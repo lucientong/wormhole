@@ -15,6 +15,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/wormhole-tunnel/wormhole/pkg/inspector"
+	"github.com/wormhole-tunnel/wormhole/pkg/p2p"
 	"github.com/wormhole-tunnel/wormhole/pkg/proto"
 	"github.com/wormhole-tunnel/wormhole/pkg/tunnel"
 	"github.com/wormhole-tunnel/wormhole/pkg/version"
@@ -36,6 +37,9 @@ type Client struct {
 	inspector        *inspector.Inspector
 	inspectorHandler *inspector.Handler
 	inspectorServer  *http.Server
+
+	// P2P
+	p2pManager *p2p.Manager
 
 	// Statistics
 	stats ClientStats
@@ -59,10 +63,13 @@ type ClientStats struct {
 // NewClient creates a new client instance.
 func NewClient(config Config) *Client {
 	insp := inspector.New(inspector.DefaultConfig())
+	p2pConfig := config.P2PConfig
+	p2pConfig.Enabled = config.P2PEnabled
 	return &Client{
-		config:    config,
-		inspector: insp,
-		closeCh:   make(chan struct{}),
+		config:     config,
+		inspector:  insp,
+		p2pManager: p2p.NewManager(p2pConfig),
+		closeCh:    make(chan struct{}),
 	}
 }
 
@@ -72,7 +79,15 @@ func (c *Client) Start(ctx context.Context) error {
 		Str("server", c.config.ServerAddr).
 		Int("local_port", c.config.LocalPort).
 		Str("local_host", c.config.LocalHost).
+		Bool("p2p", c.config.P2PEnabled).
 		Msg("Starting Wormhole client")
+
+	// Initialize P2P (non-blocking — failure is acceptable).
+	if c.config.P2PEnabled {
+		if err := c.p2pManager.Init(ctx); err != nil {
+			log.Warn().Err(err).Msg("P2P initialization failed, will use relay mode")
+		}
+	}
 
 	// Connect with reconnection
 	return c.connectWithRetry(ctx)
@@ -235,6 +250,12 @@ func (c *Client) registerTunnel(ctx context.Context) error {
 	fmt.Printf("\n")
 	fmt.Printf("  Forwarding: %s -> http://%s:%d\n", resp.PublicURL, c.config.LocalHost, c.config.LocalPort)
 	fmt.Printf("  Version:    %s\n", version.Short())
+	if c.p2pManager != nil && c.p2pManager.NATInfo() != nil {
+		info := c.p2pManager.NATInfo()
+		fmt.Printf("  NAT Type:   %s\n", info.Type)
+		fmt.Printf("  Public:     %s\n", info.PublicAddr)
+		fmt.Printf("  P2P Mode:   %s\n", c.p2pManager.Mode())
+	}
 	fmt.Printf("\n")
 	fmt.Printf("  Press Ctrl+C to stop\n")
 	fmt.Printf("\n")
@@ -247,6 +268,13 @@ func (c *Client) handleConnection(ctx context.Context) {
 	c.closeWg.Add(2)
 	go c.acceptStreams(ctx)
 	go c.heartbeatLoop(ctx)
+
+	// Attempt P2P offer (non-blocking).
+	if c.config.P2PEnabled && c.p2pManager.IsEnabled() {
+		c.closeWg.Go(func() {
+			c.sendP2POffer(ctx)
+		})
+	}
 
 	// Wait for connection to close
 	<-ctx.Done()
@@ -549,6 +577,84 @@ func (c *Client) sendPing(ctx context.Context, pingID uint64) error {
 	}
 
 	return nil
+}
+
+// sendP2POffer sends a P2P offer to the server with this client's NAT info.
+func (c *Client) sendP2POffer(ctx context.Context) {
+	natInfo := c.p2pManager.NATInfo()
+	if natInfo == nil {
+		return
+	}
+
+	c.mu.Lock()
+	mux := c.mux
+	tunnelID := c.tunnelID
+	c.mu.Unlock()
+
+	if mux == nil {
+		return
+	}
+
+	stream, err := mux.OpenStreamContext(ctx)
+	if err != nil {
+		log.Debug().Err(err).Msg("Failed to open stream for P2P offer")
+		return
+	}
+	defer stream.Close()
+
+	req := proto.NewP2POfferRequest(
+		tunnelID,
+		natInfo.Type.String(),
+		natInfo.PublicAddr.String(),
+		natInfo.LocalAddr.String(),
+	)
+	data, err := req.Encode()
+	if err != nil {
+		log.Debug().Err(err).Msg("Failed to encode P2P offer")
+		return
+	}
+
+	if err := stream.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		log.Debug().Err(err).Msg("Failed to set P2P offer deadline")
+		return
+	}
+
+	if _, err := stream.Write(data); err != nil {
+		log.Debug().Err(err).Msg("Failed to send P2P offer")
+		return
+	}
+
+	// Read response.
+	buf := make([]byte, 4096)
+	n, readErr := stream.Read(buf)
+	if readErr != nil {
+		log.Debug().Err(readErr).Msg("Failed to read P2P offer response")
+		return
+	}
+
+	msg, decodeErr := proto.DecodeControlMessage(buf[:n])
+	if decodeErr != nil || msg.P2POfferResponse == nil {
+		log.Debug().Msg("Invalid P2P offer response")
+		return
+	}
+
+	resp := msg.P2POfferResponse
+	if resp.Success && resp.PeerAddr != "" {
+		log.Info().
+			Str("peer_addr", resp.PeerAddr).
+			Str("peer_nat", resp.PeerNATType).
+			Msg("P2P peer found, attempting connection")
+		// TODO: Initiate hole punching with the peer endpoint.
+	} else {
+		log.Debug().
+			Str("reason", resp.Error).
+			Msg("P2P offer: no peer available, staying in relay mode")
+	}
+}
+
+// GetP2PManager returns the P2P manager instance.
+func (c *Client) GetP2PManager() *p2p.Manager {
+	return c.p2pManager
 }
 
 // Close closes the client.

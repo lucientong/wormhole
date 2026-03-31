@@ -20,6 +20,7 @@ func main() {
 	subdomain := flag.String("subdomain", "", "Requested subdomain")
 	token := flag.String("token", "", "Authentication token")
 	inspectorPort := flag.Int("inspector", 0, "Inspector UI port (0 to disable)")
+	p2pEnabled := flag.Bool("p2p", true, "Enable P2P direct connection when possible")
 	flag.Parse()
 
 	// Configure logging
@@ -36,6 +37,7 @@ func main() {
 	config.Subdomain = *subdomain
 	config.Token = *token
 	config.InspectorPort = *inspectorPort
+	config.P2PEnabled = *p2pEnabled
 
 	// Create client
 	client := NewClient(config)

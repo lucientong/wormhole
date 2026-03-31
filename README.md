@@ -8,16 +8,17 @@ Wormhole folds network space like a wormhole, allowing developers to expose loca
 [![Go Report Card](https://goreportcard.com/badge/github.com/lucientong/wormhole)](https://goreportcard.com/report/github.com/lucientong/wormhole)
 [![License](https://img.shields.io/github/license/lucientong/wormhole)](LICENSE)
 
+**[中文文档](README_zh.md)**
+
 ## Features
 
-- 🚀 **Zero Config** - Just one command to expose your local service
-- 🔒 **Secure** - TLS encryption with Let's Encrypt auto-certificates
-- 🌐 **HTTP/HTTPS** - Full HTTP support with Host-based routing
-- 🔌 **TCP Tunnels** - Support for any TCP protocol (gRPC, WebSocket, etc.)
-- 📊 **Inspector** - Built-in traffic inspection UI
-- 🤝 **P2P** - Direct peer-to-peer connections when possible
-- 👥 **Teams** - Multi-user collaboration with team tokens
-- 🐳 **Docker Ready** - Easy deployment with Docker
+- 🚀 **Zero Config** — Just one command to expose your local service
+- 🔒 **Secure** — TLS encryption with Let's Encrypt auto-certificates
+- 🌐 **HTTP/HTTPS** — Full HTTP support with Host-based routing
+- 🔌 **TCP Tunnels** — Support for any TCP protocol (gRPC, WebSocket, etc.)
+- 📊 **Inspector** — Built-in traffic inspection UI with real-time WebSocket streaming
+- 🤝 **P2P** — NAT traversal and direct peer-to-peer connections when possible
+- 🐳 **Docker Ready** — Easy deployment with Docker and systemd
 
 ## Quick Start
 
@@ -31,7 +32,7 @@ curl -sSL https://install.wormhole.dev | sh
 go install github.com/wormhole-tunnel/wormhole/cmd/wormhole@latest
 
 # Or download from releases
-# https://github.com/wormhole-tunnel/wormhole/releases
+# https://github.com/lucientong/wormhole/releases
 ```
 
 ### Usage
@@ -51,6 +52,9 @@ wormhole client --local 8080 --subdomain myapp
 
 # Enable traffic inspector
 wormhole client --local 8080 --inspector 4040
+
+# Disable P2P mode (use relay only)
+wormhole client --local 8080 --p2p=false
 ```
 
 That's it! Your local service is now accessible from the internet.
@@ -70,6 +74,13 @@ That's it! Your local service is now accessible from the internet.
                             │ + Port Alloc  │
                             └───────────────┘
 ```
+
+### Key Design
+
+- **Multiplexed Tunnel**: A single TCP connection carries multiple logical streams (control, HTTP requests, heartbeats) via a custom binary frame protocol
+- **Host-based Routing**: Server routes incoming HTTP requests to the correct client based on `Host` header and subdomain
+- **Inspector**: Client-side HTTP traffic capture with a real-time web UI (WebSocket push + REST API)
+- **P2P (Phase 4)**: STUN-based NAT discovery + UDP hole punching for direct connections, with automatic relay fallback
 
 ### Components
 
@@ -132,7 +143,7 @@ wormhole server \
 | `--subdomain` | Request specific subdomain | Auto-generated |
 | `--token` | Team token for auth | None |
 | `--inspector` | Inspector UI port | 0 (disabled) |
-| `--p2p` | Enable P2P mode | true |
+| `--p2p` | Enable P2P direct connection | true |
 
 ### Server Options
 
@@ -160,6 +171,22 @@ curl http://localhost:7001/stats
 curl http://localhost:7001/clients
 ```
 
+### Inspector API (Client)
+
+```bash
+# List captured requests
+curl http://localhost:4040/api/requests
+
+# Get request details
+curl http://localhost:4040/api/requests/:id
+
+# Clear all records
+curl -X DELETE http://localhost:4040/api/requests
+
+# Real-time stream (WebSocket)
+wscat -c ws://localhost:4040/api/ws
+```
+
 ## Development
 
 ### Building from Source
@@ -177,6 +204,9 @@ make test
 
 # Run with coverage
 make test-coverage
+
+# Lint (requires golangci-lint)
+golangci-lint run ./...
 ```
 
 ### Project Structure
@@ -188,22 +218,24 @@ wormhole/
 │   ├── server/       # Server implementation
 │   └── client/       # Client implementation
 ├── pkg/
-│   ├── tunnel/       # Core tunneling (mux, frame, pool)
-│   ├── inspector/    # Traffic inspection
-│   ├── p2p/          # P2P direct connection
-│   ├── proto/        # Control protocol
+│   ├── tunnel/       # Core tunneling (mux, frame, stream, pool)
+│   ├── inspector/    # Traffic inspection (capture, storage, websocket)
+│   ├── p2p/          # P2P direct connection (STUN, hole punch, predictor)
+│   ├── proto/        # Control protocol (JSON messages)
+│   ├── version/      # Build version info
 │   └── web/          # Embedded web UI
-├── web/              # Frontend source
+├── web/              # Frontend source (SolidJS)
+├── docs/             # Architecture documentation
 ├── deployments/      # Docker, systemd configs
-└── scripts/          # Build scripts
+└── scripts/          # Build and install scripts
 ```
 
 ## Roadmap
 
-- [x] Phase 1: Basic TCP tunnel
-- [x] Phase 2: HTTP routing + TLS
+- [x] Phase 1: Basic TCP tunnel with multiplexing
+- [x] Phase 2: HTTP routing + TLS + Admin API
 - [x] Phase 3: Traffic inspector UI
-- [ ] Phase 4: P2P direct connection
+- [x] Phase 4: P2P direct connection (STUN + NAT traversal + hole punching)
 - [ ] Phase 5: Team collaboration
 
 ## Contributing
@@ -212,6 +244,4 @@ Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md)
 
 ## License
 
-Apache License - see [LICENSE](LICENSE) for details.
-
----
+Apache License — see [LICENSE](LICENSE) for details.

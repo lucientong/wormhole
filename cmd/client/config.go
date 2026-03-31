@@ -3,6 +3,7 @@ package main
 import (
 	"time"
 
+	"github.com/wormhole-tunnel/wormhole/pkg/p2p"
 	"github.com/wormhole-tunnel/wormhole/pkg/tunnel"
 )
 
@@ -52,6 +53,12 @@ type Config struct {
 
 	// HeartbeatTimeout is the timeout for heartbeat responses.
 	HeartbeatTimeout time.Duration
+
+	// P2PEnabled enables P2P direct connection attempts.
+	P2PEnabled bool
+
+	// P2PConfig is the P2P manager configuration.
+	P2PConfig p2p.ManagerConfig
 }
 
 // DefaultConfig returns the default client configuration.
@@ -67,5 +74,7 @@ func DefaultConfig() Config {
 		MaxReconnectAttempts: 0, // Unlimited
 		HeartbeatInterval:    30 * time.Second,
 		HeartbeatTimeout:     10 * time.Second,
+		P2PEnabled:           true,
+		P2PConfig:            p2p.DefaultManagerConfig(),
 	}
 }

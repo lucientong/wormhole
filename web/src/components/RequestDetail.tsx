@@ -1,4 +1,4 @@
-import { Component, Show, createSignal, For } from "solid-js";
+import { Component, Show, createSignal, createMemo, For } from "solid-js";
 import {
   useSelectedRecord,
   useSelectedId,
@@ -6,6 +6,7 @@ import {
   formatBytes,
   getMethodColor,
   getStatusColor,
+  type RequestRecord,
 } from "../stores/requests";
 import JsonViewer from "./JsonViewer";
 
@@ -15,6 +16,9 @@ const RequestDetail: Component = () => {
   const record = useSelectedRecord();
   const selectedId = useSelectedId();
   const [activeTab, setActiveTab] = createSignal<Tab>("headers");
+
+  // Non-null accessor — only used inside the inner <Show> guard.
+  const r = createMemo<RequestRecord>(() => record()!);
 
   return (
     <Show
@@ -36,74 +40,72 @@ const RequestDetail: Component = () => {
           </div>
         }
       >
-        {(r) => (
-          <div class="flex flex-col h-full overflow-hidden">
-            {/* Request summary header */}
-            <div class="flex-shrink-0 p-4 border-b border-[var(--color-border-default)] bg-[var(--color-bg-secondary)]">
-              <div class="flex items-center gap-3 mb-2">
-                <span
-                  class={`inline-flex items-center justify-center min-w-[3rem] px-2 py-1 text-xs font-bold rounded ${getStatusColor(r().status)} text-[var(--color-bg-primary)]`}
-                >
-                  {r().status || "—"}
-                </span>
-                <span class={`font-mono font-semibold ${getMethodColor(r().method)}`}>
-                  {r().method}
-                </span>
-                <span class="font-mono text-sm text-[var(--color-text-primary)] truncate flex-1">
-                  {r().url}
-                </span>
-              </div>
-              <div class="flex items-center gap-4 text-xs text-[var(--color-text-secondary)]">
-                <span>
-                  <span class="text-[var(--color-text-muted)]">Time: </span>
-                  <span class="font-mono">{formatDuration(r().duration)}</span>
-                </span>
-                <span>
-                  <span class="text-[var(--color-text-muted)]">Size: </span>
-                  <span class="font-mono">{formatBytes(r().response?.bodySize || 0)}</span>
-                </span>
-                <span>
-                  <span class="text-[var(--color-text-muted)]">Host: </span>
-                  <span class="font-mono">{r().host}</span>
-                </span>
-              </div>
+        <div class="flex flex-col h-full overflow-hidden">
+          {/* Request summary header */}
+          <div class="flex-shrink-0 p-4 border-b border-[var(--color-border-default)] bg-[var(--color-bg-secondary)]">
+            <div class="flex items-center gap-3 mb-2">
+              <span
+                class={`inline-flex items-center justify-center min-w-[3rem] px-2 py-1 text-xs font-bold rounded ${getStatusColor(r().status)} text-[var(--color-bg-primary)]`}
+              >
+                {r().status || "—"}
+              </span>
+              <span class={`font-mono font-semibold ${getMethodColor(r().method)}`}>
+                {r().method}
+              </span>
+              <span class="font-mono text-sm text-[var(--color-text-primary)] truncate flex-1">
+                {r().url}
+              </span>
             </div>
-
-            {/* Tabs */}
-            <div class="flex-shrink-0 flex border-b border-[var(--color-border-default)] bg-[var(--color-bg-tertiary)]">
-              <TabButton
-                label="Headers"
-                active={activeTab() === "headers"}
-                onClick={() => setActiveTab("headers")}
-              />
-              <TabButton
-                label="Payload"
-                active={activeTab() === "payload"}
-                onClick={() => setActiveTab("payload")}
-                badge={r().bodySize > 0 ? formatBytes(r().bodySize) : undefined}
-              />
-              <TabButton
-                label="Response"
-                active={activeTab() === "response"}
-                onClick={() => setActiveTab("response")}
-                badge={r().response?.bodySize ? formatBytes(r().response.bodySize) : undefined}
-              />
-            </div>
-
-            {/* Tab content */}
-            <div class="flex-1 overflow-y-auto p-4">
-              <Show when={activeTab() === "headers"}>
-                <HeadersTab record={r()} />
-              </Show>
-              <Show when={activeTab() === "payload"}>
-                <PayloadTab body={r().body} />
-              </Show>
-              <Show when={activeTab() === "response"}>
-                <ResponseTab response={r().response} />
-              </Show>
+            <div class="flex items-center gap-4 text-xs text-[var(--color-text-secondary)]">
+              <span>
+                <span class="text-[var(--color-text-muted)]">Time: </span>
+                <span class="font-mono">{formatDuration(r().duration)}</span>
+              </span>
+              <span>
+                <span class="text-[var(--color-text-muted)]">Size: </span>
+                <span class="font-mono">{formatBytes(r().response?.bodySize || 0)}</span>
+              </span>
+              <span>
+                <span class="text-[var(--color-text-muted)]">Host: </span>
+                <span class="font-mono">{r().host}</span>
+              </span>
             </div>
           </div>
-        )}
+
+          {/* Tabs */}
+          <div class="flex-shrink-0 flex border-b border-[var(--color-border-default)] bg-[var(--color-bg-tertiary)]">
+            <TabButton
+              label="Headers"
+              active={activeTab() === "headers"}
+              onClick={() => setActiveTab("headers")}
+            />
+            <TabButton
+              label="Payload"
+              active={activeTab() === "payload"}
+              onClick={() => setActiveTab("payload")}
+              badge={r().bodySize > 0 ? formatBytes(r().bodySize) : undefined}
+            />
+            <TabButton
+              label="Response"
+              active={activeTab() === "response"}
+              onClick={() => setActiveTab("response")}
+              badge={r().response?.bodySize ? formatBytes(r().response!.bodySize) : undefined}
+            />
+          </div>
+
+          {/* Tab content */}
+          <div class="flex-1 overflow-y-auto p-4">
+            <Show when={activeTab() === "headers"}>
+              <HeadersTab record={r()} />
+            </Show>
+            <Show when={activeTab() === "payload"}>
+              <PayloadTab body={r().body} />
+            </Show>
+            <Show when={activeTab() === "response"}>
+              <ResponseTab response={r().response} />
+            </Show>
+          </div>
+        </div>
       </Show>
     </Show>
   );

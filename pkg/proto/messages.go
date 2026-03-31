@@ -59,6 +59,10 @@ const (
 	MessageTypeStatsResponse    MessageType = 10
 	MessageTypeCloseRequest     MessageType = 11
 	MessageTypeCloseResponse    MessageType = 12
+	MessageTypeP2POfferRequest  MessageType = 13
+	MessageTypeP2POfferResponse MessageType = 14
+	MessageTypeP2PCandidates    MessageType = 15
+	MessageTypeP2PResult        MessageType = 16
 )
 
 // AuthRequest is sent by client to authenticate with the server.
@@ -160,6 +164,50 @@ type CloseResponse struct {
 	Success bool `json:"success"`
 }
 
+// P2POfferRequest is sent by a client to initiate a P2P connection.
+type P2POfferRequest struct {
+	// TunnelID identifies the tunnel wanting P2P.
+	TunnelID string `json:"tunnel_id"`
+	// NATType is the sender's detected NAT type.
+	NATType string `json:"nat_type"`
+	// PublicAddr is the sender's public endpoint as discovered by STUN.
+	PublicAddr string `json:"public_addr"`
+	// LocalAddr is the sender's local endpoint.
+	LocalAddr string `json:"local_addr,omitempty"`
+}
+
+// P2POfferResponse is the server's response to a P2P offer.
+type P2POfferResponse struct {
+	// Success indicates whether a peer was found.
+	Success bool `json:"success"`
+	// Error contains a reason if the offer was rejected.
+	Error string `json:"error,omitempty"`
+	// PeerAddr is the peer's public endpoint.
+	PeerAddr string `json:"peer_addr,omitempty"`
+	// PeerNATType is the peer's NAT type.
+	PeerNATType string `json:"peer_nat_type,omitempty"`
+}
+
+// P2PCandidates carries additional candidate endpoints for hole punching.
+type P2PCandidates struct {
+	// TunnelID identifies the tunnel.
+	TunnelID string `json:"tunnel_id"`
+	// Candidates is a list of candidate endpoints.
+	Candidates []string `json:"candidates"`
+}
+
+// P2PResult reports the outcome of a P2P connection attempt.
+type P2PResult struct {
+	// TunnelID identifies the tunnel.
+	TunnelID string `json:"tunnel_id"`
+	// Success indicates whether P2P was established.
+	Success bool `json:"success"`
+	// PeerAddr is the confirmed peer address (if successful).
+	PeerAddr string `json:"peer_addr,omitempty"`
+	// Error contains a reason if P2P failed.
+	Error string `json:"error,omitempty"`
+}
+
 // ControlMessage is a wrapper for all control messages.
 type ControlMessage struct {
 	Type     MessageType `json:"type"`
@@ -178,6 +226,10 @@ type ControlMessage struct {
 	StatsResponse    *StatsResponse    `json:"stats_response,omitempty"`
 	CloseRequest     *CloseRequest     `json:"close_request,omitempty"`
 	CloseResponse    *CloseResponse    `json:"close_response,omitempty"`
+	P2POfferRequest  *P2POfferRequest  `json:"p2p_offer_request,omitempty"`
+	P2POfferResponse *P2POfferResponse `json:"p2p_offer_response,omitempty"`
+	P2PCandidates    *P2PCandidates    `json:"p2p_candidates,omitempty"`
+	P2PResult        *P2PResult        `json:"p2p_result,omitempty"`
 }
 
 // Encode serializes a control message to bytes.
@@ -312,6 +364,56 @@ func NewCloseResponse(success bool) *ControlMessage {
 		Type: MessageTypeCloseResponse,
 		CloseResponse: &CloseResponse{
 			Success: success,
+		},
+	}
+}
+
+// NewP2POfferRequest creates a P2P offer request message.
+func NewP2POfferRequest(tunnelID, natType, publicAddr, localAddr string) *ControlMessage {
+	return &ControlMessage{
+		Type: MessageTypeP2POfferRequest,
+		P2POfferRequest: &P2POfferRequest{
+			TunnelID:   tunnelID,
+			NATType:    natType,
+			PublicAddr: publicAddr,
+			LocalAddr:  localAddr,
+		},
+	}
+}
+
+// NewP2POfferResponse creates a P2P offer response message.
+func NewP2POfferResponse(success bool, err, peerAddr, peerNATType string) *ControlMessage {
+	return &ControlMessage{
+		Type: MessageTypeP2POfferResponse,
+		P2POfferResponse: &P2POfferResponse{
+			Success:     success,
+			Error:       err,
+			PeerAddr:    peerAddr,
+			PeerNATType: peerNATType,
+		},
+	}
+}
+
+// NewP2PCandidates creates a P2P candidates message.
+func NewP2PCandidates(tunnelID string, candidates []string) *ControlMessage {
+	return &ControlMessage{
+		Type: MessageTypeP2PCandidates,
+		P2PCandidates: &P2PCandidates{
+			TunnelID:   tunnelID,
+			Candidates: candidates,
+		},
+	}
+}
+
+// NewP2PResult creates a P2P result message.
+func NewP2PResult(tunnelID string, success bool, peerAddr, err string) *ControlMessage {
+	return &ControlMessage{
+		Type: MessageTypeP2PResult,
+		P2PResult: &P2PResult{
+			TunnelID: tunnelID,
+			Success:  success,
+			PeerAddr: peerAddr,
+			Error:    err,
 		},
 	}
 }

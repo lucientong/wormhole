@@ -447,9 +447,9 @@ func (s *Server) handleP2PResult(client *ClientSession, result *proto.P2PResult)
 	}
 }
 
-// findPeerForP2P looks up a peer client that could establish a P2P connection.
+// FindPeerForP2P looks up a peer client that could establish a P2P connection.
 // Returns nil if no suitable peer is found.
-func (s *Server) findPeerForP2P(excludeClientID string) *ClientSession {
+func (s *Server) FindPeerForP2P(excludeClientID string) *ClientSession {
 	s.clientLock.RLock()
 	defer s.clientLock.RUnlock()
 
