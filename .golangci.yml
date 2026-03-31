@@ -28,7 +28,7 @@ linters:
     - durationcheck
     - errname
     - errorlint
-    - exportloopref
+    - copyloopvar
     - gochecknoinits
     - goconst
     - gocritic
@@ -49,7 +49,7 @@ linters:
     - rowserrcheck
     - sqlclosecheck
     - stylecheck
-    - tenv
+    - usetesting
     - tparallel
     - unconvert
     - unparam
