@@ -18,6 +18,7 @@ Wormhole folds network space like a wormhole, allowing developers to expose loca
 - 🔌 **TCP Tunnels** — Support for any TCP protocol (gRPC, WebSocket, etc.)
 - 📊 **Inspector** — Built-in traffic inspection UI with real-time WebSocket streaming
 - 🤝 **P2P** — NAT traversal and direct peer-to-peer connections when possible
+- 🔑 **Auth & RBAC** — HMAC-SHA256 team tokens with role-based access control
 - 🐳 **Docker Ready** — Easy deployment with Docker and systemd
 
 ## Quick Start
@@ -25,14 +26,15 @@ Wormhole folds network space like a wormhole, allowing developers to expose loca
 ### Installation
 
 ```bash
-# One-line install (Linux/macOS)
-curl -sSL https://install.wormhole.dev | sh
+# With Go (recommended)
+go install github.com/lucientong/wormhole/cmd/wormhole@latest
 
-# Or with Go
-go install github.com/wormhole-tunnel/wormhole/cmd/wormhole@latest
-
-# Or download from releases
+# Or download pre-built binaries from releases
 # https://github.com/lucientong/wormhole/releases
+
+# Or build from source
+git clone https://github.com/lucientong/wormhole.git
+cd wormhole && make build
 ```
 
 ### Usage
@@ -80,7 +82,8 @@ That's it! Your local service is now accessible from the internet.
 - **Multiplexed Tunnel**: A single TCP connection carries multiple logical streams (control, HTTP requests, heartbeats) via a custom binary frame protocol
 - **Host-based Routing**: Server routes incoming HTTP requests to the correct client based on `Host` header and subdomain
 - **Inspector**: Client-side HTTP traffic capture with a real-time web UI (WebSocket push + REST API)
-- **P2P (Phase 4)**: STUN-based NAT discovery + UDP hole punching for direct connections, with automatic relay fallback
+- **P2P**: STUN-based NAT discovery + UDP hole punching for direct connections, with automatic relay fallback
+- **Auth**: HMAC-SHA256 token signing with role-based access control (admin/member/viewer), pre-shared token mode for quick setup
 
 ### Components
 
@@ -155,20 +158,40 @@ wormhole server \
 | `--domain` | Base domain | `localhost` |
 | `--tls` | Enable TLS | false |
 | `--tls-email` | Let's Encrypt email | None |
+| `--require-auth` | Require authentication for connections | false |
+| `--auth-tokens` | Comma-separated pre-shared tokens | None |
+| `--auth-secret` | HMAC secret for signed tokens (min 16 chars) | None |
+| `--admin-token` | Token to protect admin API | None |
 
 ## API
 
 ### Admin API (Server)
 
 ```bash
-# Health check
+# Health check (always public)
 curl http://localhost:7001/health
 
-# Statistics
-curl http://localhost:7001/stats
+# Statistics (requires --admin-token if configured)
+curl -H "Authorization: Bearer <admin-token>" http://localhost:7001/stats
 
 # Connected clients
-curl http://localhost:7001/clients
+curl -H "Authorization: Bearer <admin-token>" http://localhost:7001/clients
+```
+
+### Authentication
+
+Wormhole supports two authentication modes:
+
+```bash
+# Simple pre-shared tokens
+wormhole server --require-auth --auth-tokens token1,token2
+wormhole client --server example.com:7000 --local 8080 --token token1
+
+# HMAC-SHA256 signed tokens (for team management)
+wormhole server --require-auth --auth-secret "my-secret-at-least-16-chars"
+
+# Protect admin API with a separate token
+wormhole server --admin-token my-admin-secret
 ```
 
 ### Inspector API (Client)
@@ -222,6 +245,7 @@ wormhole/
 │   ├── inspector/    # Traffic inspection (capture, storage, websocket)
 │   ├── p2p/          # P2P direct connection (STUN, hole punch, predictor)
 │   ├── proto/        # Control protocol (JSON messages)
+│   ├── auth/         # Authentication & RBAC (HMAC tokens, roles, permissions)
 │   ├── version/      # Build version info
 │   └── web/          # Embedded web UI
 ├── web/              # Frontend source (SolidJS)
@@ -237,7 +261,7 @@ wormhole/
 - [x] Phase 3: Traffic inspector UI
 - [x] Phase 4: P2P direct connection — primitives (STUN, hole punch, predictor, signaling)
 - [ ] Phase 4.5: P2P end-to-end integration (peer matching, data transfer, relay→P2P switch)
-- [ ] Phase 5: Team collaboration (auth, tokens, RBAC)
+- [x] Phase 5: Team collaboration (auth, HMAC tokens, RBAC, admin API protection)
 
 ## Contributing
 

@@ -497,11 +497,11 @@ func (rb *ringBuffer) Write(p []byte) int {
 	toWrite := min(len(p), rb.Available())
 
 	// Two-phase copy to handle wrap-around
-	// Phase 1: write from rb.w to end of buffer
+	// write from rb.w to end of buffer
 	end := min(len(rb.buf)-rb.w, toWrite)
 	copy(rb.buf[rb.w:rb.w+end], p[:end])
 
-	// Phase 2: write remaining from beginning of buffer (wrap-around)
+	// write remaining from beginning of buffer (wrap-around)
 	remaining := toWrite - end
 	if remaining > 0 {
 		copy(rb.buf[0:remaining], p[end:toWrite])

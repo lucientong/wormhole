@@ -6,13 +6,17 @@ import (
 )
 
 var (
-	serverPort       int
-	serverHost       string
-	serverDomain     string
-	serverTLSEnabled bool
-	serverTLSCert    string
-	serverTLSKey     string
-	serverAdminPort  int
+	serverPort        int
+	serverHost        string
+	serverDomain      string
+	serverTLSEnabled  bool
+	serverTLSCert     string
+	serverTLSKey      string
+	serverAdminPort   int
+	serverRequireAuth bool
+	serverAuthTokens  []string
+	serverAuthSecret  string
+	serverAdminToken  string
 )
 
 // serverCmd represents the server command.
@@ -36,7 +40,16 @@ Examples:
   wormhole server --tls --cert /path/to/cert.pem --key /path/to/key.pem
 
   # Start server with Let's Encrypt auto-cert
-  wormhole server --tls --domain tunnel.example.com`,
+  wormhole server --tls --domain tunnel.example.com
+
+  # Start server with authentication
+  wormhole server --require-auth --auth-tokens token1,token2
+
+  # Start server with HMAC signed tokens
+  wormhole server --require-auth --auth-secret my-secret-key-at-least-16
+
+  # Start server with admin API protection
+  wormhole server --admin-token my-admin-secret`,
 	Run: runServer,
 }
 
@@ -48,6 +61,10 @@ func init() {
 	serverCmd.Flags().StringVar(&serverTLSCert, "cert", "", "Path to TLS certificate file")
 	serverCmd.Flags().StringVar(&serverTLSKey, "key", "", "Path to TLS private key file")
 	serverCmd.Flags().IntVar(&serverAdminPort, "admin-port", 7001, "Port for admin API")
+	serverCmd.Flags().BoolVar(&serverRequireAuth, "require-auth", false, "Require authentication for client connections")
+	serverCmd.Flags().StringSliceVar(&serverAuthTokens, "auth-tokens", nil, "Comma-separated list of valid authentication tokens")
+	serverCmd.Flags().StringVar(&serverAuthSecret, "auth-secret", "", "HMAC secret for signed tokens (min 16 chars)")
+	serverCmd.Flags().StringVar(&serverAdminToken, "admin-token", "", "Token for admin API authentication")
 }
 
 func runServer(_ *cobra.Command, _ []string) {
@@ -56,6 +73,7 @@ func runServer(_ *cobra.Command, _ []string) {
 		Int("port", serverPort).
 		Str("domain", serverDomain).
 		Bool("tls", serverTLSEnabled).
+		Bool("require_auth", serverRequireAuth).
 		Msg("Starting Wormhole server")
 
 	// TODO: Implement server startup after server package is ready

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+	"github.com/wormhole-tunnel/wormhole/pkg/auth"
 	"github.com/wormhole-tunnel/wormhole/pkg/proto"
 	"github.com/wormhole-tunnel/wormhole/pkg/tunnel"
 )
@@ -31,6 +32,9 @@ type Server struct {
 	tlsManager    *TLSManager
 	adminAPI      *AdminAPI
 	portAllocator *TCPPortAllocator
+
+	// Authentication.
+	authenticator *auth.Auth
 
 	// Client management.
 	clients    map[string]*ClientSession
@@ -55,6 +59,10 @@ type ClientSession struct {
 	LastSeen  time.Time
 	BytesIn   uint64
 	BytesOut  uint64
+
+	// Authentication info.
+	TeamName string
+	Role     auth.Role
 
 	// P2P info.
 	P2PPublicAddr string
@@ -101,6 +109,27 @@ func NewServer(config Config) *Server {
 	s.tlsManager = NewTLSManager(config)
 	s.adminAPI = NewAdminAPI(s)
 	s.portAllocator = NewTCPPortAllocator(config.TCPPortRangeStart, config.TCPPortRangeEnd)
+
+	// Initialize authentication.
+	if config.RequireAuth {
+		switch {
+		case config.AuthSecret != "":
+			a, err := auth.New(auth.Config{
+				Secret:        []byte(config.AuthSecret),
+				AllowedTokens: config.AuthTokens,
+			})
+			if err != nil {
+				log.Fatal().Err(err).Msg("Failed to initialize authentication")
+			}
+			s.authenticator = a
+			log.Info().Msg("Authentication enabled (HMAC + simple token mode)")
+		case len(config.AuthTokens) > 0:
+			s.authenticator = auth.NewSimple(config.AuthTokens)
+			log.Info().Int("tokens", len(config.AuthTokens)).Msg("Authentication enabled (simple token mode)")
+		default:
+			log.Warn().Msg("RequireAuth is true but no tokens or secret configured — all connections will be rejected")
+		}
+	}
 
 	return s
 }
@@ -228,15 +257,43 @@ func (s *Server) handleClient(conn net.Conn) {
 		return
 	}
 
-	// Generate session ID and subdomain.
+	// Authentication handshake.
+	var teamName string
+	var role auth.Role
+	subdomain := ""
+
+	// Generate session ID early so auth response carries the same ID we register with.
 	sessionID := generateID()
-	subdomain := generateSubdomain()
+
+	if s.config.RequireAuth && s.authenticator != nil {
+		claims, authSubdomain, authErr := s.authenticateClient(mux, sessionID)
+		if authErr != nil {
+			log.Warn().Err(authErr).Str("remote", remoteAddr).Msg("Authentication failed")
+			_ = mux.Close()
+			return
+		}
+		teamName = claims.TeamName
+		role = claims.Role
+		subdomain = authSubdomain
+		log.Info().
+			Str("team", teamName).
+			Str("role", string(role)).
+			Str("remote", remoteAddr).
+			Msg("Client authenticated")
+	}
+
+	// Generate subdomain (if not set by auth).
+	if subdomain == "" {
+		subdomain = generateSubdomain()
+	}
 
 	// Create client session.
 	client := &ClientSession{
 		ID:        sessionID,
 		Subdomain: subdomain,
 		Mux:       mux,
+		TeamName:  teamName,
+		Role:      role,
 		CreatedAt: time.Now(),
 		LastSeen:  time.Now(),
 	}
@@ -269,6 +326,94 @@ func (s *Server) handleClient(conn net.Conn) {
 		Str("session_id", sessionID).
 		Str("subdomain", subdomain).
 		Msg("Client disconnected")
+}
+
+// authenticateClient performs the authentication handshake with a client.
+// It waits for an AuthRequest on the first stream and responds with AuthResponse.
+// The sessionID parameter is the pre-generated ID to include in the response.
+func (s *Server) authenticateClient(mux *tunnel.Mux, sessionID string) (*auth.Claims, string, error) {
+	// Accept the auth stream with a timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), s.config.AuthTimeout)
+	defer cancel()
+
+	stream, err := mux.AcceptStreamContext(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("accept auth stream: %w", err)
+	}
+	defer stream.Close()
+
+	// Set read deadline.
+	if deadlineErr := stream.SetDeadline(time.Now().Add(s.config.AuthTimeout)); deadlineErr != nil {
+		return nil, "", fmt.Errorf("set auth deadline: %w", deadlineErr)
+	}
+
+	// Read auth request.
+	buf := make([]byte, 4096)
+	n, err := stream.Read(buf)
+	if err != nil {
+		return nil, "", fmt.Errorf("read auth request: %w", err)
+	}
+
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	if err != nil {
+		return nil, "", fmt.Errorf("decode auth request: %w", err)
+	}
+
+	if msg.Type != proto.MessageTypeAuthRequest || msg.AuthRequest == nil {
+		// Send rejection and return error.
+		resp := proto.NewAuthResponse(false, "expected auth request", "", "", "")
+		if data, encErr := resp.Encode(); encErr == nil {
+			_, _ = stream.Write(data)
+		}
+		return nil, "", fmt.Errorf("expected auth request, got type %d", msg.Type)
+	}
+
+	authReq := msg.AuthRequest
+
+	// Validate token.
+	claims, err := s.authenticator.ValidateToken(authReq.Token)
+	if err != nil {
+		// Send failure response.
+		resp := proto.NewAuthResponse(false, "authentication failed: "+err.Error(), "", "", "")
+		if data, encErr := resp.Encode(); encErr == nil {
+			_, _ = stream.Write(data)
+		}
+		return nil, "", fmt.Errorf("validate token: %w", err)
+	}
+
+	// Check connect permission.
+	if !auth.HasPermission(claims, auth.PermissionConnect) {
+		resp := proto.NewAuthResponse(false, "insufficient permissions", "", "", "")
+		if data, encErr := resp.Encode(); encErr == nil {
+			_, _ = stream.Write(data)
+		}
+		return nil, "", fmt.Errorf("role %s lacks connect permission", claims.Role)
+	}
+
+	// Generate subdomain from auth request (or assign a random one).
+	subdomain := authReq.Subdomain
+	if subdomain == "" {
+		subdomain = generateSubdomain()
+	}
+
+	// Send success response with the pre-generated session ID.
+	resp := proto.NewAuthResponse(true, "", subdomain, "", sessionID)
+	data, err := resp.Encode()
+	if err != nil {
+		return nil, "", fmt.Errorf("encode auth response: %w", err)
+	}
+	if _, writeErr := stream.Write(data); writeErr != nil {
+		return nil, "", fmt.Errorf("write auth response: %w", writeErr)
+	}
+
+	log.Debug().
+		Str("team", claims.TeamName).
+		Str("role", string(claims.Role)).
+		Str("version", authReq.Version).
+		Str("subdomain", subdomain).
+		Msg("Authentication successful")
+
+	return claims, subdomain, nil
 }
 
 // handleClientStreams handles streams from a client.

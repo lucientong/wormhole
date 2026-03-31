@@ -3,8 +3,10 @@ package main
 
 import (
 	"context"
+	"flag"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/rs/zerolog"
@@ -12,6 +14,13 @@ import (
 )
 
 func main() {
+	// Parse flags.
+	requireAuth := flag.Bool("require-auth", false, "Require authentication for client connections")
+	authTokens := flag.String("auth-tokens", "", "Comma-separated list of valid authentication tokens")
+	authSecret := flag.String("auth-secret", "", "HMAC secret for signed tokens (min 16 chars)")
+	adminToken := flag.String("admin-token", "", "Token for admin API authentication")
+	flag.Parse()
+
 	// Configure logging
 	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: "15:04:05"}).
 		With().
@@ -20,6 +29,13 @@ func main() {
 
 	// Create server
 	config := DefaultConfig()
+	config.RequireAuth = *requireAuth
+	if *authTokens != "" {
+		config.AuthTokens = strings.Split(*authTokens, ",")
+	}
+	config.AuthSecret = *authSecret
+	config.AdminToken = *adminToken
+
 	server := NewServer(config)
 
 	// Handle shutdown signals

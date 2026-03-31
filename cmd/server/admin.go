@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -24,9 +26,9 @@ func (a *AdminAPI) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", a.handleHealth)
-	mux.HandleFunc("/stats", a.handleStats)
-	mux.HandleFunc("/clients", a.handleClients)
-	mux.HandleFunc("/tunnels", a.handleTunnels)
+	mux.HandleFunc("/stats", a.requireAdminAuth(a.handleStats))
+	mux.HandleFunc("/clients", a.requireAdminAuth(a.handleClients))
+	mux.HandleFunc("/tunnels", a.requireAdminAuth(a.handleTunnels))
 
 	return mux
 }
@@ -182,11 +184,50 @@ func (a *AdminAPI) handleTunnels(w http.ResponseWriter, _ *http.Request) {
 }
 
 // writeJSON writes a JSON response with the given status code.
-func writeJSON(w http.ResponseWriter, status int, v interface{}) { //nolint:unparam // status may vary for future error responses
+func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.Error().Err(err).Msg("Failed to encode JSON response")
+	}
+}
+
+// ErrorResponse is the standard error response for the admin API.
+type ErrorResponse struct {
+	Error string `json:"error"`
+}
+
+// requireAdminAuth wraps a handler with admin token authentication.
+// If AdminToken is not configured, it passes through without checking.
+func (a *AdminAPI) requireAdminAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		adminToken := a.server.config.AdminToken
+		if adminToken == "" {
+			// No admin token configured — allow unrestricted access.
+			next(w, r)
+			return
+		}
+
+		// Check Authorization header: "Bearer <token>".
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			writeJSON(w, http.StatusUnauthorized, ErrorResponse{Error: "missing authorization header"})
+			return
+		}
+
+		const bearerPrefix = "Bearer "
+		if !strings.HasPrefix(authHeader, bearerPrefix) {
+			writeJSON(w, http.StatusUnauthorized, ErrorResponse{Error: "invalid authorization format, expected: Bearer <token>"})
+			return
+		}
+
+		token := strings.TrimPrefix(authHeader, bearerPrefix)
+		if subtle.ConstantTimeCompare([]byte(token), []byte(adminToken)) != 1 {
+			writeJSON(w, http.StatusForbidden, ErrorResponse{Error: "invalid admin token"})
+			return
+		}
+
+		next(w, r)
 	}
 }

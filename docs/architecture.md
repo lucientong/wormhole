@@ -11,6 +11,7 @@
 - [Tunnel Multiplexing Protocol](#tunnel-multiplexing-protocol)
 - [Frame Protocol](#frame-protocol)
 - [Control Protocol](#control-protocol)
+- [Authentication & Authorization](#authentication--authorization)
 - [HTTP Proxy Flow](#http-proxy-flow)
 - [TCP Tunnel Flow](#tcp-tunnel-flow)
 - [Inspector Traffic Capture](#inspector-traffic-capture)
@@ -110,6 +111,7 @@ Wormhole is a Client-Server architecture tunneling tool. The core idea is:
 |---------|----------|----------------|
 | `tunnel` | `pkg/tunnel/` | Multiplexer, frame codec, stream management, connection pool |
 | `proto` | `pkg/proto/` | Control protocol message definitions (JSON encoding) |
+| `auth` | `pkg/auth/` | Authentication & authorization (HMAC tokens, roles, permissions) |
 | `p2p` | `pkg/p2p/` | STUN client, NAT discovery, UDP hole punching, port prediction |
 | `version` | `pkg/version/` | Build version information |
 
@@ -273,19 +275,30 @@ All messages are wrapped in a `ControlMessage` envelope, distinguished by the `t
     │                                        │
     │ ◄──── Mux Handshake ──────────────►   │  (tunnel layer handshake)
     │                                        │
-    │ ── [Stream 1] RegisterRequest ──────► │
+    │ ── [Stream 1] AuthRequest ──────────► │  (if auth enabled)
+    │     { token: "xxx",                   │
+    │       version: "1.0",                 │
+    │       subdomain: "myapp" }            │
+    │                                        │  → Validate Token
+    │                                        │  → Check connect permission
+    │ ◄── [Stream 1] AuthResponse ──────── │
+    │     { success: true,                  │
+    │       subdomain: "myapp",             │
+    │       session_id: "abc123" }          │
+    │                                        │
+    │ ── [Stream 2] RegisterRequest ──────► │
     │     { local_port: 8080,               │
     │       protocol: "HTTP",               │
     │       subdomain: "myapp" }            │
     │                                        │  → Assign subdomain
     │                                        │  → Register route
-    │ ◄── [Stream 1] RegisterResponse ──── │
+    │ ◄── [Stream 2] RegisterResponse ──── │
     │     { success: true,                  │
     │       tunnel_id: "abc123",            │
     │       public_url: "http://myapp.ex.." }│
     │                                        │
-    │ ── [Stream 2] PingRequest ──────────► │  (periodic heartbeat)
-    │ ◄── [Stream 2] PingResponse ──────── │
+    │ ── [Stream 3] PingRequest ──────────► │  (periodic heartbeat)
+    │ ◄── [Stream 3] PingResponse ──────── │
     │                                        │
 ```
 
@@ -581,6 +594,77 @@ On timeout: Mark connection abnormal, trigger reconnection
 
 ---
 
+## Authentication & Authorization
+
+### Overview
+
+Wormhole supports optional authentication to protect the server from unauthorized client connections. The auth module is located in `pkg/auth/`.
+
+### Authentication Modes
+
+| Mode | Use Case | Configuration |
+|------|----------|---------------|
+| **HMAC Signed Token** | Multi-team collaboration, fine-grained access control | `--auth-secret` |
+| **Simple Pre-shared Token** | Quick deployment, single team | `--auth-tokens` |
+| **Hybrid Mode** | Support both token types simultaneously | `--auth-secret` + `--auth-tokens` |
+
+### HMAC Token Format
+
+```
+<base64url(payload)>.<base64url(hmac-sha256(payload))>
+
+payload = {
+  "team":  "team-name",
+  "role":  "member",
+  "iat":   1711900800,
+  "exp":   1711987200,
+  "nonce": "random-base64"
+}
+```
+
+### Roles and Permissions
+
+| Role | connect | write | read | admin |
+|------|---------|-------|------|-------|
+| `admin` | ✅ | ✅ | ✅ | ✅ |
+| `member` | ✅ | ✅ | ✅ | ❌ |
+| `viewer` | ❌ | ❌ | ✅ | ❌ |
+
+### Authentication Handshake Flow
+
+```
+  Client                                Server
+    │                                      │
+    │  ── Mux.OpenStream() ──►            │
+    │                                      │  ◄── Mux.AcceptStream()
+    │                                      │      (with timeout, default 10s)
+    │                                      │
+    │  ── AuthRequest ──────────────────► │
+    │     { token: "xxx",                 │
+    │       version: "1.0.0",             │
+    │       subdomain: "myapp" }          │
+    │                                      │  1. ValidateToken(token)
+    │                                      │     → Try simple match first
+    │                                      │     → Then try HMAC verification
+    │                                      │  2. HasPermission(claims, "connect")
+    │                                      │
+    │  ◄── AuthResponse ────────────────  │
+    │     { success: true,                │
+    │       subdomain: "myapp",           │
+    │       session_id: "abc123" }        │
+    │                                      │
+    │  (continue with RegisterRequest)    │
+```
+
+### Admin API Authentication
+
+- `/health` endpoint is always public
+- `/stats`, `/clients`, `/tunnels` are protected by `--admin-token`
+- Uses `Authorization: Bearer <token>` header
+- Token comparison uses `crypto/subtle.ConstantTimeCompare` to prevent timing attacks
+
+---
+
 ## Security Model
 
 ### Transport Encryption
@@ -590,8 +674,11 @@ On timeout: Mark connection abnormal, trigger reconnection
 
 ### Authentication
 
-- Team Token authentication (full implementation in Phase 5)
-- HMAC-SHA256 based token generation/verification
+- Dual-mode token authentication: HMAC-SHA256 signed tokens (team management) + simple pre-shared tokens (quick deployment)
+- HMAC-SHA256 based token generation/verification with nonce for replay prevention
+- Role-based access control (RBAC): admin, member, viewer roles
+- Mandatory authentication on connection handshake (`--require-auth`), viewer role cannot establish tunnel connections
+- Admin API protected by separate token, using constant-time comparison to prevent timing attacks
 
 ### Input Validation
 

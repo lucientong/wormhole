@@ -57,8 +57,19 @@ type Config struct {
 	// RequireAuth requires authentication for connections.
 	RequireAuth bool
 
-	// AuthTokens is a list of valid authentication tokens.
+	// AuthTokens is a list of valid authentication tokens (simple mode).
 	AuthTokens []string
+
+	// AuthSecret is the HMAC secret for signed token mode.
+	// Must be at least 16 bytes. If empty, only simple token mode is available.
+	AuthSecret string
+
+	// AuthTimeout is the timeout for the authentication handshake.
+	AuthTimeout time.Duration
+
+	// AdminToken is the token required to access the admin API.
+	// If empty, the admin API requires no authentication.
+	AdminToken string
 }
 
 // DefaultConfig returns the default server configuration.
@@ -77,5 +88,6 @@ func DefaultConfig() Config {
 		IdleTimeout:       5 * time.Minute,
 		MaxClients:        1000,
 		RequireAuth:       false,
+		AuthTimeout:       10 * time.Second,
 	}
 }

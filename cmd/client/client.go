@@ -173,12 +173,90 @@ func (c *Client) connect(ctx context.Context) error {
 
 	log.Info().Str("server", c.config.ServerAddr).Msg("Connected to server")
 
+	// Phase 5: Authenticate if token is provided.
+	if c.config.Token != "" {
+		if err := c.authenticate(ctx); err != nil {
+			_ = mux.Close()
+			_ = conn.Close()
+			return fmt.Errorf("authenticate: %w", err)
+		}
+	}
+
 	// Register tunnel
 	if err := c.registerTunnel(ctx); err != nil {
 		_ = mux.Close()
 		_ = conn.Close()
 		return fmt.Errorf("register tunnel: %w", err)
 	}
+
+	return nil
+}
+
+// authenticate sends an AuthRequest to the server and validates the response.
+func (c *Client) authenticate(ctx context.Context) error {
+	c.mu.Lock()
+	mux := c.mux
+	c.mu.Unlock()
+
+	if mux == nil {
+		return fmt.Errorf("not connected")
+	}
+
+	// Open auth stream.
+	stream, err := mux.OpenStreamContext(ctx)
+	if err != nil {
+		return fmt.Errorf("open auth stream: %w", err)
+	}
+	defer stream.Close()
+
+	// Set timeout for auth handshake.
+	if deadlineErr := stream.SetDeadline(time.Now().Add(10 * time.Second)); deadlineErr != nil {
+		return fmt.Errorf("set auth deadline: %w", deadlineErr)
+	}
+
+	// Send auth request.
+	req := proto.NewAuthRequest(c.config.Token, version.Short(), c.config.Subdomain)
+	data, err := req.Encode()
+	if err != nil {
+		return fmt.Errorf("encode auth request: %w", err)
+	}
+
+	if _, writeErr := stream.Write(data); writeErr != nil {
+		return fmt.Errorf("write auth request: %w", writeErr)
+	}
+
+	// Read auth response.
+	buf := make([]byte, 4096)
+	n, err := stream.Read(buf)
+	if err != nil {
+		return fmt.Errorf("read auth response: %w", err)
+	}
+
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	if err != nil {
+		return fmt.Errorf("decode auth response: %w", err)
+	}
+
+	if msg.AuthResponse == nil {
+		return fmt.Errorf("unexpected response type (expected auth response)")
+	}
+
+	resp := msg.AuthResponse
+	if !resp.Success {
+		return fmt.Errorf("server rejected authentication: %s", resp.Error)
+	}
+
+	// Use subdomain from auth response if provided.
+	if resp.Subdomain != "" {
+		c.mu.Lock()
+		c.config.Subdomain = resp.Subdomain
+		c.mu.Unlock()
+	}
+
+	log.Info().
+		Str("session_id", resp.SessionID).
+		Str("subdomain", resp.Subdomain).
+		Msg("Authenticated with server")
 
 	return nil
 }

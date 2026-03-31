@@ -81,7 +81,7 @@ func (s *STUNClient) Discover(ctx context.Context) (*NATInfo, error) {
 		return nil, fmt.Errorf("at least 2 STUN servers required for NAT detection")
 	}
 
-	// Phase 1: Binding request to first server.
+	// Binding request to first server.
 	addr1, localAddr1, err := s.bindingRequest(ctx, s.config.Servers[0])
 	if err != nil {
 		return nil, fmt.Errorf("STUN binding to %s: %w", s.config.Servers[0], err)
@@ -93,7 +93,7 @@ func (s *STUNClient) Discover(ctx context.Context) (*NATInfo, error) {
 		Str("local", localAddr1.String()).
 		Msg("STUN binding result 1")
 
-	// Phase 2: Binding request to second server (from same local port).
+	// Binding request to second server (from same local port).
 	addr2, _, err := s.bindingRequestFromPort(ctx, s.config.Servers[1], localAddr1.Port)
 	if err != nil {
 		// Second server failed — we still know the public address from server 1.
