@@ -1,0 +1,142 @@
+# golangci-lint configuration
+# https://golangci-lint.run/usage/configuration/
+
+run:
+  timeout: 5m
+  tests: true
+  modules-download-mode: readonly
+
+output:
+  formats:
+    - format: colored-line-number
+  print-issued-lines: true
+  print-linter-name: true
+
+linters:
+  enable:
+    # Default linters
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    # Additional linters
+    - bodyclose
+    - contextcheck
+    - dupl
+    - durationcheck
+    - errname
+    - errorlint
+    - copyloopvar
+    - gochecknoinits
+    - goconst
+    - gocritic
+    - gocyclo
+    - godot
+    - gofmt
+    - goimports
+    - goprintffuncname
+    - gosec
+    - misspell
+    - nilerr
+    - nilnil
+    - noctx
+    - nolintlint
+    - prealloc
+    - predeclared
+    - revive
+    - rowserrcheck
+    - sqlclosecheck
+    - stylecheck
+    - usetesting
+    - tparallel
+    - unconvert
+    - unparam
+    - wastedassign
+    - whitespace
+
+linters-settings:
+  errcheck:
+    check-type-assertions: false
+    check-blank: false
+    exclude-functions:
+      - (net/http.ResponseWriter).Write
+      - (*github.com/spf13/cobra.Command).Help
+      - (*github.com/spf13/cobra.Command).MarkFlagRequired
+      - crypto/rand.Read
+
+  govet:
+    enable-all: true
+    disable:
+      - fieldalignment # too strict
+
+  gocyclo:
+    min-complexity: 15
+
+  dupl:
+    threshold: 100
+
+  goconst:
+    min-len: 3
+    min-occurrences: 3
+
+  misspell:
+    locale: US
+
+  revive:
+    rules:
+      - name: blank-imports
+      - name: context-as-argument
+      - name: context-keys-type
+      - name: dot-imports
+      - name: error-return
+      - name: error-strings
+      - name: error-naming
+      - name: exported
+      - name: if-return
+      - name: increment-decrement
+      - name: var-naming
+      - name: var-declaration
+      - name: package-comments
+      - name: range
+      - name: receiver-naming
+      - name: time-naming
+      - name: unexported-return
+      - name: indent-error-flow
+      - name: errorf
+      - name: empty-block
+      - name: superfluous-else
+      - name: unused-parameter
+      - name: unreachable-code
+      - name: redefines-builtin-id
+
+  gosec:
+    excludes:
+      - G114 # Use of net/http serve function that has no support for setting timeouts
+      - G115 # Integer overflow conversion (safe by design with bounds checking)
+      - G304 # File path provided as taint input
+
+  stylecheck:
+    checks: ["all", "-ST1000", "-ST1003"]
+
+issues:
+  exclude-rules:
+    # Exclude some linters from running on tests files
+    - path: _test\.go
+      linters:
+        - dupl
+        - gosec
+        - goconst
+        - gocyclo
+        - errcheck
+        - contextcheck
+        - errorlint
+
+    # Exclude certain issues in main packages
+    - path: cmd/
+      linters:
+        - gochecknoinits
+
+  max-issues-per-linter: 50
+  max-same-issues: 10

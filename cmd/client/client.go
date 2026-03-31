@@ -271,7 +271,7 @@ func (c *Client) acceptStreams(ctx context.Context) {
 			continue
 		}
 
-		go c.handleStream(stream)
+		go c.handleStream(stream) //nolint:contextcheck // stream handling runs as background goroutine
 	}
 }
 
@@ -309,7 +309,8 @@ func (c *Client) handleStream(stream *tunnel.Stream) {
 func (c *Client) forwardToLocal(stream *tunnel.Stream, req *proto.StreamRequest) {
 	// Connect to local service
 	localAddr := net.JoinHostPort(c.config.LocalHost, fmt.Sprintf("%d", c.config.LocalPort))
-	localConn, err := net.DialTimeout("tcp", localAddr, 5*time.Second)
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	localConn, err := dialer.DialContext(context.Background(), "tcp", localAddr)
 	if err != nil {
 		log.Error().Err(err).Str("addr", localAddr).Msg("Connect to local failed")
 		// Send error response

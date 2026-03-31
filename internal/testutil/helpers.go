@@ -50,7 +50,8 @@ func WithTimeout(t *testing.T, d time.Duration) context.Context {
 // GetFreePort returns an available TCP port.
 func GetFreePort(t *testing.T) int {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	lc := net.ListenConfig{}
+	listener, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to get free port: %v", err)
 	}

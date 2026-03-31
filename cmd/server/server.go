@@ -21,27 +21,25 @@ import (
 type Server struct {
 	config Config
 
-	// Listeners
+	// Listeners.
 	tunnelListener net.Listener
 	httpListener   net.Listener
 	adminListener  net.Listener
 
-	// Client management
+	router        *Router
+	httpHandler   *HTTPHandler
+	tlsManager    *TLSManager
+	adminAPI      *AdminAPI
+	portAllocator *TCPPortAllocator
+
+	// Client management.
 	clients    map[string]*ClientSession
 	clientLock sync.RWMutex
 
-	// Tunnel routing
-	routes     map[string]*ClientSession // subdomain -> client
-	routesLock sync.RWMutex
-
-	// TCP port allocation
-	tcpPorts    map[int]*ClientSession
-	nextTCPPort int
-
-	// Stats
+	// Stats.
 	stats ServerStats
 
-	// Shutdown
+	// Shutdown.
 	closed  uint32
 	closeCh chan struct{}
 	closeWg sync.WaitGroup
@@ -83,17 +81,23 @@ type ServerStats struct {
 
 // NewServer creates a new server instance.
 func NewServer(config Config) *Server {
-	return &Server{
-		config:      config,
-		clients:     make(map[string]*ClientSession),
-		routes:      make(map[string]*ClientSession),
-		tcpPorts:    make(map[int]*ClientSession),
-		nextTCPPort: config.TCPPortRangeStart,
-		closeCh:     make(chan struct{}),
+	s := &Server{
+		config:  config,
+		clients: make(map[string]*ClientSession),
+		closeCh: make(chan struct{}),
 		stats: ServerStats{
 			StartTime: time.Now(),
 		},
 	}
+
+	// Initialize Phase 2 components.
+	s.router = NewRouter(config.Domain)
+	s.httpHandler = NewHTTPHandler(s.router, s)
+	s.tlsManager = NewTLSManager(config)
+	s.adminAPI = NewAdminAPI(s)
+	s.portAllocator = NewTCPPortAllocator(config.TCPPortRangeStart, config.TCPPortRangeEnd)
+
+	return s
 }
 
 // Start starts the server.
@@ -102,25 +106,29 @@ func (s *Server) Start(ctx context.Context) error {
 		Str("tunnel_addr", s.config.ListenAddr).
 		Str("http_addr", s.config.HTTPAddr).
 		Str("admin_addr", s.config.AdminAddr).
+		Str("domain", s.config.Domain).
+		Bool("tls", s.config.TLSEnabled).
 		Msg("Starting Wormhole server")
 
-	// Start tunnel listener
-	tunnelLn, err := net.Listen("tcp", s.config.ListenAddr)
+	// Start tunnel listener.
+	lc := net.ListenConfig{}
+	tunnelLn, err := lc.Listen(ctx, "tcp", s.config.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("listen tunnel: %w", err)
 	}
 	s.tunnelListener = tunnelLn
 
-	// Start HTTP listener
-	httpLn, err := net.Listen("tcp", s.config.HTTPAddr)
+	// Start HTTP listener (with optional TLS).
+	httpLn, err := lc.Listen(ctx, "tcp", s.config.HTTPAddr)
 	if err != nil {
 		_ = tunnelLn.Close()
 		return fmt.Errorf("listen http: %w", err)
 	}
-	s.httpListener = httpLn
+	// Wrap with TLS if configured.
+	s.httpListener = s.tlsManager.WrapListener(httpLn)
 
-	// Start admin listener
-	adminLn, err := net.Listen("tcp", s.config.AdminAddr)
+	// Start admin listener.
+	adminLn, err := lc.Listen(ctx, "tcp", s.config.AdminAddr)
 	if err != nil {
 		_ = tunnelLn.Close()
 		_ = httpLn.Close()
@@ -128,15 +136,21 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	s.adminListener = adminLn
 
-	// Start accept loops
+	// Start ACME HTTP-01 challenge server if AutoTLS is enabled.
+	if s.config.TLSEnabled && s.config.AutoTLS {
+		s.closeWg.Add(1)
+		go s.serveACMEChallenge()
+	}
+
+	// Start accept loops.
 	s.closeWg.Add(3)
-	go s.acceptTunnelLoop()
+	go s.acceptTunnelLoop() //nolint:contextcheck // tunnel accept loop runs as background goroutine
 	go s.serveHTTP()
 	go s.serveAdmin()
 
 	log.Info().Msg("Server started successfully")
 
-	// Wait for shutdown
+	// Wait for shutdown.
 	<-ctx.Done()
 	return s.Shutdown()
 }
@@ -150,7 +164,7 @@ func (s *Server) Shutdown() error {
 	log.Info().Msg("Shutting down server...")
 	close(s.closeCh)
 
-	// Close listeners
+	// Close listeners.
 	if s.tunnelListener != nil {
 		_ = s.tunnelListener.Close()
 	}
@@ -161,7 +175,12 @@ func (s *Server) Shutdown() error {
 		_ = s.adminListener.Close()
 	}
 
-	// Close all clients
+	// Close port allocator.
+	if s.portAllocator != nil {
+		s.portAllocator.CloseAll()
+	}
+
+	// Close all clients.
 	s.clientLock.Lock()
 	for _, client := range s.clients {
 		_ = client.Mux.Close()
@@ -196,7 +215,7 @@ func (s *Server) handleClient(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr().String()
 	log.Info().Str("remote", remoteAddr).Msg("New client connection")
 
-	// Create multiplexer
+	// Create multiplexer.
 	mux, err := tunnel.Server(conn, s.config.MuxConfig)
 	if err != nil {
 		log.Error().Err(err).Str("remote", remoteAddr).Msg("Failed to create mux")
@@ -204,11 +223,11 @@ func (s *Server) handleClient(conn net.Conn) {
 		return
 	}
 
-	// Generate session ID and subdomain
+	// Generate session ID and subdomain.
 	sessionID := generateID()
 	subdomain := generateSubdomain()
 
-	// Create client session
+	// Create client session.
 	client := &ClientSession{
 		ID:        sessionID,
 		Subdomain: subdomain,
@@ -217,14 +236,15 @@ func (s *Server) handleClient(conn net.Conn) {
 		LastSeen:  time.Now(),
 	}
 
-	// Register client
+	// Register client.
 	s.clientLock.Lock()
 	s.clients[sessionID] = client
 	s.clientLock.Unlock()
 
-	s.routesLock.Lock()
-	s.routes[subdomain] = client
-	s.routesLock.Unlock()
+	// Register route via Router.
+	if err := s.router.RegisterSubdomain(subdomain, client); err != nil {
+		log.Error().Err(err).Str("subdomain", subdomain).Msg("Failed to register subdomain")
+	}
 
 	atomic.AddUint64(&s.stats.ActiveClients, 1)
 	atomic.AddUint64(&s.stats.TotalClients, 1)
@@ -235,10 +255,10 @@ func (s *Server) handleClient(conn net.Conn) {
 		Str("remote", remoteAddr).
 		Msg("Client registered")
 
-	// Handle client streams
+	// Handle client streams.
 	s.handleClientStreams(client)
 
-	// Client disconnected
+	// Client disconnected — clean up.
 	s.removeClient(client)
 	log.Info().
 		Str("session_id", sessionID).
@@ -265,7 +285,7 @@ func (s *Server) handleClientStreams(client *ClientSession) {
 func (s *Server) handleClientStream(client *ClientSession, stream *tunnel.Stream) {
 	defer stream.Close()
 
-	// Read control message
+	// Read control message.
 	buf := make([]byte, 4096)
 	n, err := stream.Read(buf)
 	if err != nil {
@@ -279,7 +299,7 @@ func (s *Server) handleClientStream(client *ClientSession, stream *tunnel.Stream
 		return
 	}
 
-	// Handle message
+	// Handle message.
 	switch msg.Type {
 	case proto.MessageTypeRegisterRequest:
 		s.handleRegister(client, stream, msg.RegisterRequest)
@@ -293,13 +313,33 @@ func (s *Server) handleClientStream(client *ClientSession, stream *tunnel.Stream
 // handleRegister handles a tunnel registration request.
 func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, req *proto.RegisterRequest) {
 	tunnelID := generateID()
-	publicURL := fmt.Sprintf("http://%s.%s", client.Subdomain, s.config.Domain)
+
+	// Determine public URL based on TLS config.
+	scheme := "http"
+	if s.config.TLSEnabled {
+		scheme = "https"
+	}
+	publicURL := fmt.Sprintf("%s://%s.%s", scheme, client.Subdomain, s.config.Domain)
+
+	// Allocate TCP port for TCP tunnels.
+	var tcpPort uint32
+	if req.Protocol == proto.ProtocolTCP {
+		port, ln, allocErr := s.portAllocator.Allocate(context.Background())
+		if allocErr != nil {
+			log.Error().Err(allocErr).Msg("Failed to allocate TCP port")
+		} else {
+			tcpPort = uint32(port)
+			// Start TCP listener for this tunnel.
+			go s.serveTCPTunnel(ln, client)
+		}
+	}
 
 	tunnelInfo := &TunnelInfo{
 		ID:        tunnelID,
 		LocalPort: req.LocalPort,
 		Protocol:  req.Protocol,
 		PublicURL: publicURL,
+		TCPPort:   tcpPort,
 		CreatedAt: time.Now(),
 	}
 
@@ -309,8 +349,15 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 
 	atomic.AddUint64(&s.stats.ActiveTunnels, 1)
 
-	// Send response
-	resp := proto.NewRegisterResponse(true, "", tunnelID, publicURL, 0)
+	// Also register custom hostname/path if requested.
+	if req.Hostname != "" {
+		if regErr := s.router.RegisterHostname(req.Hostname, client); regErr != nil {
+			log.Warn().Err(regErr).Str("hostname", req.Hostname).Msg("Failed to register custom hostname")
+		}
+	}
+
+	// Send response.
+	resp := proto.NewRegisterResponse(true, "", tunnelID, publicURL, tcpPort)
 	data, err := resp.Encode()
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to encode register response")
@@ -325,6 +372,7 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 		Str("tunnel_id", tunnelID).
 		Str("public_url", publicURL).
 		Uint32("local_port", req.LocalPort).
+		Uint32("tcp_port", tcpPort).
 		Msg("Tunnel registered")
 }
 
@@ -345,13 +393,12 @@ func (s *Server) handlePing(client *ClientSession, stream *tunnel.Stream, req *p
 	}
 }
 
-// serveHTTP serves HTTP requests.
+// serveHTTP serves HTTP requests using the new HTTPHandler.
 func (s *Server) serveHTTP() {
 	defer s.closeWg.Done()
 
-	handler := http.HandlerFunc(s.httpHandler)
 	server := &http.Server{
-		Handler:      handler,
+		Handler:      s.httpHandler,
 		ReadTimeout:  s.config.ReadTimeout,
 		WriteTimeout: s.config.WriteTimeout,
 		IdleTimeout:  s.config.IdleTimeout,
@@ -362,90 +409,12 @@ func (s *Server) serveHTTP() {
 	}
 }
 
-// httpHandler handles HTTP requests and routes them to the appropriate client.
-func (s *Server) httpHandler(w http.ResponseWriter, r *http.Request) {
-	host := r.Host
-	subdomain := extractSubdomain(host, s.config.Domain)
-
-	if subdomain == "" {
-		http.Error(w, "No tunnel found for this host", http.StatusNotFound)
-		return
-	}
-
-	// Find client
-	s.routesLock.RLock()
-	client := s.routes[subdomain]
-	s.routesLock.RUnlock()
-
-	if client == nil {
-		http.Error(w, "Tunnel not found", http.StatusNotFound)
-		return
-	}
-
-	// Forward request to client
-	if err := s.forwardHTTP(client, w, r); err != nil {
-		log.Error().Err(err).Str("subdomain", subdomain).Msg("Forward HTTP failed")
-		http.Error(w, "Tunnel error", http.StatusBadGateway)
-	}
-
-	atomic.AddUint64(&s.stats.Requests, 1)
-}
-
-// forwardHTTP forwards an HTTP request to the client.
-func (s *Server) forwardHTTP(client *ClientSession, w http.ResponseWriter, r *http.Request) error {
-	// Open stream to client
-	stream, err := client.Mux.OpenStreamContext(r.Context())
-	if err != nil {
-		return fmt.Errorf("open stream: %w", err)
-	}
-	defer stream.Close()
-
-	// Send stream request
-	streamReq := proto.NewStreamRequest("", generateID(), r.RemoteAddr, proto.ProtocolHTTP)
-	streamReq.StreamRequest.HTTPMetadata = &proto.HTTPMetadata{
-		Method:        r.Method,
-		URI:           r.RequestURI,
-		Host:          r.Host,
-		ContentType:   r.Header.Get("Content-Type"),
-		ContentLength: r.ContentLength,
-	}
-	data, err := streamReq.Encode()
-	if err != nil {
-		return fmt.Errorf("encode stream request: %w", err)
-	}
-	if _, err := stream.Write(data); err != nil {
-		return fmt.Errorf("write stream request: %w", err)
-	}
-
-	// Write HTTP request headers
-	if err := r.Write(stream); err != nil {
-		return fmt.Errorf("write http request: %w", err)
-	}
-
-	// Read response
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := stream.Read(buf)
-		if err != nil {
-			break
-		}
-		_, _ = w.Write(buf[:n])
-	}
-
-	return nil
-}
-
-// serveAdmin serves the admin API.
+// serveAdmin serves the admin API using the new AdminAPI handler.
 func (s *Server) serveAdmin() {
 	defer s.closeWg.Done()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", s.adminHealth)
-	mux.HandleFunc("/stats", s.adminStats)
-	mux.HandleFunc("/clients", s.adminClients)
-
 	server := &http.Server{
-		Handler:      mux,
+		Handler:      s.adminAPI.Handler(),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
@@ -455,39 +424,94 @@ func (s *Server) serveAdmin() {
 	}
 }
 
-// adminHealth returns health status.
-func (s *Server) adminHealth(w http.ResponseWriter, _ *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"status":"healthy"}`))
-}
+// serveACMEChallenge serves ACME HTTP-01 challenges on port 80.
+func (s *Server) serveACMEChallenge() {
+	defer s.closeWg.Done()
 
-// adminStats returns server statistics.
-func (s *Server) adminStats(w http.ResponseWriter, _ *http.Request) {
-	stats := s.getStats()
-	fmt.Fprintf(w, `{"active_clients":%d,"total_clients":%d,"active_tunnels":%d,"requests":%d,"uptime_seconds":%d}`,
-		stats.ActiveClients,
-		stats.TotalClients,
-		stats.ActiveTunnels,
-		stats.Requests,
-		int64(time.Since(stats.StartTime).Seconds()))
-}
-
-// adminClients returns the list of connected clients.
-func (s *Server) adminClients(w http.ResponseWriter, _ *http.Request) {
-	s.clientLock.RLock()
-	defer s.clientLock.RUnlock()
-
-	_, _ = w.Write([]byte("["))
-	first := true
-	for _, client := range s.clients {
-		if !first {
-			_, _ = w.Write([]byte(","))
-		}
-		first = false
-		fmt.Fprintf(w, `{"id":"%s","subdomain":"%s","created_at":"%s"}`,
-			client.ID, client.Subdomain, client.CreatedAt.Format(time.RFC3339))
+	challengeServer := &http.Server{
+		Addr:         ":80",
+		Handler:      s.tlsManager.HTTPChallengeHandler(),
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 5 * time.Second,
 	}
-	_, _ = w.Write([]byte("]"))
+
+	if err := challengeServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Error().Err(err).Msg("ACME challenge server error")
+	}
+}
+
+// serveTCPTunnel handles raw TCP connections for a tunnel.
+func (s *Server) serveTCPTunnel(ln net.Listener, client *ClientSession) {
+	defer ln.Close()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if s.isClosed() {
+				return
+			}
+			log.Error().Err(err).Msg("Accept TCP tunnel connection failed")
+			continue
+		}
+
+		go s.handleTCPConnection(conn, client)
+	}
+}
+
+// handleTCPConnection handles a single raw TCP connection by proxying it through the tunnel.
+func (s *Server) handleTCPConnection(conn net.Conn, client *ClientSession) {
+	defer conn.Close()
+
+	// Open stream to client.
+	stream, err := client.Mux.OpenStreamContext(context.Background())
+	if err != nil {
+		log.Error().Err(err).Msg("Open stream for TCP tunnel failed")
+		return
+	}
+	defer stream.Close()
+
+	// Send stream request.
+	streamReq := proto.NewStreamRequest("", generateID(), conn.RemoteAddr().String(), proto.ProtocolTCP)
+	data, err := streamReq.Encode()
+	if err != nil {
+		return
+	}
+	if _, err := stream.Write(data); err != nil {
+		return
+	}
+
+	// Bidirectional proxy.
+	done := make(chan struct{}, 2)
+
+	go func() {
+		buf := make([]byte, 32*1024)
+		for {
+			n, readErr := conn.Read(buf)
+			if readErr != nil {
+				break
+			}
+			if _, writeErr := stream.Write(buf[:n]); writeErr != nil {
+				break
+			}
+		}
+		done <- struct{}{}
+	}()
+
+	go func() {
+		buf := make([]byte, 32*1024)
+		for {
+			n, readErr := stream.Read(buf)
+			if readErr != nil {
+				break
+			}
+			if _, writeErr := conn.Write(buf[:n]); writeErr != nil {
+				break
+			}
+		}
+		done <- struct{}{}
+	}()
+
+	<-done
 }
 
 // removeClient removes a client from the server.
@@ -496,11 +520,19 @@ func (s *Server) removeClient(client *ClientSession) {
 	delete(s.clients, client.ID)
 	s.clientLock.Unlock()
 
-	s.routesLock.Lock()
-	delete(s.routes, client.Subdomain)
-	s.routesLock.Unlock()
+	// Remove all routes via Router.
+	s.router.Unregister(client)
 
-	atomic.AddUint64(&s.stats.ActiveClients, ^uint64(0)) // Decrement
+	// Release allocated TCP ports.
+	client.mu.Lock()
+	for _, t := range client.Tunnels {
+		if t.TCPPort > 0 {
+			s.portAllocator.Release(int(t.TCPPort))
+		}
+	}
+	client.mu.Unlock()
+
+	atomic.AddUint64(&s.stats.ActiveClients, ^uint64(0)) // Decrement.
 
 	_ = client.Mux.Close()
 }
@@ -523,7 +555,7 @@ func (s *Server) isClosed() bool {
 	return atomic.LoadUint32(&s.closed) == 1
 }
 
-// Helper functions
+// Helper functions.
 
 func generateID() string {
 	b := make([]byte, 8)
@@ -535,13 +567,4 @@ func generateSubdomain() string {
 	b := make([]byte, 4)
 	rand.Read(b)
 	return hex.EncodeToString(b)
-}
-
-func extractSubdomain(host, domain string) string {
-	// Simple extraction: assumes host is subdomain.domain
-	// In production, this should be more robust
-	if len(host) <= len(domain) {
-		return ""
-	}
-	return host[:len(host)-len(domain)-1]
 }

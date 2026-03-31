@@ -1,41 +1,27 @@
-# golangci-lint configuration
-# https://golangci-lint.run/usage/configuration/
-
+version: "2"
 run:
-  timeout: 5m
-  tests: true
   modules-download-mode: readonly
-
+  tests: true
 output:
   formats:
-    - format: colored-line-number
-  print-issued-lines: true
-  print-linter-name: true
-
+    text:
+      path: stdout
+      print-linter-name: true
+      print-issued-lines: true
 linters:
   enable:
-    # Default linters
-    - errcheck
-    - gosimple
-    - govet
-    - ineffassign
-    - staticcheck
-    - unused
-    # Additional linters
     - bodyclose
     - contextcheck
+    - copyloopvar
     - dupl
     - durationcheck
     - errname
     - errorlint
-    - copyloopvar
     - gochecknoinits
     - goconst
     - gocritic
     - gocyclo
     - godot
-    - gofmt
-    - goimports
     - goprintffuncname
     - gosec
     - misspell
@@ -48,95 +34,107 @@ linters:
     - revive
     - rowserrcheck
     - sqlclosecheck
-    - stylecheck
-    - usetesting
+    - staticcheck
     - tparallel
     - unconvert
     - unparam
+    - usetesting
     - wastedassign
     - whitespace
-
-linters-settings:
-  errcheck:
-    check-type-assertions: false
-    check-blank: false
-    exclude-functions:
-      - (net/http.ResponseWriter).Write
-      - (*github.com/spf13/cobra.Command).Help
-      - (*github.com/spf13/cobra.Command).MarkFlagRequired
-      - crypto/rand.Read
-
-  govet:
-    enable-all: true
-    disable:
-      - fieldalignment # too strict
-
-  gocyclo:
-    min-complexity: 15
-
-  dupl:
-    threshold: 100
-
-  goconst:
-    min-len: 3
-    min-occurrences: 3
-
-  misspell:
-    locale: US
-
-  revive:
+  settings:
+    dupl:
+      threshold: 100
+    errcheck:
+      check-type-assertions: false
+      check-blank: false
+      exclude-functions:
+        - (net/http.ResponseWriter).Write
+        - (*github.com/spf13/cobra.Command).Help
+        - (*github.com/spf13/cobra.Command).MarkFlagRequired
+        - crypto/rand.Read
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+    gocyclo:
+      min-complexity: 15
+    gosec:
+      excludes:
+        - G114
+        - G115
+        - G304
+    govet:
+      disable:
+        - fieldalignment
+      enable-all: true
+    misspell:
+      locale: US
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+        - name: if-return
+        - name: increment-decrement
+        - name: var-naming
+        - name: var-declaration
+        - name: package-comments
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: indent-error-flow
+        - name: errorf
+        - name: empty-block
+        - name: superfluous-else
+        - name: unused-parameter
+        - name: unreachable-code
+        - name: redefines-builtin-id
+    staticcheck:
+      checks:
+        - all
+        - -ST1000
+        - -ST1003
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
     rules:
-      - name: blank-imports
-      - name: context-as-argument
-      - name: context-keys-type
-      - name: dot-imports
-      - name: error-return
-      - name: error-strings
-      - name: error-naming
-      - name: exported
-      - name: if-return
-      - name: increment-decrement
-      - name: var-naming
-      - name: var-declaration
-      - name: package-comments
-      - name: range
-      - name: receiver-naming
-      - name: time-naming
-      - name: unexported-return
-      - name: indent-error-flow
-      - name: errorf
-      - name: empty-block
-      - name: superfluous-else
-      - name: unused-parameter
-      - name: unreachable-code
-      - name: redefines-builtin-id
-
-  gosec:
-    excludes:
-      - G114 # Use of net/http serve function that has no support for setting timeouts
-      - G115 # Integer overflow conversion (safe by design with bounds checking)
-      - G304 # File path provided as taint input
-
-  stylecheck:
-    checks: ["all", "-ST1000", "-ST1003"]
-
+      - linters:
+          - contextcheck
+          - dupl
+          - errcheck
+          - errorlint
+          - goconst
+          - gocyclo
+          - gosec
+          - noctx
+          - revive
+        path: _test\.go
+      - linters:
+          - gochecknoinits
+        path: cmd/
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
 issues:
-  exclude-rules:
-    # Exclude some linters from running on tests files
-    - path: _test\.go
-      linters:
-        - dupl
-        - gosec
-        - goconst
-        - gocyclo
-        - errcheck
-        - contextcheck
-        - errorlint
-
-    # Exclude certain issues in main packages
-    - path: cmd/
-      linters:
-        - gochecknoinits
-
   max-issues-per-linter: 50
   max-same-issues: 10
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
