@@ -1,0 +1,120 @@
+# GoReleaser configuration
+# https://goreleaser.com
+
+version: 1
+
+before:
+  hooks:
+    - go mod tidy
+    - go generate ./...
+
+builds:
+  - id: wormhole
+    main: ./cmd/wormhole
+    binary: wormhole
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w
+      - -X github.com/wormhole-tunnel/wormhole/pkg/version.Version={{.Version}}
+      - -X github.com/wormhole-tunnel/wormhole/pkg/version.Commit={{.ShortCommit}}
+      - -X github.com/wormhole-tunnel/wormhole/pkg/version.BuildTime={{.Date}}
+
+archives:
+  - id: default
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  name_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^ci:'
+      - '^chore:'
+      - Merge pull request
+      - Merge branch
+
+release:
+  github:
+    owner: wormhole-tunnel
+    name: wormhole
+  prerelease: auto
+  draft: false
+  name_template: "v{{.Version}}"
+  header: |
+    ## Wormhole v{{.Version}}
+    
+    A zero-config tunnel tool to expose local services to the internet.
+  footer: |
+    ---
+    
+    ### Quick Install
+    
+    ```bash
+    curl -sSL https://install.wormhole.dev | sh
+    ```
+    
+    ### Docker
+    
+    ```bash
+    docker pull wormhole/wormhole:{{.Version}}
+    ```
+
+brews:
+  - name: wormhole
+    repository:
+      owner: wormhole-tunnel
+      name: homebrew-tap
+    folder: Formula
+    homepage: https://github.com/wormhole-tunnel/wormhole
+    description: Zero-config tunnel tool to expose local services to the internet
+    license: MIT
+    install: |
+      bin.install "wormhole"
+    test: |
+      system "#{bin}/wormhole", "version"
+
+nfpms:
+  - id: packages
+    package_name: wormhole
+    vendor: Wormhole
+    homepage: https://github.com/wormhole-tunnel/wormhole
+    description: Zero-config tunnel tool to expose local services to the internet
+    license: MIT
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+    contents:
+      - src: deployments/systemd/wormhole-server.service
+        dst: /etc/systemd/system/wormhole-server.service
+        type: config

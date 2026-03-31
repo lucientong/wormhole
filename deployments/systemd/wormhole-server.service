@@ -1,0 +1,58 @@
+[Unit]
+Description=Wormhole Tunnel Server
+Documentation=https://github.com/wormhole-tunnel/wormhole
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wormhole
+Group=wormhole
+
+# Configuration
+Environment=WORMHOLE_DOMAIN=tunnel.example.com
+Environment=WORMHOLE_TLS_ENABLED=true
+Environment=WORMHOLE_TLS_EMAIL=admin@example.com
+
+# Working directory
+WorkingDirectory=/opt/wormhole
+
+# Executable
+ExecStart=/usr/local/bin/wormhole server \
+    --port 7000 \
+    --http-port 80 \
+    --admin-port 7001 \
+    --domain ${WORMHOLE_DOMAIN} \
+    --tls=${WORMHOLE_TLS_ENABLED}
+
+# Restart on failure
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+
+# Allow binding to privileged ports
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Resource limits
+LimitNOFILE=65535
+LimitNPROC=4096
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wormhole
+
+[Install]
+WantedBy=multi-user.target

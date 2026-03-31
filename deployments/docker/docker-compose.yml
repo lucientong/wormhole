@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  wormhole-server:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+      args:
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-unknown}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
+    image: wormhole/wormhole:${VERSION:-latest}
+    container_name: wormhole-server
+    restart: unless-stopped
+    ports:
+      - "7000:7000"  # Tunnel connections
+      - "80:80"      # HTTP traffic
+      - "443:443"    # HTTPS traffic (optional)
+      - "7001:7001"  # Admin API
+    environment:
+      - WORMHOLE_DOMAIN=${WORMHOLE_DOMAIN:-localhost}
+      - WORMHOLE_TLS_ENABLED=${WORMHOLE_TLS_ENABLED:-false}
+      - WORMHOLE_TLS_EMAIL=${WORMHOLE_TLS_EMAIL:-}
+    volumes:
+      - wormhole-data:/data
+      - wormhole-certs:/certs
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:7001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - wormhole-net
+
+volumes:
+  wormhole-data:
+  wormhole-certs:
+
+networks:
+  wormhole-net:
+    driver: bridge

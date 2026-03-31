@@ -1,0 +1,238 @@
+syntax = "proto3";
+
+package wormhole;
+
+option go_package = "github.com/wormhole-tunnel/wormhole/pkg/proto";
+
+// AuthRequest is sent by client to authenticate with the server.
+message AuthRequest {
+  // Token for authentication (team token or API key)
+  string token = 1;
+  
+  // Client version
+  string version = 2;
+  
+  // Requested subdomain (optional)
+  string subdomain = 3;
+  
+  // Client capabilities
+  repeated string capabilities = 4;
+}
+
+// AuthResponse is sent by server after authentication.
+message AuthResponse {
+  // Whether authentication succeeded
+  bool success = 1;
+  
+  // Error message if failed
+  string error = 2;
+  
+  // Assigned subdomain
+  string subdomain = 3;
+  
+  // Public URL for the tunnel
+  string public_url = 4;
+  
+  // Assigned TCP port (if applicable)
+  uint32 tcp_port = 5;
+  
+  // Server capabilities
+  repeated string capabilities = 6;
+  
+  // Session ID for this connection
+  string session_id = 7;
+}
+
+// RegisterRequest is sent by client to register a tunnel.
+message RegisterRequest {
+  // Local port being exposed
+  uint32 local_port = 1;
+  
+  // Protocol type
+  Protocol protocol = 2;
+  
+  // Requested subdomain (optional)
+  string subdomain = 3;
+  
+  // Custom hostname (for HTTP routing)
+  string hostname = 4;
+}
+
+// RegisterResponse is sent by server after tunnel registration.
+message RegisterResponse {
+  // Whether registration succeeded
+  bool success = 1;
+  
+  // Error message if failed
+  string error = 2;
+  
+  // Assigned tunnel ID
+  string tunnel_id = 3;
+  
+  // Public URL for the tunnel
+  string public_url = 4;
+  
+  // Assigned TCP port (for TCP tunnels)
+  uint32 tcp_port = 5;
+}
+
+// Protocol defines the protocol type for a tunnel.
+enum Protocol {
+  PROTOCOL_UNKNOWN = 0;
+  PROTOCOL_HTTP = 1;
+  PROTOCOL_HTTPS = 2;
+  PROTOCOL_TCP = 3;
+  PROTOCOL_UDP = 4;
+  PROTOCOL_WEBSOCKET = 5;
+  PROTOCOL_GRPC = 6;
+}
+
+// PingRequest is used for keep-alive.
+message PingRequest {
+  // Ping ID for matching responses
+  uint64 ping_id = 1;
+  
+  // Timestamp when ping was sent
+  int64 timestamp = 2;
+}
+
+// PingResponse is the response to a ping.
+message PingResponse {
+  // Echo back the ping ID
+  uint64 ping_id = 1;
+  
+  // Server timestamp
+  int64 timestamp = 2;
+}
+
+// StreamRequest is sent to initiate a new stream.
+message StreamRequest {
+  // Tunnel ID this stream belongs to
+  string tunnel_id = 1;
+  
+  // Request ID for correlation
+  string request_id = 2;
+  
+  // Remote address of the incoming connection
+  string remote_addr = 3;
+  
+  // Protocol of the incoming request
+  Protocol protocol = 4;
+  
+  // HTTP-specific metadata
+  HttpMetadata http_metadata = 5;
+}
+
+// HttpMetadata contains HTTP-specific information.
+message HttpMetadata {
+  // HTTP method
+  string method = 1;
+  
+  // Request URI
+  string uri = 2;
+  
+  // Host header
+  string host = 3;
+  
+  // Content-Type header
+  string content_type = 4;
+  
+  // Content-Length
+  int64 content_length = 5;
+}
+
+// StreamResponse is the response to a stream request.
+message StreamResponse {
+  // Request ID for correlation
+  string request_id = 1;
+  
+  // Whether the stream was accepted
+  bool accepted = 2;
+  
+  // Error message if rejected
+  string error = 3;
+}
+
+// StatsRequest requests statistics from the server.
+message StatsRequest {
+  // Session ID to get stats for (empty for all)
+  string session_id = 1;
+}
+
+// StatsResponse contains statistics.
+message StatsResponse {
+  // Number of active tunnels
+  uint32 active_tunnels = 1;
+  
+  // Number of active connections
+  uint32 active_connections = 2;
+  
+  // Total bytes sent
+  uint64 bytes_sent = 3;
+  
+  // Total bytes received
+  uint64 bytes_received = 4;
+  
+  // Number of requests handled
+  uint64 requests_handled = 5;
+  
+  // Uptime in seconds
+  uint64 uptime_seconds = 6;
+}
+
+// CloseRequest is sent to close a tunnel.
+message CloseRequest {
+  // Tunnel ID to close
+  string tunnel_id = 1;
+  
+  // Reason for closing
+  string reason = 2;
+}
+
+// CloseResponse acknowledges a close request.
+message CloseResponse {
+  // Whether close was successful
+  bool success = 1;
+}
+
+// ControlMessage is a wrapper for all control messages.
+message ControlMessage {
+  // Message type
+  MessageType type = 1;
+  
+  // Sequence number for request/response matching
+  uint64 sequence = 2;
+  
+  // One of the following messages
+  oneof payload {
+    AuthRequest auth_request = 10;
+    AuthResponse auth_response = 11;
+    RegisterRequest register_request = 12;
+    RegisterResponse register_response = 13;
+    PingRequest ping_request = 14;
+    PingResponse ping_response = 15;
+    StreamRequest stream_request = 16;
+    StreamResponse stream_response = 17;
+    StatsRequest stats_request = 18;
+    StatsResponse stats_response = 19;
+    CloseRequest close_request = 20;
+    CloseResponse close_response = 21;
+  }
+}
+
+// MessageType identifies the type of control message.
+enum MessageType {
+  MESSAGE_TYPE_UNKNOWN = 0;
+  MESSAGE_TYPE_AUTH_REQUEST = 1;
+  MESSAGE_TYPE_AUTH_RESPONSE = 2;
+  MESSAGE_TYPE_REGISTER_REQUEST = 3;
+  MESSAGE_TYPE_REGISTER_RESPONSE = 4;
+  MESSAGE_TYPE_PING_REQUEST = 5;
+  MESSAGE_TYPE_PING_RESPONSE = 6;
+  MESSAGE_TYPE_STREAM_REQUEST = 7;
+  MESSAGE_TYPE_STREAM_RESPONSE = 8;
+  MESSAGE_TYPE_STATS_REQUEST = 9;
+  MESSAGE_TYPE_STATS_RESPONSE = 10;
+  MESSAGE_TYPE_CLOSE_REQUEST = 11;
+  MESSAGE_TYPE_CLOSE_RESPONSE = 12;
+}
