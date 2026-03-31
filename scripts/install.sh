@@ -5,7 +5,7 @@
 set -e
 
 # Configuration
-REPO="wormhole-tunnel/wormhole"
+REPO="lucientong/wormhole"
 BINARY_NAME="wormhole"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 

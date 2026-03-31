@@ -55,7 +55,12 @@ type ClientSession struct {
 	LastSeen  time.Time
 	BytesIn   uint64
 	BytesOut  uint64
-	mu        sync.Mutex
+
+	// P2P info.
+	P2PPublicAddr string
+	P2PNATType    string
+
+	mu sync.Mutex
 }
 
 // TunnelInfo contains information about a tunnel.
@@ -305,6 +310,10 @@ func (s *Server) handleClientStream(client *ClientSession, stream *tunnel.Stream
 		s.handleRegister(client, stream, msg.RegisterRequest)
 	case proto.MessageTypePingRequest:
 		s.handlePing(client, stream, msg.PingRequest)
+	case proto.MessageTypeP2POfferRequest:
+		s.handleP2POffer(client, stream, msg.P2POfferRequest)
+	case proto.MessageTypeP2PResult:
+		s.handleP2PResult(client, msg.P2PResult)
 	default:
 		log.Warn().Int("type", int(msg.Type)).Msg("Unknown message type")
 	}
@@ -391,6 +400,65 @@ func (s *Server) handlePing(client *ClientSession, stream *tunnel.Stream, req *p
 	if _, err := stream.Write(data); err != nil {
 		log.Error().Err(err).Msg("Failed to write ping response")
 	}
+}
+
+// handleP2POffer handles a P2P connection offer from a client.
+// It stores the client's P2P info and returns the peer's info if available.
+func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, req *proto.P2POfferRequest) {
+	// Store client's P2P info.
+	client.mu.Lock()
+	client.P2PPublicAddr = req.PublicAddr
+	client.P2PNATType = req.NATType
+	client.mu.Unlock()
+
+	log.Info().
+		Str("client", client.ID).
+		Str("nat_type", req.NATType).
+		Str("public_addr", req.PublicAddr).
+		Msg("P2P offer received")
+
+	// For now, we store the P2P info for future peer matching.
+	// In a multi-client scenario, we would look up the peer and relay the offer.
+	// Current single-client-exposes-service model doesn't have a direct peer to
+	// match, so we respond with success=false and the client stays in relay mode.
+	resp := proto.NewP2POfferResponse(false, "no peer available for P2P", "", "")
+	data, err := resp.Encode()
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to encode P2P offer response")
+		return
+	}
+	if _, err := stream.Write(data); err != nil {
+		log.Error().Err(err).Msg("Failed to write P2P offer response")
+	}
+}
+
+// handleP2PResult handles a P2P result notification from a client.
+func (s *Server) handleP2PResult(client *ClientSession, result *proto.P2PResult) {
+	if result.Success {
+		log.Info().
+			Str("client", client.ID).
+			Str("peer_addr", result.PeerAddr).
+			Msg("P2P connection established")
+	} else {
+		log.Info().
+			Str("client", client.ID).
+			Str("error", result.Error).
+			Msg("P2P connection failed, using relay")
+	}
+}
+
+// findPeerForP2P looks up a peer client that could establish a P2P connection.
+// Returns nil if no suitable peer is found.
+func (s *Server) findPeerForP2P(excludeClientID string) *ClientSession {
+	s.clientLock.RLock()
+	defer s.clientLock.RUnlock()
+
+	for _, client := range s.clients {
+		if client.ID != excludeClientID && client.P2PPublicAddr != "" {
+			return client
+		}
+	}
+	return nil
 }
 
 // serveHTTP serves HTTP requests using the new HTTPHandler.

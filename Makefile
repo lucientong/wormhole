@@ -35,8 +35,8 @@ NC := \033[0m # No Color
 ## Default target
 all: lint test build
 
-## Build the binary for current platform
-build:
+## Build the binary for current platform (includes web UI)
+build: web
 	@echo "$(GREEN)Building $(BINARY_NAME)...$(NC)"
 	@mkdir -p $(DIST_DIR)
 	$(GOBUILD) $(LDFLAGS) -o $(DIST_DIR)/$(BINARY_NAME) $(CMD_DIR)
@@ -79,6 +79,7 @@ clean:
 	@echo "$(YELLOW)Cleaning...$(NC)"
 	@rm -rf $(DIST_DIR)
 	@rm -rf coverage.out coverage.html
+	@find ./pkg/web/dist -mindepth 1 ! -name '.gitkeep' -delete 2>/dev/null || true
 	@echo "$(GREEN)Clean complete$(NC)"
 
 ## Run tests
@@ -118,11 +119,11 @@ proto:
 	@echo "$(GREEN)Generating protobuf files...$(NC)"
 	@./scripts/gen-proto.sh
 
-## Build web UI
+## Build web UI (outputs to pkg/web/dist/ for Go embed)
 web:
 	@echo "$(GREEN)Building web UI...$(NC)"
 	@cd $(WEB_DIR) && npm install && npm run build
-	@echo "$(GREEN)Web UI build complete$(NC)"
+	@echo "$(GREEN)Web UI build complete -> pkg/web/dist/$(NC)"
 
 ## Download dependencies
 deps:

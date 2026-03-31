@@ -40,6 +40,11 @@ func main() {
 	// Create client
 	client := NewClient(config)
 
+	// Start inspector if enabled.
+	if err := client.StartInspector(config.InspectorPort); err != nil {
+		log.Fatal().Err(err).Msg("Failed to start inspector")
+	}
+
 	// Handle shutdown signals
 	ctx, cancel := context.WithCancel(context.Background())
 

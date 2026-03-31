@@ -41,6 +41,8 @@ Thumbs.db
 # Web frontend
 /web/node_modules/
 /web/dist/
+/pkg/web/dist/
+!/pkg/web/dist/.gitkeep
 /pkg/web/static/
 
 # Logs

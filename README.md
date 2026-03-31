@@ -4,9 +4,9 @@
 
 Wormhole folds network space like a wormhole, allowing developers to expose local services to the internet with a single command.
 
-[![CI](https://github.com/wormhole-tunnel/wormhole/actions/workflows/ci.yml/badge.svg)](https://github.com/wormhole-tunnel/wormhole/actions/workflows/ci.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/wormhole-tunnel/wormhole)](https://goreportcard.com/report/github.com/wormhole-tunnel/wormhole)
-[![License](https://img.shields.io/github/license/wormhole-tunnel/wormhole)](LICENSE)
+[![CI](https://github.com/lucientong/wormhole/actions/workflows/ci.yml/badge.svg)](https://github.com/lucientong/wormhole/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/lucientong/wormhole)](https://goreportcard.com/report/github.com/lucientong/wormhole)
+[![License](https://img.shields.io/github/license/lucientong/wormhole)](LICENSE)
 
 ## Features
 
@@ -56,6 +56,8 @@ wormhole client --local 8080 --inspector 4040
 That's it! Your local service is now accessible from the internet.
 
 ## Architecture
+
+> 📖 For detailed protocol design and system architecture, see [Architecture Guide](docs/architecture.md).
 
 ```
 ┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
@@ -164,7 +166,7 @@ curl http://localhost:7001/clients
 
 ```bash
 # Clone repository
-git clone https://github.com/wormhole-tunnel/wormhole.git
+git clone https://github.com/lucientong/wormhole.git
 cd wormhole
 
 # Build
@@ -200,7 +202,7 @@ wormhole/
 
 - [x] Phase 1: Basic TCP tunnel
 - [x] Phase 2: HTTP routing + TLS
-- [ ] Phase 3: Traffic inspector UI
+- [x] Phase 3: Traffic inspector UI
 - [ ] Phase 4: P2P direct connection
 - [ ] Phase 5: Team collaboration
 

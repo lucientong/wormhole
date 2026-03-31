@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -11,9 +14,11 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+	"github.com/wormhole-tunnel/wormhole/pkg/inspector"
 	"github.com/wormhole-tunnel/wormhole/pkg/proto"
 	"github.com/wormhole-tunnel/wormhole/pkg/tunnel"
 	"github.com/wormhole-tunnel/wormhole/pkg/version"
+	"github.com/wormhole-tunnel/wormhole/pkg/web"
 )
 
 // Client is the wormhole client.
@@ -26,6 +31,11 @@ type Client struct {
 	connected uint32
 	publicURL string
 	tunnelID  string
+
+	// Inspector
+	inspector        *inspector.Inspector
+	inspectorHandler *inspector.Handler
+	inspectorServer  *http.Server
 
 	// Statistics
 	stats ClientStats
@@ -48,9 +58,11 @@ type ClientStats struct {
 
 // NewClient creates a new client instance.
 func NewClient(config Config) *Client {
+	insp := inspector.New(inspector.DefaultConfig())
 	return &Client{
-		config:  config,
-		closeCh: make(chan struct{}),
+		config:    config,
+		inspector: insp,
+		closeCh:   make(chan struct{}),
 	}
 }
 
@@ -307,45 +319,164 @@ func (c *Client) handleStream(stream *tunnel.Stream) {
 
 // forwardToLocal forwards a stream to the local service.
 func (c *Client) forwardToLocal(stream *tunnel.Stream, req *proto.StreamRequest) {
-	// Connect to local service
+	// Use HTTP-aware forwarding when inspector is active and protocol is HTTP.
+	if req.Protocol == proto.ProtocolHTTP && c.inspector.IsEnabled() {
+		c.forwardHTTPWithInspect(stream, req)
+		return
+	}
+
+	// Fallback: raw TCP bidirectional proxy.
+	c.forwardRawTCP(stream, req)
+}
+
+// forwardRawTCP forwards a stream to the local service using raw TCP proxy.
+func (c *Client) forwardRawTCP(stream *tunnel.Stream, req *proto.StreamRequest) {
+	c.dialAndProxy(stream, stream, req)
+}
+
+// forwardRawTCPWithReader is like forwardRawTCP but uses a custom reader
+// for the stream->local direction (used when we've partially consumed the stream).
+func (c *Client) forwardRawTCPWithReader(reader io.Reader, stream *tunnel.Stream, sreq *proto.StreamRequest) {
+	c.dialAndProxy(reader, stream, sreq)
+}
+
+// dialAndProxy connects to the local service and proxies data bidirectionally
+// between the given reader/writer pair and the local connection.
+func (c *Client) dialAndProxy(inReader io.Reader, outWriter io.Writer, sreq *proto.StreamRequest) {
 	localAddr := net.JoinHostPort(c.config.LocalHost, fmt.Sprintf("%d", c.config.LocalPort))
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	localConn, err := dialer.DialContext(context.Background(), "tcp", localAddr)
 	if err != nil {
 		log.Error().Err(err).Str("addr", localAddr).Msg("Connect to local failed")
-		// Send error response
-		resp := proto.NewStreamResponse(req.RequestID, false, "Local service unavailable")
+		resp := proto.NewStreamResponse(sreq.RequestID, false, "Local service unavailable")
 		data, _ := resp.Encode()
-		_, _ = stream.Write(data)
+		_, _ = outWriter.Write(data)
 		return
 	}
 	defer localConn.Close()
 
-	// For HTTP, the stream already contains the HTTP request
-	// Just proxy the data bidirectionally
-
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Stream -> Local
+	// InReader -> Local.
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(localConn, stream)
+		n, _ := io.Copy(localConn, inReader)
 		if n > 0 {
 			atomic.AddUint64(&c.stats.BytesIn, uint64(n))
 		}
 	}()
 
-	// Local -> Stream
+	// Local -> OutWriter.
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(stream, localConn)
+		n, _ := io.Copy(outWriter, localConn)
 		if n > 0 {
 			atomic.AddUint64(&c.stats.BytesOut, uint64(n)) // #nosec G115
 		}
 	}()
 
 	wg.Wait()
+}
+
+// forwardHTTPWithInspect forwards an HTTP request through the tunnel with
+// traffic inspection. It parses the raw HTTP request from the stream,
+// forwards it to the local service via http.Transport, captures the
+// request/response pair in the inspector, and writes the response back.
+func (c *Client) forwardHTTPWithInspect(stream *tunnel.Stream, sreq *proto.StreamRequest) {
+	localAddr := net.JoinHostPort(c.config.LocalHost, fmt.Sprintf("%d", c.config.LocalPort))
+
+	start := time.Now()
+
+	// 1. Parse the raw HTTP request from the stream.
+	br := bufio.NewReader(stream)
+	httpReq, err := http.ReadRequest(br)
+	if err != nil {
+		log.Debug().Err(err).Msg("HTTP parse failed, falling back to raw TCP")
+		// Cannot parse HTTP — write back whatever buffered data plus the
+		// rest of the stream through raw TCP. Create a composite reader
+		// from buffered data + remaining stream.
+		buffered := br.Buffered()
+		if buffered > 0 {
+			peeked, _ := br.Peek(buffered)
+			combined := io.MultiReader(bytes.NewReader(peeked), stream)
+			c.forwardRawTCPWithReader(combined, stream, sreq)
+		} else {
+			c.forwardRawTCP(stream, sreq)
+		}
+		return
+	}
+	defer httpReq.Body.Close()
+
+	// 2. Read request body for inspection (limited by MaxBodySize).
+	var reqBody []byte
+	if httpReq.Body != nil {
+		reqBody, _ = io.ReadAll(httpReq.Body)
+	}
+
+	// Track bytes in.
+	atomic.AddUint64(&c.stats.BytesIn, uint64(len(reqBody)))
+
+	// 3. Prepare the request for forwarding to local service.
+	httpReq.URL.Scheme = "http"
+	httpReq.URL.Host = localAddr
+	httpReq.Body = io.NopCloser(bytes.NewReader(reqBody))
+	httpReq.ContentLength = int64(len(reqBody))
+	httpReq.RequestURI = "" // Must clear for http.Transport.
+
+	// Use a transport that connects to the local service.
+	transport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout: 5 * time.Second,
+		}).DialContext,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // local service may use self-signed certs
+		MaxIdleConnsPerHost:   10,
+		ResponseHeaderTimeout: 60 * time.Second,
+	}
+	defer transport.CloseIdleConnections()
+
+	// 4. Execute the request.
+	resp, roundTripErr := transport.RoundTrip(httpReq)
+	duration := time.Since(start)
+
+	if roundTripErr != nil {
+		// Local service error — send 502 back through the stream.
+		log.Error().Err(roundTripErr).Str("addr", localAddr).Msg("Local service request failed")
+
+		errResp := &http.Response{
+			StatusCode: http.StatusBadGateway,
+			Status:     "502 Bad Gateway",
+			Proto:      "HTTP/1.1",
+			ProtoMajor: 1,
+			ProtoMinor: 1,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(bytes.NewBufferString("Local service unavailable")),
+		}
+		errResp.Header.Set("Content-Type", "text/plain")
+		_ = errResp.Write(stream)
+
+		// Capture the failed request.
+		c.inspector.Capture(httpReq, reqBody, nil, nil, duration, roundTripErr)
+		return
+	}
+	defer resp.Body.Close()
+
+	// 5. Read response body for inspection.
+	respBody, _ := io.ReadAll(resp.Body)
+
+	// Track bytes out.
+	atomic.AddUint64(&c.stats.BytesOut, uint64(len(respBody)))
+
+	// 6. Write response back to stream.
+	// Reconstruct the response with the body we've read.
+	resp.Body = io.NopCloser(bytes.NewReader(respBody))
+	resp.ContentLength = int64(len(respBody))
+	if writeErr := resp.Write(stream); writeErr != nil {
+		log.Error().Err(writeErr).Msg("Failed to write response to stream")
+	}
+
+	// 7. Capture in inspector.
+	c.inspector.Capture(httpReq, reqBody, resp, respBody, duration, nil)
 }
 
 // heartbeatLoop sends periodic heartbeats.
@@ -435,6 +566,17 @@ func (c *Client) Close() error { //nolint:unparam // satisfies io.Closer interfa
 	if c.conn != nil {
 		_ = c.conn.Close()
 	}
+	if c.inspectorServer != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = c.inspectorServer.Shutdown(shutdownCtx)
+		shutdownCancel()
+	}
+	if c.inspectorHandler != nil {
+		c.inspectorHandler.Close()
+	}
+	if c.inspector != nil {
+		c.inspector.Close()
+	}
 	c.mu.Unlock()
 
 	c.closeWg.Wait()
@@ -466,22 +608,34 @@ func (c *Client) StartInspector(port int) error { //nolint:unparam // error retu
 	addr := net.JoinHostPort("", fmt.Sprintf("%d", port))
 	log.Info().Str("addr", addr).Msg("Starting inspector UI")
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("Inspector UI - Coming soon!"))
+	// Create inspector handler.
+	c.inspectorHandler = inspector.NewHandler(c.inspector)
+
+	// Create web server with API and static file serving.
+	handler := web.NewServer(web.ServerConfig{
+		APIHandler:      c.inspectorHandler,
+		FallbackToIndex: true,
 	})
 
 	server := &http.Server{
 		Addr:         addr,
-		Handler:      mux,
+		Handler:      handler,
 		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		WriteTimeout: 0, // Disable for WebSocket long-lived connections.
 		IdleTimeout:  60 * time.Second,
 	}
+	c.inspectorServer = server
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Error().Err(err).Msg("Inspector server error")
 		}
 	}()
+
+	fmt.Printf("  Inspector: http://localhost:%d\n", port)
 	return nil
+}
+
+// GetInspector returns the inspector instance.
+func (c *Client) GetInspector() *inspector.Inspector {
+	return c.inspector
 }

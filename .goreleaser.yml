@@ -65,7 +65,7 @@ changelog:
 
 release:
   github:
-    owner: wormhole-tunnel
+    owner: lucientong
     name: wormhole
   prerelease: auto
   draft: false
@@ -92,10 +92,10 @@ release:
 brews:
   - name: wormhole
     repository:
-      owner: wormhole-tunnel
+      owner: lucientong
       name: homebrew-tap
     folder: Formula
-    homepage: https://github.com/wormhole-tunnel/wormhole
+    homepage: https://github.com/lucientong/wormhole
     description: Zero-config tunnel tool to expose local services to the internet
     license: MIT
     install: |
@@ -107,7 +107,7 @@ nfpms:
   - id: packages
     package_name: wormhole
     vendor: Wormhole
-    homepage: https://github.com/wormhole-tunnel/wormhole
+    homepage: https://github.com/lucientong/wormhole
     description: Zero-config tunnel tool to expose local services to the internet
     license: MIT
     formats:
