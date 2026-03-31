@@ -24,7 +24,6 @@ func main() {
 
 	// Handle shutdown signals
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -37,6 +36,8 @@ func main() {
 
 	// Start server
 	if err := server.Start(ctx); err != nil {
+		cancel()
 		log.Fatal().Err(err).Msg("Server failed")
 	}
+	cancel()
 }

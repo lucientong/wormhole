@@ -520,7 +520,7 @@ func (m *Mux) sendWindowUpdate(streamID uint32, increment uint32) error {
 }
 
 // sendClose sends a close frame.
-func (m *Mux) sendClose(streamID uint32) error {
+func (m *Mux) sendClose(streamID uint32) error { //nolint:unparam // error return reserved for future use
 	if m.IsClosed() {
 		return nil
 	}

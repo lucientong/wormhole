@@ -183,8 +183,8 @@ func (c *Client) registerTunnel(ctx context.Context) error {
 		return fmt.Errorf("encode request: %w", err)
 	}
 
-	if _, err := stream.Write(data); err != nil {
-		return fmt.Errorf("write request: %w", err)
+	if _, writeErr := stream.Write(data); writeErr != nil {
+		return fmt.Errorf("write request: %w", writeErr)
 	}
 
 	// Read response
@@ -420,7 +420,7 @@ func (c *Client) sendPing(ctx context.Context, pingID uint64) error {
 }
 
 // Close closes the client.
-func (c *Client) Close() error {
+func (c *Client) Close() error { //nolint:unparam // satisfies io.Closer interface
 	if !atomic.CompareAndSwapUint32(&c.closed, 0, 1) {
 		return nil
 	}
@@ -457,7 +457,7 @@ func (c *Client) GetStats() ClientStats {
 }
 
 // StartInspector starts the inspector UI server.
-func (c *Client) StartInspector(port int) error {
+func (c *Client) StartInspector(port int) error { //nolint:unparam // error return reserved for future use
 	if port == 0 {
 		return nil
 	}

@@ -42,7 +42,6 @@ func main() {
 
 	// Handle shutdown signals
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -55,6 +54,8 @@ func main() {
 
 	// Start client
 	if err := client.Start(ctx); err != nil {
+		cancel()
 		log.Fatal().Err(err).Msg("Client failed")
 	}
+	cancel()
 }

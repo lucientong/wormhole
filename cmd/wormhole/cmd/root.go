@@ -11,12 +11,12 @@ import (
 )
 
 var (
-	// Flags
+	// Flags.
 	verbose bool
 	debug   bool
 )
 
-// rootCmd represents the base command
+// rootCmd represents the base command.
 var rootCmd = &cobra.Command{
 	Use:   "wormhole",
 	Short: "A zero-config tunnel tool to expose local services to the internet",
@@ -87,7 +87,7 @@ func configureLogging() {
 		Level(level)
 }
 
-// versionCmd shows version information
+// versionCmd shows version information.
 var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Show version information",

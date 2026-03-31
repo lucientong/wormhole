@@ -15,7 +15,7 @@ var (
 	clientP2PEnabled    bool
 )
 
-// clientCmd represents the client command
+// clientCmd represents the client command.
 var clientCmd = &cobra.Command{
 	Use:   "client",
 	Short: "Start the Wormhole client to expose a local service",

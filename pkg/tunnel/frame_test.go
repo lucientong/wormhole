@@ -418,7 +418,9 @@ func TestFrameCodec_DecodeErrors(t *testing.T) {
 		binary.BigEndian.PutUint32(header[6:10], 100) // Expect 100 bytes
 
 		// Only provide header + 10 bytes of payload
-		data := append(header, make([]byte, 10)...)
+		data := make([]byte, 0, FrameHeaderSize+10)
+		data = append(data, header...)
+		data = append(data, make([]byte, 10)...)
 		buf := bytes.NewReader(data)
 		_, err := codec.Decode(buf)
 		require.Error(t, err)

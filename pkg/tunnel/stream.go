@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// Stream state constants
+// Stream state constants.
 const (
 	streamStateOpen uint32 = iota
 	streamStateLocalClose

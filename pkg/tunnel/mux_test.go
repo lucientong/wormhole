@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// testConn creates a pair of connected net.Conn
+// testConn creates a pair of connected net.Conn.
 func testConn() (net.Conn, net.Conn) {
 	return net.Pipe()
 }
@@ -145,8 +145,8 @@ func TestMux_MultipleStreams(t *testing.T) {
 	}()
 
 	// Client opens multiple streams concurrently
-	for i := range numStreams {
-		go func(id int) {
+	for range numStreams {
+		go func() {
 			defer wg.Done()
 			stream, err := clientMux.OpenStream()
 			assert.NoError(t, err)
@@ -157,7 +157,7 @@ func TestMux_MultipleStreams(t *testing.T) {
 			buf := make([]byte, 100)
 			n, _ := stream.Read(buf)
 			assert.Equal(t, msg, buf[:n])
-		}(i)
+		}()
 	}
 
 	wg.Wait()

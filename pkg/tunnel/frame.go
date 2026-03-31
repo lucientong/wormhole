@@ -8,13 +8,13 @@ import (
 	"sync"
 )
 
-// Frame protocol constants
+// Frame protocol constants.
 const (
 	// FrameVersion is the current protocol version.
 	FrameVersion uint8 = 1
 
-	// FrameHeaderSize is the size of the frame header in bytes.
-	// [Version:1][Type:1][StreamID:4][Length:4] = 10 bytes
+	// FrameHeaderSize is the size of the frame header in bytes:
+	// [Version:1][Type:1][StreamID:4][Length:4] = 10 bytes.
 	FrameHeaderSize = 10
 
 	// MaxFramePayloadSize is the maximum payload size (16MB).
@@ -27,7 +27,7 @@ const (
 // FrameType represents the type of a frame.
 type FrameType uint8
 
-// Frame types
+// Frame types.
 const (
 	// FrameData carries stream data.
 	FrameData FrameType = 0x01
@@ -78,7 +78,7 @@ func (t FrameType) IsValid() bool {
 	return t >= FrameData && t <= FrameError // FrameError is 0x07
 }
 
-// Frame errors
+// Frame errors.
 var (
 	ErrInvalidVersion     = errors.New("tunnel: invalid frame version")
 	ErrInvalidFrameType   = errors.New("tunnel: invalid frame type")

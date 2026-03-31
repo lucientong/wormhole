@@ -12,9 +12,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// testDialer creates a dialer that returns connected pipes
+// testDialer creates a dialer that returns connected pipes.
 func testDialer(serverHandler func(net.Conn)) DialFunc {
-	return func(ctx context.Context) (net.Conn, error) {
+	return func(_ context.Context) (net.Conn, error) {
 		client, server := net.Pipe()
 		go serverHandler(server)
 		return client, nil
@@ -117,11 +117,9 @@ func TestPool_MaxSize(t *testing.T) {
 	defer pool.Close()
 
 	// Create MaxSize connections
-	var muxes []*Mux
 	for i := 0; i < config.MaxSize+2; i++ {
-		mux, err := pool.Get(context.Background())
+		_, err := pool.Get(context.Background())
 		require.NoError(t, err)
-		muxes = append(muxes, mux)
 	}
 
 	// Should not exceed MaxSize
