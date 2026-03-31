@@ -9,8 +9,7 @@
 //   - Request/response capture with headers and body
 //   - Ring buffer storage with configurable capacity
 //   - Real-time WebSocket push to UI clients
-//   - Filtering and search capabilities
-//   - HAR export support
+//   - HTTP handler wrapping middleware
 //
 // # Usage
 //
