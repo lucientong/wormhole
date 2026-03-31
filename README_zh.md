@@ -235,8 +235,9 @@ wormhole/
 - [x] Phase 1：基础 TCP 隧道 + 多路复用
 - [x] Phase 2：HTTP 路由 + TLS + 管理 API
 - [x] Phase 3：流量检查器 UI
-- [x] Phase 4：P2P 直连（STUN + NAT 穿透 + UDP 打洞）
-- [ ] Phase 5：团队协作
+- [x] Phase 4：P2P 直连 — 基础原语（STUN、打洞、端口预测、信令）
+- [ ] Phase 4.5：P2P 端到端集成（peer 匹配、数据传输、Relay→P2P 切换）
+- [ ] Phase 5：团队协作（认证、Token、权限控制）
 
 ## 贡献
 

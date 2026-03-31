@@ -235,8 +235,9 @@ wormhole/
 - [x] Phase 1: Basic TCP tunnel with multiplexing
 - [x] Phase 2: HTTP routing + TLS + Admin API
 - [x] Phase 3: Traffic inspector UI
-- [x] Phase 4: P2P direct connection (STUN + NAT traversal + hole punching)
-- [ ] Phase 5: Team collaboration
+- [x] Phase 4: P2P direct connection — primitives (STUN, hole punch, predictor, signaling)
+- [ ] Phase 4.5: P2P end-to-end integration (peer matching, data transfer, relay→P2P switch)
+- [ ] Phase 5: Team collaboration (auth, tokens, RBAC)
 
 ## Contributing
 
