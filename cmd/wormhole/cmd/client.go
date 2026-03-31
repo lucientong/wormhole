@@ -51,10 +51,10 @@ func init() {
 	clientCmd.Flags().IntVar(&clientInspectorPort, "inspector", 0, "Port for traffic inspector UI (0 to disable)")
 	clientCmd.Flags().BoolVar(&clientP2PEnabled, "p2p", true, "Enable P2P direct connection when possible")
 
-	clientCmd.MarkFlagRequired("local")
+	_ = clientCmd.MarkFlagRequired("local")
 }
 
-func runClient(cmd *cobra.Command, args []string) {
+func runClient(_ *cobra.Command, _ []string) {
 	log.Info().
 		Str("server", clientServer).
 		Int("local_port", clientLocalPort).

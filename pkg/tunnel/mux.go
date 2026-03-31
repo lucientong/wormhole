@@ -52,11 +52,11 @@ type Mux struct {
 	codec  *FrameCodec
 
 	// Stream management
-	streams       map[uint32]*Stream
-	streamLock    sync.RWMutex
-	nextStreamID  uint32
-	acceptCh      chan *Stream
-	isClient      bool
+	streams      map[uint32]*Stream
+	streamLock   sync.RWMutex
+	nextStreamID uint32
+	acceptCh     chan *Stream
+	isClient     bool
 
 	// State
 	closed   uint32
@@ -69,10 +69,10 @@ type Mux struct {
 	sendLock sync.Mutex
 
 	// Keep-alive
-	pingID     uint32
-	lastPing   time.Time
-	pingLock   sync.Mutex
-	pongCh     chan uint32
+	pingID   uint32
+	lastPing time.Time
+	pingLock sync.Mutex
+	pongCh   chan uint32
 
 	// Shutdown
 	shutdownOnce sync.Once
@@ -155,6 +155,13 @@ func (m *Mux) OpenStream() (*Stream, error) {
 func (m *Mux) OpenStreamContext(ctx context.Context) (*Stream, error) {
 	if m.IsClosed() {
 		return nil, m.getCloseErr()
+	}
+
+	// Check context before proceeding
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
 	}
 
 	// Allocate stream ID
@@ -251,7 +258,7 @@ func (m *Mux) getCloseErr() error {
 
 // recvLoop handles incoming frames.
 func (m *Mux) recvLoop() {
-	defer m.closeWithError(nil)
+	defer func() { _ = m.closeWithError(nil) }()
 
 	for {
 		frame, err := m.codec.Decode(m.conn)
@@ -262,7 +269,7 @@ func (m *Mux) recvLoop() {
 			if m.IsClosed() {
 				return
 			}
-			m.closeWithError(fmt.Errorf("decode frame: %w", err))
+			_ = m.closeWithError(fmt.Errorf("decode frame: %w", err))
 			return
 		}
 
@@ -270,7 +277,7 @@ func (m *Mux) recvLoop() {
 			if m.IsClosed() {
 				return
 			}
-			m.closeWithError(fmt.Errorf("handle frame: %w", err))
+			_ = m.closeWithError(fmt.Errorf("handle frame: %w", err))
 			return
 		}
 	}
@@ -410,7 +417,7 @@ func (m *Mux) sendLoop() {
 		case frame := <-m.sendCh:
 			if err := m.writeFrame(frame); err != nil {
 				if !m.IsClosed() {
-					m.closeWithError(fmt.Errorf("write frame: %w", err))
+					_ = m.closeWithError(fmt.Errorf("write frame: %w", err))
 				}
 				return
 			}
@@ -438,7 +445,7 @@ func (m *Mux) keepAliveLoop() {
 			// Send ping
 			if err := m.sendPing(); err != nil {
 				if !m.IsClosed() {
-					m.closeWithError(fmt.Errorf("keep-alive failed: %w", err))
+					_ = m.closeWithError(fmt.Errorf("keep-alive failed: %w", err))
 				}
 				return
 			}
@@ -468,7 +475,7 @@ func (m *Mux) keepAliveLoop() {
 				case <-timeout.C:
 					// Pong timeout - connection is dead
 					if !m.IsClosed() {
-						m.closeWithError(fmt.Errorf("keep-alive timeout: no pong received within %v", m.config.KeepAliveTimeout))
+						_ = m.closeWithError(fmt.Errorf("keep-alive timeout: no pong received within %v", m.config.KeepAliveTimeout))
 					}
 					return
 				case <-m.closeCh:

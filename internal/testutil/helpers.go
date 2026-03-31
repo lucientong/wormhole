@@ -54,7 +54,7 @@ func GetFreePort(t *testing.T) int {
 	if err != nil {
 		t.Fatalf("failed to get free port: %v", err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	return listener.Addr().(*net.TCPAddr).Port
 }
 

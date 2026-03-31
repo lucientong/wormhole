@@ -50,7 +50,7 @@ func init() {
 	serverCmd.Flags().IntVar(&serverAdminPort, "admin-port", 7001, "Port for admin API")
 }
 
-func runServer(cmd *cobra.Command, args []string) {
+func runServer(_ *cobra.Command, _ []string) {
 	log.Info().
 		Str("host", serverHost).
 		Int("port", serverPort).

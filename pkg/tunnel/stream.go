@@ -397,12 +397,15 @@ func (s *Stream) updateRecvWindow(bytesRead int) {
 	// Send window update when we've consumed half the window
 	threshold := int64(s.config.WindowSize / 2)
 	if s.recvWindow >= threshold {
-		increment := uint32(s.recvWindow)
+		if s.recvWindow > int64(^uint32(0)) {
+			s.recvWindow = int64(^uint32(0))
+		}
+		increment := uint32(s.recvWindow) // #nosec G115 - clamped above
 		s.recvWindow = 0
 		s.recvWindowLock.Unlock()
 
 		// Send window update frame (ignore error, best effort)
-		s.mux.sendWindowUpdate(s.id, increment)
+		_ = s.mux.sendWindowUpdate(s.id, increment)
 		return
 	}
 	s.recvWindowLock.Unlock()

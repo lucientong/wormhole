@@ -35,17 +35,16 @@ type Server struct {
 	routesLock sync.RWMutex
 
 	// TCP port allocation
-	tcpPorts     map[int]*ClientSession
-	tcpPortsLock sync.Mutex
-	nextTCPPort  int
+	tcpPorts    map[int]*ClientSession
+	nextTCPPort int
 
 	// Stats
 	stats ServerStats
 
 	// Shutdown
-	closed   uint32
-	closeCh  chan struct{}
-	closeWg  sync.WaitGroup
+	closed  uint32
+	closeCh chan struct{}
+	closeWg sync.WaitGroup
 }
 
 // ClientSession represents a connected client.
@@ -115,7 +114,7 @@ func (s *Server) Start(ctx context.Context) error {
 	// Start HTTP listener
 	httpLn, err := net.Listen("tcp", s.config.HTTPAddr)
 	if err != nil {
-		tunnelLn.Close()
+		_ = tunnelLn.Close()
 		return fmt.Errorf("listen http: %w", err)
 	}
 	s.httpListener = httpLn
@@ -123,8 +122,8 @@ func (s *Server) Start(ctx context.Context) error {
 	// Start admin listener
 	adminLn, err := net.Listen("tcp", s.config.AdminAddr)
 	if err != nil {
-		tunnelLn.Close()
-		httpLn.Close()
+		_ = tunnelLn.Close()
+		_ = httpLn.Close()
 		return fmt.Errorf("listen admin: %w", err)
 	}
 	s.adminListener = adminLn
@@ -153,19 +152,19 @@ func (s *Server) Shutdown() error {
 
 	// Close listeners
 	if s.tunnelListener != nil {
-		s.tunnelListener.Close()
+		_ = s.tunnelListener.Close()
 	}
 	if s.httpListener != nil {
-		s.httpListener.Close()
+		_ = s.httpListener.Close()
 	}
 	if s.adminListener != nil {
-		s.adminListener.Close()
+		_ = s.adminListener.Close()
 	}
 
 	// Close all clients
 	s.clientLock.Lock()
 	for _, client := range s.clients {
-		client.Mux.Close()
+		_ = client.Mux.Close()
 	}
 	s.clientLock.Unlock()
 
@@ -201,7 +200,7 @@ func (s *Server) handleClient(conn net.Conn) {
 	mux, err := tunnel.Server(conn, s.config.MuxConfig)
 	if err != nil {
 		log.Error().Err(err).Str("remote", remoteAddr).Msg("Failed to create mux")
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 
@@ -312,8 +311,15 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 
 	// Send response
 	resp := proto.NewRegisterResponse(true, "", tunnelID, publicURL, 0)
-	data, _ := resp.Encode()
-	stream.Write(data)
+	data, err := resp.Encode()
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to encode register response")
+		return
+	}
+	if _, err := stream.Write(data); err != nil {
+		log.Error().Err(err).Msg("Failed to write register response")
+		return
+	}
 
 	log.Info().
 		Str("tunnel_id", tunnelID).
@@ -329,8 +335,14 @@ func (s *Server) handlePing(client *ClientSession, stream *tunnel.Stream, req *p
 	client.mu.Unlock()
 
 	resp := proto.NewPingResponse(req.PingID)
-	data, _ := resp.Encode()
-	stream.Write(data)
+	data, err := resp.Encode()
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to encode ping response")
+		return
+	}
+	if _, err := stream.Write(data); err != nil {
+		log.Error().Err(err).Msg("Failed to write ping response")
+	}
 }
 
 // serveHTTP serves HTTP requests.
@@ -382,7 +394,7 @@ func (s *Server) httpHandler(w http.ResponseWriter, r *http.Request) {
 // forwardHTTP forwards an HTTP request to the client.
 func (s *Server) forwardHTTP(client *ClientSession, w http.ResponseWriter, r *http.Request) error {
 	// Open stream to client
-	stream, err := client.Mux.OpenStream()
+	stream, err := client.Mux.OpenStreamContext(r.Context())
 	if err != nil {
 		return fmt.Errorf("open stream: %w", err)
 	}
@@ -397,7 +409,10 @@ func (s *Server) forwardHTTP(client *ClientSession, w http.ResponseWriter, r *ht
 		ContentType:   r.Header.Get("Content-Type"),
 		ContentLength: r.ContentLength,
 	}
-	data, _ := streamReq.Encode()
+	data, err := streamReq.Encode()
+	if err != nil {
+		return fmt.Errorf("encode stream request: %w", err)
+	}
 	if _, err := stream.Write(data); err != nil {
 		return fmt.Errorf("write stream request: %w", err)
 	}
@@ -414,7 +429,7 @@ func (s *Server) forwardHTTP(client *ClientSession, w http.ResponseWriter, r *ht
 		if err != nil {
 			break
 		}
-		w.Write(buf[:n])
+		_, _ = w.Write(buf[:n])
 	}
 
 	return nil
@@ -441,13 +456,13 @@ func (s *Server) serveAdmin() {
 }
 
 // adminHealth returns health status.
-func (s *Server) adminHealth(w http.ResponseWriter, r *http.Request) {
+func (s *Server) adminHealth(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status":"healthy"}`))
+	_, _ = w.Write([]byte(`{"status":"healthy"}`))
 }
 
 // adminStats returns server statistics.
-func (s *Server) adminStats(w http.ResponseWriter, r *http.Request) {
+func (s *Server) adminStats(w http.ResponseWriter, _ *http.Request) {
 	stats := s.getStats()
 	fmt.Fprintf(w, `{"active_clients":%d,"total_clients":%d,"active_tunnels":%d,"requests":%d,"uptime_seconds":%d}`,
 		stats.ActiveClients,
@@ -458,21 +473,21 @@ func (s *Server) adminStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // adminClients returns the list of connected clients.
-func (s *Server) adminClients(w http.ResponseWriter, r *http.Request) {
+func (s *Server) adminClients(w http.ResponseWriter, _ *http.Request) {
 	s.clientLock.RLock()
 	defer s.clientLock.RUnlock()
 
-	w.Write([]byte("["))
+	_, _ = w.Write([]byte("["))
 	first := true
 	for _, client := range s.clients {
 		if !first {
-			w.Write([]byte(","))
+			_, _ = w.Write([]byte(","))
 		}
 		first = false
 		fmt.Fprintf(w, `{"id":"%s","subdomain":"%s","created_at":"%s"}`,
 			client.ID, client.Subdomain, client.CreatedAt.Format(time.RFC3339))
 	}
-	w.Write([]byte("]"))
+	_, _ = w.Write([]byte("]"))
 }
 
 // removeClient removes a client from the server.
@@ -487,7 +502,7 @@ func (s *Server) removeClient(client *ClientSession) {
 
 	atomic.AddUint64(&s.stats.ActiveClients, ^uint64(0)) // Decrement
 
-	client.Mux.Close()
+	_ = client.Mux.Close()
 }
 
 // getStats returns server statistics.

@@ -56,9 +56,9 @@ type Pool struct {
 	connLock sync.RWMutex
 
 	// State
-	closed   uint32
-	closeCh  chan struct{}
-	closeWg  sync.WaitGroup
+	closed  uint32
+	closeCh chan struct{}
+	closeWg sync.WaitGroup
 
 	// Stats
 	stats PoolStats
@@ -184,7 +184,7 @@ func (p *Pool) Close() error {
 
 	p.connLock.Lock()
 	for _, pc := range p.conns {
-		pc.mux.Close()
+		_ = pc.mux.Close()
 	}
 	p.conns = nil
 	p.connLock.Unlock()
@@ -304,7 +304,7 @@ func (p *Pool) createConn(ctx context.Context) (*Mux, error) {
 		mux, err = Server(conn, p.config.MuxConfig)
 	}
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		atomic.AddInt64(&p.stats.FailedConnections, 1)
 		return nil, err
 	}
@@ -321,7 +321,7 @@ func (p *Pool) createConn(ctx context.Context) (*Mux, error) {
 	if len(p.conns) >= p.config.MaxSize {
 		p.connLock.Unlock()
 		// We exceeded capacity, close the newly created connection
-		mux.Close()
+		_ = mux.Close()
 		// Return an existing connection instead
 		if conn := p.getIdleConn(); conn != nil {
 			return conn, nil
@@ -342,7 +342,7 @@ func (p *Pool) removeConn(mux *Mux) {
 
 	for i, pc := range p.conns {
 		if pc.mux == mux {
-			pc.mux.Close()
+			_ = pc.mux.Close()
 			p.conns = append(p.conns[:i], p.conns[i+1:]...)
 			return
 		}
@@ -425,7 +425,7 @@ func (p *Pool) cleanupIdle() {
 
 	// Remove idle connections
 	for _, pc := range toRemove {
-		pc.mux.Close()
+		_ = pc.mux.Close()
 		for i, conn := range p.conns {
 			if conn == pc {
 				p.conns = append(p.conns[:i], p.conns[i+1:]...)

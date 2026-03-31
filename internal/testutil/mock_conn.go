@@ -81,8 +81,8 @@ func (c *MockConn) Close() error {
 		return nil
 	}
 	c.closed = true
-	c.reader.Close()
-	c.writer.Close()
+	_ = c.reader.Close()
+	_ = c.writer.Close()
 	return nil
 }
 
@@ -97,17 +97,17 @@ func (c *MockConn) RemoteAddr() net.Addr {
 }
 
 // SetDeadline sets the read and write deadlines.
-func (c *MockConn) SetDeadline(t time.Time) error {
+func (c *MockConn) SetDeadline(_ time.Time) error {
 	return nil // Not implemented for mock
 }
 
 // SetReadDeadline sets the deadline for future Read calls.
-func (c *MockConn) SetReadDeadline(t time.Time) error {
+func (c *MockConn) SetReadDeadline(_ time.Time) error {
 	return nil // Not implemented for mock
 }
 
 // SetWriteDeadline sets the deadline for future Write calls.
-func (c *MockConn) SetWriteDeadline(t time.Time) error {
+func (c *MockConn) SetWriteDeadline(_ time.Time) error {
 	return nil // Not implemented for mock
 }
 

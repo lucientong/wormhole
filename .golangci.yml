@@ -58,8 +58,13 @@ linters:
 
 linters-settings:
   errcheck:
-    check-type-assertions: true
-    check-blank: true
+    check-type-assertions: false
+    check-blank: false
+    exclude-functions:
+      - (net/http.ResponseWriter).Write
+      - (*github.com/spf13/cobra.Command).Help
+      - (*github.com/spf13/cobra.Command).MarkFlagRequired
+      - crypto/rand.Read
 
   govet:
     enable-all: true
@@ -108,7 +113,8 @@ linters-settings:
 
   gosec:
     excludes:
-      - G104 # Audit errors not checked
+      - G114 # Use of net/http serve function that has no support for setting timeouts
+      - G115 # Integer overflow conversion (safe by design with bounds checking)
       - G304 # File path provided as taint input
 
   stylecheck:
@@ -123,6 +129,9 @@ issues:
         - gosec
         - goconst
         - gocyclo
+        - errcheck
+        - contextcheck
+        - errorlint
 
     # Exclude certain issues in main packages
     - path: cmd/

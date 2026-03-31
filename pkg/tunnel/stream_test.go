@@ -115,9 +115,9 @@ func TestRingBuffer_GrowPreservesData(t *testing.T) {
 	rb := newRingBuffer(8)
 
 	// Write and partially read to create wrap-around state
-	rb.Write([]byte("ABCDEF"))   // w=6, r=0
+	rb.Write([]byte("ABCDEF")) // w=6, r=0
 	buf := make([]byte, 4)
-	rb.Read(buf)                  // w=6, r=4
+	rb.Read(buf) // w=6, r=4
 	assert.Equal(t, "ABCD", string(buf))
 
 	rb.Write([]byte("GHIJ"))     // w=2, r=4 (wrapped)

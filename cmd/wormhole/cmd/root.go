@@ -32,7 +32,7 @@ Examples:
 
   # Connect to a specific server
   wormhole client --server wormhole.example.com:7000 --local 8080`,
-	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+	PersistentPreRun: func(_ *cobra.Command, _ []string) {
 		// Configure logging
 		configureLogging()
 	},
@@ -46,7 +46,7 @@ Examples:
 			return
 		}
 		// No args, show help
-		cmd.Help()
+		_ = cmd.Help()
 	},
 }
 
@@ -91,7 +91,7 @@ func configureLogging() {
 var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Show version information",
-	Run: func(cmd *cobra.Command, args []string) {
+	Run: func(cmd *cobra.Command, _ []string) {
 		info := version.Get()
 		cmd.Printf("Wormhole %s\n", info.Version)
 		cmd.Printf("  Commit:     %s\n", info.Commit)

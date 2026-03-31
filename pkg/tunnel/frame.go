@@ -175,7 +175,7 @@ func NewErrorFrame(streamID uint32, code uint32, message string) *Frame {
 
 // Length returns the payload length.
 func (f *Frame) Length() uint32 {
-	return uint32(len(f.Payload))
+	return uint32(len(f.Payload)) // #nosec G115 - len() is always non-negative and bounded by MaxFramePayloadSize (16MB)
 }
 
 // TotalSize returns the total frame size including header.
@@ -274,7 +274,7 @@ func (c *FrameCodec) Encode(w io.Writer, f *Frame) error {
 	header[0] = f.Version
 	header[1] = byte(f.Type)
 	binary.BigEndian.PutUint32(header[2:6], f.StreamID)
-	binary.BigEndian.PutUint32(header[6:10], uint32(len(f.Payload)))
+	binary.BigEndian.PutUint32(header[6:10], uint32(len(f.Payload))) // #nosec G115 - validated by f.Validate() above
 
 	// Write header
 	if _, err := w.Write(header); err != nil {

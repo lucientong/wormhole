@@ -21,31 +21,29 @@ type Client struct {
 	config Config
 
 	// Connection state
-	mux        *tunnel.Mux
-	conn       net.Conn
-	connected  uint32
-	sessionID  string
-	subdomain  string
-	publicURL  string
-	tunnelID   string
+	mux       *tunnel.Mux
+	conn      net.Conn
+	connected uint32
+	publicURL string
+	tunnelID  string
 
 	// Statistics
 	stats ClientStats
 
 	// Shutdown
-	closed   uint32
-	closeCh  chan struct{}
-	closeWg  sync.WaitGroup
-	mu       sync.Mutex
+	closed  uint32
+	closeCh chan struct{}
+	closeWg sync.WaitGroup
+	mu      sync.Mutex
 }
 
 // ClientStats contains client statistics.
 type ClientStats struct {
-	BytesIn         uint64
-	BytesOut        uint64
-	Requests        uint64
-	Reconnects      uint64
-	ConnectionTime  time.Time
+	BytesIn        uint64
+	BytesOut       uint64
+	Requests       uint64
+	Reconnects     uint64
+	ConnectionTime time.Time
 }
 
 // NewClient creates a new client instance.
@@ -134,7 +132,7 @@ func (c *Client) connect(ctx context.Context) error {
 	// Create multiplexer
 	mux, err := tunnel.Client(conn, c.config.MuxConfig)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return fmt.Errorf("create mux: %w", err)
 	}
 
@@ -149,9 +147,9 @@ func (c *Client) connect(ctx context.Context) error {
 	log.Info().Str("server", c.config.ServerAddr).Msg("Connected to server")
 
 	// Register tunnel
-	if err := c.registerTunnel(); err != nil {
-		mux.Close()
-		conn.Close()
+	if err := c.registerTunnel(ctx); err != nil {
+		_ = mux.Close()
+		_ = conn.Close()
 		return fmt.Errorf("register tunnel: %w", err)
 	}
 
@@ -159,7 +157,7 @@ func (c *Client) connect(ctx context.Context) error {
 }
 
 // registerTunnel registers a tunnel with the server.
-func (c *Client) registerTunnel() error {
+func (c *Client) registerTunnel(ctx context.Context) error {
 	c.mu.Lock()
 	mux := c.mux
 	c.mu.Unlock()
@@ -169,14 +167,17 @@ func (c *Client) registerTunnel() error {
 	}
 
 	// Open control stream
-	stream, err := mux.OpenStream()
+	stream, err := mux.OpenStreamContext(ctx)
 	if err != nil {
 		return fmt.Errorf("open stream: %w", err)
 	}
 	defer stream.Close()
 
 	// Send register request
-	req := proto.NewRegisterRequest(uint32(c.config.LocalPort), proto.ProtocolHTTP, c.config.Subdomain)
+	if c.config.LocalPort < 0 || c.config.LocalPort > 65535 {
+		return fmt.Errorf("invalid local port: %d", c.config.LocalPort)
+	}
+	req := proto.NewRegisterRequest(uint32(c.config.LocalPort), proto.ProtocolHTTP, c.config.Subdomain) // #nosec G115
 	data, err := req.Encode()
 	if err != nil {
 		return fmt.Errorf("encode request: %w", err)
@@ -240,7 +241,7 @@ func (c *Client) handleConnection(ctx context.Context) {
 
 	c.mu.Lock()
 	if c.mux != nil {
-		c.mux.Close()
+		_ = c.mux.Close()
 	}
 	c.mu.Unlock()
 
@@ -307,14 +308,14 @@ func (c *Client) handleStream(stream *tunnel.Stream) {
 // forwardToLocal forwards a stream to the local service.
 func (c *Client) forwardToLocal(stream *tunnel.Stream, req *proto.StreamRequest) {
 	// Connect to local service
-	localAddr := fmt.Sprintf("%s:%d", c.config.LocalHost, c.config.LocalPort)
+	localAddr := net.JoinHostPort(c.config.LocalHost, fmt.Sprintf("%d", c.config.LocalPort))
 	localConn, err := net.DialTimeout("tcp", localAddr, 5*time.Second)
 	if err != nil {
 		log.Error().Err(err).Str("addr", localAddr).Msg("Connect to local failed")
 		// Send error response
 		resp := proto.NewStreamResponse(req.RequestID, false, "Local service unavailable")
 		data, _ := resp.Encode()
-		stream.Write(data)
+		_, _ = stream.Write(data)
 		return
 	}
 	defer localConn.Close()
@@ -329,14 +330,18 @@ func (c *Client) forwardToLocal(stream *tunnel.Stream, req *proto.StreamRequest)
 	go func() {
 		defer wg.Done()
 		n, _ := io.Copy(localConn, stream)
-		atomic.AddUint64(&c.stats.BytesIn, uint64(n))
+		if n > 0 {
+			atomic.AddUint64(&c.stats.BytesIn, uint64(n))
+		}
 	}()
 
 	// Local -> Stream
 	go func() {
 		defer wg.Done()
 		n, _ := io.Copy(stream, localConn)
-		atomic.AddUint64(&c.stats.BytesOut, uint64(n))
+		if n > 0 {
+			atomic.AddUint64(&c.stats.BytesOut, uint64(n)) // #nosec G115
+		}
 	}()
 
 	wg.Wait()
@@ -363,7 +368,7 @@ func (c *Client) heartbeatLoop(ctx context.Context) {
 			}
 
 			pingID++
-			if err := c.sendPing(pingID); err != nil {
+			if err := c.sendPing(ctx, pingID); err != nil {
 				log.Error().Err(err).Msg("Heartbeat failed")
 			}
 
@@ -376,7 +381,7 @@ func (c *Client) heartbeatLoop(ctx context.Context) {
 }
 
 // sendPing sends a ping to the server.
-func (c *Client) sendPing(pingID uint64) error {
+func (c *Client) sendPing(ctx context.Context, pingID uint64) error {
 	c.mu.Lock()
 	mux := c.mux
 	c.mu.Unlock()
@@ -385,7 +390,7 @@ func (c *Client) sendPing(pingID uint64) error {
 		return fmt.Errorf("not connected")
 	}
 
-	stream, err := mux.OpenStream()
+	stream, err := mux.OpenStreamContext(ctx)
 	if err != nil {
 		return fmt.Errorf("open stream: %w", err)
 	}
@@ -397,7 +402,9 @@ func (c *Client) sendPing(pingID uint64) error {
 		return fmt.Errorf("encode ping: %w", err)
 	}
 
-	stream.SetDeadline(time.Now().Add(c.config.HeartbeatTimeout))
+	if err := stream.SetDeadline(time.Now().Add(c.config.HeartbeatTimeout)); err != nil {
+		return fmt.Errorf("set deadline: %w", err)
+	}
 
 	if _, err := stream.Write(data); err != nil {
 		return fmt.Errorf("write ping: %w", err)
@@ -422,10 +429,10 @@ func (c *Client) Close() error {
 
 	c.mu.Lock()
 	if c.mux != nil {
-		c.mux.Close()
+		_ = c.mux.Close()
 	}
 	if c.conn != nil {
-		c.conn.Close()
+		_ = c.conn.Close()
 	}
 	c.mu.Unlock()
 
@@ -455,13 +462,25 @@ func (c *Client) StartInspector(port int) error {
 		return nil
 	}
 
-	addr := fmt.Sprintf(":%d", port)
+	addr := net.JoinHostPort("", fmt.Sprintf("%d", port))
 	log.Info().Str("addr", addr).Msg("Starting inspector UI")
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Inspector UI - Coming soon!"))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("Inspector UI - Coming soon!"))
 	})
 
-	go http.ListenAndServe(addr, nil)
+	server := &http.Server{
+		Addr:         addr,
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Error().Err(err).Msg("Inspector server error")
+		}
+	}()
 	return nil
 }
