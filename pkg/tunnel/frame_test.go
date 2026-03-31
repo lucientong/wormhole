@@ -19,6 +19,7 @@ func TestFrameType_String(t *testing.T) {
 		{FrameData, "DATA"},
 		{FrameWindowUpdate, "WINDOW_UPDATE"},
 		{FramePing, "PING"},
+		{FramePong, "PONG"},
 		{FrameClose, "CLOSE"},
 		{FrameHandshake, "HANDSHAKE"},
 		{FrameError, "ERROR"},
@@ -40,11 +41,12 @@ func TestFrameType_IsValid(t *testing.T) {
 		{FrameData, true},
 		{FrameWindowUpdate, true},
 		{FramePing, true},
+		{FramePong, true},
 		{FrameClose, true},
 		{FrameHandshake, true},
 		{FrameError, true},
 		{FrameType(0), false},
-		{FrameType(7), false},
+		{FrameType(8), false},
 		{FrameType(255), false},
 	}
 

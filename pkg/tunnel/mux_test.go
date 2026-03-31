@@ -349,7 +349,6 @@ func TestDefaultMuxConfig(t *testing.T) {
 }
 
 func TestMux_LargeData(t *testing.T) {
-	t.Skip("Skipping large data test - requires ringBuffer optimization")
 	clientConn, serverConn := testConn()
 
 	serverConfig := DefaultMuxConfig()

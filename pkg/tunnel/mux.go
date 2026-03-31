@@ -285,6 +285,8 @@ func (m *Mux) handleFrame(f *Frame) error {
 		return m.handleWindowUpdate(f)
 	case FramePing:
 		return m.handlePing(f)
+	case FramePong:
+		return m.handlePong(f)
 	case FrameClose:
 		return m.handleClose(f)
 	case FrameHandshake:
@@ -331,6 +333,22 @@ func (m *Mux) handlePing(f *Frame) error {
 
 	// Send pong (ping response with same ID)
 	return m.sendPong(pingID)
+}
+
+// handlePong handles a pong (ping response) frame.
+func (m *Mux) handlePong(f *Frame) error {
+	pongID, err := ParsePong(f)
+	if err != nil {
+		return err
+	}
+
+	// Notify keep-alive loop that pong was received
+	select {
+	case m.pongCh <- pongID:
+	default:
+		// pongCh is full, discard (non-blocking)
+	}
+	return nil
 }
 
 // handleClose handles a close frame.
@@ -409,7 +427,7 @@ func (m *Mux) writeFrame(f *Frame) error {
 	return m.codec.Encode(m.conn, f)
 }
 
-// keepAliveLoop sends periodic keep-alive pings.
+// keepAliveLoop sends periodic keep-alive pings and checks for pong responses.
 func (m *Mux) keepAliveLoop() {
 	ticker := time.NewTicker(m.config.KeepAliveInterval)
 	defer ticker.Stop()
@@ -417,11 +435,46 @@ func (m *Mux) keepAliveLoop() {
 	for {
 		select {
 		case <-ticker.C:
+			// Send ping
 			if err := m.sendPing(); err != nil {
 				if !m.IsClosed() {
 					m.closeWithError(fmt.Errorf("keep-alive failed: %w", err))
 				}
 				return
+			}
+
+			// Wait for pong with timeout
+			if m.config.KeepAliveTimeout > 0 {
+				m.pingLock.Lock()
+				expectedID := m.pingID
+				m.pingLock.Unlock()
+
+				timeout := time.NewTimer(m.config.KeepAliveTimeout)
+				select {
+				case pongID := <-m.pongCh:
+					timeout.Stop()
+					if pongID != expectedID {
+						// Mismatched pong, but not fatal - could be delayed
+						// Drain any stale pongs
+						for {
+							select {
+							case <-m.pongCh:
+							default:
+								goto drained
+							}
+						}
+					drained:
+					}
+				case <-timeout.C:
+					// Pong timeout - connection is dead
+					if !m.IsClosed() {
+						m.closeWithError(fmt.Errorf("keep-alive timeout: no pong received within %v", m.config.KeepAliveTimeout))
+					}
+					return
+				case <-m.closeCh:
+					timeout.Stop()
+					return
+				}
 			}
 		case <-m.closeCh:
 			return
@@ -523,8 +576,7 @@ func (m *Mux) sendPong(pingID uint32) error {
 		return nil
 	}
 
-	// Pong uses the same ping frame format with the same ID
-	frame := NewPingFrame(pingID)
+	frame := NewPongFrame(pingID)
 	select {
 	case m.sendCh <- frame:
 		return nil

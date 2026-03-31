@@ -38,14 +38,17 @@ const (
 	// FramePing is used for keep-alive.
 	FramePing FrameType = 0x03
 
+	// FramePong is the response to a ping frame.
+	FramePong FrameType = 0x04
+
 	// FrameClose signals stream closure.
-	FrameClose FrameType = 0x04
+	FrameClose FrameType = 0x05
 
 	// FrameHandshake is used for initial handshake.
-	FrameHandshake FrameType = 0x05
+	FrameHandshake FrameType = 0x06
 
 	// FrameError signals an error condition.
-	FrameError FrameType = 0x06
+	FrameError FrameType = 0x07
 )
 
 // String returns the string representation of the frame type.
@@ -57,6 +60,8 @@ func (t FrameType) String() string {
 		return "WINDOW_UPDATE"
 	case FramePing:
 		return "PING"
+	case FramePong:
+		return "PONG"
 	case FrameClose:
 		return "CLOSE"
 	case FrameHandshake:
@@ -70,7 +75,7 @@ func (t FrameType) String() string {
 
 // IsValid returns whether the frame type is valid.
 func (t FrameType) IsValid() bool {
-	return t >= FrameData && t <= FrameError
+	return t >= FrameData && t <= FrameError // FrameError is 0x07
 }
 
 // Frame errors
@@ -141,6 +146,13 @@ func NewPingFrame(pingID uint32) *Frame {
 	payload := make([]byte, 4)
 	binary.BigEndian.PutUint32(payload, pingID)
 	return NewFrame(FramePing, 0, payload)
+}
+
+// NewPongFrame creates a new pong (ping response) frame.
+func NewPongFrame(pingID uint32) *Frame {
+	payload := make([]byte, 4)
+	binary.BigEndian.PutUint32(payload, pingID)
+	return NewFrame(FramePong, 0, payload)
 }
 
 // NewCloseFrame creates a new close frame.
@@ -366,6 +378,17 @@ func ParsePing(f *Frame) (uint32, error) {
 	}
 	if len(f.Payload) < 4 {
 		return 0, fmt.Errorf("PING payload too short: %d", len(f.Payload))
+	}
+	return binary.BigEndian.Uint32(f.Payload), nil
+}
+
+// ParsePong extracts the ping ID from a pong frame.
+func ParsePong(f *Frame) (uint32, error) {
+	if f.Type != FramePong {
+		return 0, fmt.Errorf("expected PONG frame, got %s", f.Type)
+	}
+	if len(f.Payload) < 4 {
+		return 0, fmt.Errorf("PONG payload too short: %d", len(f.Payload))
 	}
 	return binary.BigEndian.Uint32(f.Payload), nil
 }

@@ -246,11 +246,39 @@ func (p *Pool) getIdleConn() *Mux {
 // createConn creates a new connection.
 func (p *Pool) createConn(ctx context.Context) (*Mux, error) {
 	p.connLock.Lock()
-	// Check if we're at max capacity
+
+	// If at max capacity, try to clean up closed connections
 	if len(p.conns) >= p.config.MaxSize {
+		// Remove closed connections in-place
+		n := 0
+		for _, pc := range p.conns {
+			if !pc.mux.IsClosed() {
+				p.conns[n] = pc
+				n++
+			}
+		}
+		// Clear remaining slots to avoid memory leaks
+		for i := n; i < len(p.conns); i++ {
+			p.conns[i] = nil
+		}
+		p.conns = p.conns[:n]
+	}
+
+	// After cleanup, check if still at max capacity
+	if len(p.conns) >= p.config.MaxSize {
+		// Find a non-closed connection to return
+		for _, pc := range p.conns {
+			if !pc.mux.IsClosed() {
+				pc.mu.Lock()
+				pc.lastUsedAt = time.Now()
+				pc.useCount++
+				pc.mu.Unlock()
+				p.connLock.Unlock()
+				return pc.mux, nil
+			}
+		}
 		p.connLock.Unlock()
-		// Return an existing connection even if it's busy
-		return p.getIdleConn(), nil
+		return nil, errors.New("pool is at max capacity and no idle connections available")
 	}
 	p.connLock.Unlock()
 
@@ -289,6 +317,17 @@ func (p *Pool) createConn(ctx context.Context) (*Mux, error) {
 	}
 
 	p.connLock.Lock()
+	// Double-check capacity after creating connection (another goroutine may have added one)
+	if len(p.conns) >= p.config.MaxSize {
+		p.connLock.Unlock()
+		// We exceeded capacity, close the newly created connection
+		mux.Close()
+		// Return an existing connection instead
+		if conn := p.getIdleConn(); conn != nil {
+			return conn, nil
+		}
+		return nil, errors.New("pool is at max capacity")
+	}
 	p.conns = append(p.conns, pc)
 	p.connLock.Unlock()
 

@@ -65,15 +65,76 @@ func TestRingBuffer_Full(t *testing.T) {
 	assert.Equal(t, 5, rb.Len())
 	assert.Equal(t, 0, rb.Available())
 
-	// Try to write more
+	// Write more - buffer should auto-grow
 	n = rb.Write([]byte("678"))
-	assert.Equal(t, 0, n)
+	assert.Equal(t, 3, n)
+	assert.Equal(t, 8, rb.Len())
+	assert.True(t, rb.Cap() > 5, "Buffer should have grown")
 
 	// Read all
-	buf := make([]byte, 5)
+	buf := make([]byte, 8)
 	n = rb.Read(buf)
-	assert.Equal(t, 5, n)
-	assert.Equal(t, "12345", string(buf))
+	assert.Equal(t, 8, n)
+	assert.Equal(t, "12345678", string(buf[:n]))
+}
+
+func TestRingBuffer_GrowLimit(t *testing.T) {
+	// initCap=4, maxCap=4*16=64
+	rb := newRingBuffer(4)
+
+	// Keep writing until buffer can't grow anymore
+	totalWritten := 0
+	for range 100 {
+		n := rb.Write([]byte("ABCD"))
+		if n == 0 {
+			break
+		}
+		totalWritten += n
+	}
+
+	// Buffer should have grown to maxCap (4 * 16 = 64)
+	assert.Equal(t, 64, rb.Cap(), "Buffer should have grown to max capacity")
+	assert.Equal(t, 64, rb.Len(), "Buffer should be full")
+	assert.Equal(t, 0, rb.Available())
+
+	// Now writing should fail (no more room and can't grow)
+	n := rb.Write([]byte("X"))
+	assert.Equal(t, 0, n, "Write should fail when buffer is at max capacity and full")
+
+	// Read everything back and verify data integrity
+	buf := make([]byte, 64)
+	n = rb.Read(buf)
+	assert.Equal(t, 64, n)
+	// All data should be "ABCD" repeated
+	for i := 0; i < 64; i += 4 {
+		assert.Equal(t, "ABCD", string(buf[i:i+4]))
+	}
+}
+
+func TestRingBuffer_GrowPreservesData(t *testing.T) {
+	rb := newRingBuffer(8)
+
+	// Write and partially read to create wrap-around state
+	rb.Write([]byte("ABCDEF"))   // w=6, r=0
+	buf := make([]byte, 4)
+	rb.Read(buf)                  // w=6, r=4
+	assert.Equal(t, "ABCD", string(buf))
+
+	rb.Write([]byte("GHIJ"))     // w=2, r=4 (wrapped)
+	assert.Equal(t, 6, rb.Len()) // "EF" + "GHIJ"
+
+	// Now write more than available space to trigger grow
+	// Available = 8-6 = 2, writing 4 bytes should trigger grow
+	n := rb.Write([]byte("KLMN"))
+	assert.Equal(t, 4, n)
+	assert.True(t, rb.Cap() > 8, "Buffer should have grown")
+	assert.Equal(t, 10, rb.Len())
+
+	// Read all data and verify order
+	result := make([]byte, 10)
+	n = rb.Read(result)
+	assert.Equal(t, 10, n)
+	assert.Equal(t, "EFGHIJKLMN", string(result[:n]))
 }
 
 func TestRingBuffer_Reset(t *testing.T) {

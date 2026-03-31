@@ -56,10 +56,10 @@ type Stream struct {
 	readLock    sync.Mutex
 
 	// Write side
-	sendWindow  int64
-	sendCond    *sync.Cond
+	sendWindow   int64
+	sendCond     *sync.Cond
 	writeTimeout time.Time
-	writeLock   sync.Mutex
+	writeLock    sync.Mutex
 
 	// Receive window tracking
 	recvWindow     int64
@@ -261,7 +261,10 @@ func (s *Stream) closeWithError(err error) error {
 			}
 
 			s.stateLock.Lock()
-			if err == nil && s.remoteErr == nil {
+			s.readLock.Lock()
+			hasRemoteErr := s.remoteErr != nil
+			s.readLock.Unlock()
+			if err == nil && !hasRemoteErr {
 				atomic.StoreUint32(&s.state, streamStateClosed)
 			}
 		}
@@ -380,7 +383,9 @@ func (s *Stream) receiveClose() {
 
 // receiveError is called when an error frame is received.
 func (s *Stream) receiveError(code uint32, message string) {
+	s.readLock.Lock()
 	s.remoteErr = &RemoteError{Code: code, Message: message}
+	s.readLock.Unlock()
 	s.receiveClose()
 }
 
@@ -417,16 +422,19 @@ func (e *RemoteError) Error() string {
 }
 
 // ringBuffer is a simple ring buffer for stream read buffering.
+// It supports auto-growing when the buffer is full to handle large data transfers.
 type ringBuffer struct {
-	buf   []byte
-	r     int // read position
-	w     int // write position
-	size  int // current data size
+	buf     []byte
+	r       int // read position
+	w       int // write position
+	size    int // current data size
+	initCap int // initial capacity for growth limit
 }
 
 func newRingBuffer(capacity int) *ringBuffer {
 	return &ringBuffer{
-		buf: make([]byte, capacity),
+		buf:     make([]byte, capacity),
+		initCap: capacity,
 	}
 }
 
@@ -442,34 +450,63 @@ func (rb *ringBuffer) Available() int {
 	return len(rb.buf) - rb.size
 }
 
+// grow doubles the buffer capacity, preserving existing data.
+// Maximum growth is 16x the initial capacity.
+func (rb *ringBuffer) grow() bool {
+	maxCap := rb.initCap * 16
+	if len(rb.buf) >= maxCap {
+		return false
+	}
+	newCap := min(len(rb.buf)*2, maxCap)
+	newBuf := make([]byte, newCap)
+
+	// Linearize existing data into the new buffer
+	if rb.size > 0 {
+		if rb.r < rb.w {
+			copy(newBuf, rb.buf[rb.r:rb.w])
+		} else {
+			n := copy(newBuf, rb.buf[rb.r:])
+			copy(newBuf[n:], rb.buf[:rb.w])
+		}
+	}
+	rb.buf = newBuf
+	rb.r = 0
+	rb.w = rb.size
+	return true
+}
+
 func (rb *ringBuffer) Write(p []byte) int {
-	if len(p) == 0 || rb.Available() == 0 {
+	if len(p) == 0 {
 		return 0
 	}
 
-	toWrite := len(p)
-	if toWrite > rb.Available() {
-		toWrite = rb.Available()
+	// Auto-grow if not enough space
+	for rb.Available() < len(p) {
+		if !rb.grow() {
+			break
+		}
 	}
 
-	written := 0
-	for written < toWrite {
-		// Write to the end position
-		n := copy(rb.buf[rb.w:], p[written:toWrite])
-		if n == 0 && rb.w < len(rb.buf) {
-			// Need to wrap around
-			n = copy(rb.buf[rb.w:], p[written:toWrite])
-		}
-		if n == 0 {
-			// Wrapped, write from beginning
-			n = copy(rb.buf[:rb.r], p[written:toWrite])
-		}
-		written += n
-		rb.w = (rb.w + n) % len(rb.buf)
-		rb.size += n
+	if rb.Available() == 0 {
+		return 0
 	}
 
-	return written
+	toWrite := min(len(p), rb.Available())
+
+	// Two-phase copy to handle wrap-around
+	// Phase 1: write from rb.w to end of buffer
+	end := min(len(rb.buf)-rb.w, toWrite)
+	copy(rb.buf[rb.w:rb.w+end], p[:end])
+
+	// Phase 2: write remaining from beginning of buffer (wrap-around)
+	remaining := toWrite - end
+	if remaining > 0 {
+		copy(rb.buf[0:remaining], p[end:toWrite])
+	}
+
+	rb.w = (rb.w + toWrite) % len(rb.buf)
+	rb.size += toWrite
+	return toWrite
 }
 
 func (rb *ringBuffer) Read(p []byte) int {
@@ -477,26 +514,22 @@ func (rb *ringBuffer) Read(p []byte) int {
 		return 0
 	}
 
-	toRead := len(p)
-	if toRead > rb.size {
-		toRead = rb.size
+	toRead := min(len(p), rb.size)
+
+	// Two-phase copy to handle wrap-around
+	// Phase 1: read from rb.r to end of buffer
+	end := min(len(rb.buf)-rb.r, toRead)
+	copy(p[:end], rb.buf[rb.r:rb.r+end])
+
+	// Phase 2: read remaining from beginning of buffer (wrap-around)
+	remaining := toRead - end
+	if remaining > 0 {
+		copy(p[end:toRead], rb.buf[0:remaining])
 	}
 
-	read := 0
-	for read < toRead {
-		// Calculate how much we can read in one copy
-		var n int
-		if rb.r < rb.w {
-			n = copy(p[read:toRead], rb.buf[rb.r:rb.w])
-		} else {
-			n = copy(p[read:toRead], rb.buf[rb.r:])
-		}
-		read += n
-		rb.r = (rb.r + n) % len(rb.buf)
-		rb.size -= n
-	}
-
-	return read
+	rb.r = (rb.r + toRead) % len(rb.buf)
+	rb.size -= toRead
+	return toRead
 }
 
 func (rb *ringBuffer) Reset() {
