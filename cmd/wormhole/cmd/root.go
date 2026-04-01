@@ -7,7 +7,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
-	"github.com/wormhole-tunnel/wormhole/pkg/version"
+	"github.com/lucientong/wormhole/pkg/version"
 )
 
 var (

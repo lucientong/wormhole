@@ -111,8 +111,8 @@ Wormhole is a Client-Server architecture tunneling tool. The core idea is:
 |---------|----------|----------------|
 | `tunnel` | `pkg/tunnel/` | Multiplexer, frame codec, stream management, connection pool |
 | `proto` | `pkg/proto/` | Control protocol message definitions (JSON encoding) |
-| `auth` | `pkg/auth/` | Authentication & authorization (HMAC tokens, roles, permissions) |
-| `p2p` | `pkg/p2p/` | STUN client, NAT discovery, UDP hole punching, port prediction |
+| `auth` | `pkg/auth/` | Authentication & authorization (HMAC tokens, roles, permissions, rate limiting, audit logging, SQLite persistence) |
+| `p2p` | `pkg/p2p/` | STUN client, NAT discovery, UDP hole punching, port prediction, reliable UDP transport |
 | `version` | `pkg/version/` | Build version information |
 
 ---
@@ -478,7 +478,7 @@ type Record struct {
 
 ---
 
-## P2P Direct Connection (Phase 4)
+## P2P Direct Connection (Phase 4 & 4.5)
 
 ### Goal
 
@@ -522,9 +522,9 @@ When two Clients need to communicate (or a single Client exposes a service), att
           │  (reliable transport)  │
 ```
 
-### Current Implementation
+### Implementation
 
-Phase 4 provides the foundational P2P primitives:
+Phase 4 provides the foundational P2P primitives, and Phase 4.5 completes end-to-end integration:
 
 | Component | File | Status |
 |-----------|------|--------|
@@ -533,14 +533,65 @@ Phase 4 provides the foundational P2P primitives:
 | **Hole Puncher** | `pkg/p2p/hole_punch.go` | ✅ Complete — UDP probe/ack with WHPP magic prefix |
 | **Port Predictor** | `pkg/p2p/predictor.go` | ✅ Complete — Delta-based prediction for symmetric NAT |
 | **P2P Manager** | `pkg/p2p/manager.go` | ✅ Complete — Coordinates STUN + hole punch + relay fallback |
+| **Reliable UDP Transport** | `pkg/p2p/transport.go` | ✅ Complete — ARQ protocol with seq/ack, retransmission, FIN |
 | **Signaling Messages** | `pkg/proto/messages.go` | ✅ Complete — P2POfferRequest/Response, Candidates, Result |
-| **Client Integration** | `cmd/client/client.go` | ✅ Partial — NAT discovery at startup, sends P2P offer |
-| **Server Signaling** | `cmd/server/server.go` | ✅ Partial — Receives P2P offer, stores NAT info |
+| **Client Integration** | `cmd/client/client.go` | ✅ Complete — NAT discovery, P2P offer, hot switch, fallback |
+| **Server Signaling** | `cmd/server/server.go` | ✅ Complete — Peer matching, NAT compatibility check |
+| **Integration Tests** | `pkg/p2p/integration_test.go` | ✅ Complete — 15+ test cases |
+
+### Reliable UDP Transport Layer
+
+The P2P module includes a custom ARQ-based reliable transport (`transport.go`):
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Transport Layer                       │
+│                                                          │
+│  ┌────────────┐    ┌────────────┐    ┌────────────┐    │
+│  │  Sequence  │    │  ACK/NACK  │    │  Retrans   │    │
+│  │  Numbering │    │  Handling  │    │  Timer     │    │
+│  └────────────┘    └────────────┘    └────────────┘    │
+│                                                          │
+│  ┌────────────┐    ┌────────────┐    ┌────────────┐    │
+│  │  Packet    │    │  Out-of-   │    │  FIN/ACK   │    │
+│  │  Assembly  │    │  Order Buf │    │  Close     │    │
+│  └────────────┘    └────────────┘    └────────────┘    │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+                    UDP Connection
+```
+
+### Relay→P2P Hot Switching
+
+When P2P connection succeeds, data transfer seamlessly switches from relay to direct:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                    Hot Switch Flow                        │
+│                                                           │
+│  1. Initial: Traffic via Server relay                     │
+│     Client A ──TCP──► Server ──TCP──► Client B            │
+│                                                           │
+│  2. P2P attempt succeeds                                  │
+│     Client A ◄──UDP P2P──► Client B                       │
+│                                                           │
+│  3. Hot switch: New streams use P2P                       │
+│     - Existing streams continue on relay                  │
+│     - New streams routed via p2pReadLoop                  │
+│     - Graceful transition, no data loss                   │
+│                                                           │
+│  4. Fallback: If P2P fails, automatic relay fallback      │
+│     Client A ──TCP──► Server ──TCP──► Client B            │
+└──────────────────────────────────────────────────────────┘
+```
 
 ### NAT Type Classification
 
 | NAT Type | Traversal Difficulty | Strategy |
 |----------|---------------------|----------|
+| None (Open Internet) | ★☆☆☆ | Direct connection, always succeeds |
 | Full Cone | ★☆☆☆ | Direct connection, almost always succeeds |
 | Restricted Cone | ★★☆☆ | Requires outbound probe first |
 | Port Restricted Cone | ★★★☆ | Requires port-matched probe |
@@ -552,8 +603,10 @@ Phase 4 provides the foundational P2P primitives:
 Attempt P2P Connection
     │
     ├── Success → Use P2P channel for data transfer
+    │              (p2pReadLoop handles incoming data)
     │
-    └── Failure → Automatic fallback to Server relay (existing architecture)
+    └── Failure → Automatic fallback to Server relay
+                  (fallbackToRelay() resets P2P state)
 ```
 
 ---
@@ -600,6 +653,35 @@ On timeout: Mark connection abnormal, trigger reconnection
 
 Wormhole supports optional authentication to protect the server from unauthorized client connections. The auth module is located in `pkg/auth/`.
 
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Auth Module (pkg/auth/)                  │
+│                                                              │
+│  ┌────────────┐  ┌────────────┐  ┌────────────────────────┐ │
+│  │   Token    │  │   Rate     │  │   Audit                │ │
+│  │  Manager   │  │  Limiter   │  │   Logger               │ │
+│  │            │  │            │  │                        │ │
+│  │ - Generate │  │ - IsBlocked│  │ - LogAuthSuccess       │ │
+│  │ - Validate │  │ - RecordFail│ │ - LogAuthFailure       │ │
+│  │ - Revoke   │  │ - Unblock  │  │ - LogIPBlocked         │ │
+│  └─────┬──────┘  └─────┬──────┘  └──────────┬─────────────┘ │
+│        │               │                     │               │
+│        └───────────────┼─────────────────────┘               │
+│                        │                                     │
+│                        ▼                                     │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │                  Storage Backend                        │ │
+│  │                                                         │ │
+│  │   ┌──────────────┐         ┌──────────────┐            │ │
+│  │   │   Memory     │   OR    │   SQLite     │            │ │
+│  │   │  (default)   │         │ (persistent) │            │ │
+│  │   └──────────────┘         └──────────────┘            │ │
+│  └────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
 ### Authentication Modes
 
 | Mode | Use Case | Configuration |
@@ -630,6 +712,91 @@ payload = {
 | `member` | ✅ | ✅ | ✅ | ❌ |
 | `viewer` | ❌ | ❌ | ✅ | ❌ |
 
+### Rate Limiting
+
+The rate limiter (`ratelimit.go`) protects against brute-force attacks:
+
+```
+┌─────────────────────────────────────────┐
+│          Rate Limit Flow                 │
+│                                          │
+│  Auth Request                            │
+│       │                                  │
+│       ▼                                  │
+│  ┌─────────────┐                         │
+│  │ IsBlocked?  │──Yes──► 429 Too Many    │
+│  └──────┬──────┘         Requests        │
+│         │ No                             │
+│         ▼                                │
+│  ┌─────────────┐                         │
+│  │  Validate   │                         │
+│  │   Token     │                         │
+│  └──────┬──────┘                         │
+│         │                                │
+│    ┌────┴────┐                           │
+│    │         │                           │
+│  Success   Failure                       │
+│    │         │                           │
+│    ▼         ▼                           │
+│ RecordSuccess  RecordFailure             │
+│ (clear count)  (increment count)         │
+│                    │                     │
+│              ┌─────┴─────┐               │
+│              │ >= 5 fails?│              │
+│              └─────┬─────┘               │
+│                    │ Yes                 │
+│                    ▼                     │
+│              Block IP for                │
+│              15 minutes                  │
+└─────────────────────────────────────────┘
+
+Default Configuration:
+- MaxFailures: 5
+- Window: 5 minutes
+- BlockDuration: 15 minutes
+```
+
+### Audit Logging
+
+The audit logger (`audit.go`) records security events for compliance and debugging:
+
+| Event Type | Description |
+|------------|-------------|
+| `auth_success` | Successful authentication |
+| `auth_failure` | Failed authentication attempt |
+| `ip_blocked` | IP blocked due to rate limit |
+| `ip_unblocked` | IP manually unblocked |
+| `token_generated` | New token created |
+| `client_connected` | Client established tunnel |
+| `client_disconnected` | Client disconnected |
+
+Log format (JSON):
+```json
+{
+  "timestamp": "2024-03-31T12:00:00Z",
+  "type": "auth_success",
+  "ip": "192.168.1.100",
+  "team": "team-alpha",
+  "role": "member",
+  "session_id": "abc123",
+  "subdomain": "myapp"
+}
+```
+
+### Persistent Storage
+
+Storage backends (`store.go`, `store_sqlite.go`):
+
+| Backend | Use Case | Configuration |
+|---------|----------|---------------|
+| **Memory** | Development, stateless deployments | Default |
+| **SQLite** | Production, persistent team data | `--persistence sqlite` |
+
+SQLite stores:
+- Team information (name, creation time)
+- Revoked token blacklist
+- Token metadata (expiry, revocation status)
+
 ### Authentication Handshake Flow
 
 ```
@@ -639,14 +806,19 @@ payload = {
     │                                      │  ◄── Mux.AcceptStream()
     │                                      │      (with timeout, default 10s)
     │                                      │
+    │                                      │  1. rateLimiter.IsBlocked(ip)?
+    │                                      │     → Yes: close connection
+    │                                      │
     │  ── AuthRequest ──────────────────► │
     │     { token: "xxx",                 │
     │       version: "1.0.0",             │
     │       subdomain: "myapp" }          │
-    │                                      │  1. ValidateToken(token)
+    │                                      │  2. ValidateToken(token)
     │                                      │     → Try simple match first
     │                                      │     → Then try HMAC verification
-    │                                      │  2. HasPermission(claims, "connect")
+    │                                      │  3. HasPermission(claims, "connect")
+    │                                      │  4. rateLimiter.RecordSuccess/Failure
+    │                                      │  5. auditLogger.LogAuthSuccess/Failure
     │                                      │
     │  ◄── AuthResponse ────────────────  │
     │     { success: true,                │
@@ -659,9 +831,35 @@ payload = {
 ### Admin API Authentication
 
 - `/health` endpoint is always public
-- `/stats`, `/clients`, `/tunnels` are protected by `--admin-token`
+- `/stats`, `/clients`, `/tunnels`, `/teams` are protected by `--admin-token`
 - Uses `Authorization: Bearer <token>` header
 - Token comparison uses `crypto/subtle.ConstantTimeCompare` to prevent timing attacks
+
+### Team Management API
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/teams` | GET | List all teams |
+| `/teams` | POST | Create a new team |
+| `/teams/{name}` | GET | Get team details |
+| `/tokens/generate` | POST | Generate token for a team |
+| `/tokens/revoke` | POST | Revoke a token |
+
+### Client Token Persistence
+
+The client stores authentication tokens locally (`~/.wormhole/config.yaml`):
+
+```yaml
+server_addr: "tunnel.example.com:7000"
+token: "eyJ0ZWFtIjoiYWxwaGEiLCJyb2xlIjoibWVtYmVyIi4uLn0.xxx"
+subdomain: "myapp"
+tls_enabled: true
+p2p_enabled: true
+```
+
+- Tokens are saved with restrictive permissions (0600)
+- Command-line flags override persistent config
+- `--save-token` flag persists token after successful auth
 
 ---
 
@@ -679,6 +877,22 @@ payload = {
 - Role-based access control (RBAC): admin, member, viewer roles
 - Mandatory authentication on connection handshake (`--require-auth`), viewer role cannot establish tunnel connections
 - Admin API protected by separate token, using constant-time comparison to prevent timing attacks
+- Token revocation support with persistent blacklist (SQLite backend)
+
+### Rate Limiting
+
+- Authentication failure tracking per IP address
+- Configurable thresholds: 5 failures within 5 minutes → 15 minute block
+- Automatic expiration and cleanup of rate limit records
+- Manual unblock capability via Admin API
+- Blocked IPs cannot attempt authentication
+
+### Audit Logging
+
+- Structured JSON logging of security events
+- Events: auth success/failure, IP blocked/unblocked, token generated, client connect/disconnect
+- Configurable output destination (stdout, file)
+- Compliance-ready event format with timestamps and session tracking
 
 ### Input Validation
 
@@ -686,10 +900,11 @@ payload = {
 - Subdomain restricted to single-level labels (no dots)
 - Path prefix normalization (leading/trailing `/`)
 
-### Rate Limiting
+### Connection Limits
 
 - `MaxClients` limits concurrent online clients
 - TCP port allocation range restriction (default 10000-20000)
+- Per-IP connection tracking for rate limiting
 
 ---
 

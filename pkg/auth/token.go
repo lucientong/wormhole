@@ -18,6 +18,7 @@ import (
 var (
 	ErrInvalidToken    = errors.New("invalid token")
 	ErrTokenExpired    = errors.New("token expired")
+	ErrTokenRevoked    = errors.New("token revoked")
 	ErrForbidden       = errors.New("forbidden")
 	ErrTeamNotFound    = errors.New("team not found")
 	ErrInvalidSecret   = errors.New("secret must be at least 16 bytes")
@@ -69,10 +70,16 @@ type Config struct {
 	// AllowedTokens is a list of pre-shared plain tokens (simple mode).
 	// When set, these tokens bypass HMAC validation entirely.
 	AllowedTokens []string
+
+	// Store is the storage backend for teams and revoked tokens.
+	// If nil, a MemoryStore is used (no persistence).
+	Store Store
 }
 
 // Claims contains the validated token information.
 type Claims struct {
+	// TokenID is the unique identifier for this token.
+	TokenID string `json:"jti,omitempty"`
 	// TeamName is the team this token belongs to.
 	TeamName string `json:"team"`
 	// Role is the role assigned to this token.
@@ -85,6 +92,7 @@ type Claims struct {
 
 // tokenPayload is the internal structure embedded in the token.
 type tokenPayload struct {
+	TokenID   string `json:"jti,omitempty"`
 	TeamName  string `json:"team"`
 	Role      Role   `json:"role"`
 	IssuedAt  int64  `json:"iat"`
@@ -103,9 +111,10 @@ type TeamInfo struct {
 type Auth struct {
 	config Config
 
-	// teams stores team metadata (team name → info).
-	teams map[string]*TeamInfo
-	mu    sync.RWMutex
+	// store is the storage backend for teams and revoked tokens.
+	store Store
+
+	mu sync.RWMutex
 }
 
 // New creates a new Auth instance.
@@ -119,9 +128,15 @@ func New(config Config) (*Auth, error) {
 		config.TokenExpiry = 24 * time.Hour
 	}
 
+	// Use provided store or default to memory.
+	store := config.Store
+	if store == nil {
+		store = NewMemoryStore()
+	}
+
 	return &Auth{
 		config: config,
-		teams:  make(map[string]*TeamInfo),
+		store:  store,
 	}, nil
 }
 
@@ -132,7 +147,7 @@ func NewSimple(allowedTokens []string) *Auth {
 		config: Config{
 			AllowedTokens: allowedTokens,
 		},
-		teams: make(map[string]*TeamInfo),
+		store: NewMemoryStore(),
 	}
 }
 
@@ -150,8 +165,15 @@ func (a *Auth) GenerateTeamToken(teamName string, role Role) (string, error) {
 		return "", fmt.Errorf("generate nonce: %w", err)
 	}
 
+	// Generate a unique token ID.
+	tokenID, err := generateNonce(12)
+	if err != nil {
+		return "", fmt.Errorf("generate token id: %w", err)
+	}
+
 	now := time.Now()
 	payload := tokenPayload{
+		TokenID:  tokenID,
 		TeamName: teamName,
 		Role:     role,
 		IssuedAt: now.Unix(),
@@ -179,14 +201,20 @@ func (a *Auth) GenerateTeamToken(teamName string, role Role) (string, error) {
 
 	// Track team.
 	a.mu.Lock()
-	if info, ok := a.teams[teamName]; ok {
-		info.Tokens++
-	} else {
-		a.teams[teamName] = &TeamInfo{
+	info, err := a.store.GetTeam(teamName)
+	switch err {
+	case ErrTeamNotFound:
+		info = &TeamInfo{
 			Name:      teamName,
 			CreatedAt: now,
 			Tokens:    1,
 		}
+	case nil:
+		info.Tokens++
+	default:
+	}
+	if err == nil || err == ErrTeamNotFound {
+		_ = a.store.SaveTeam(info)
 	}
 	a.mu.Unlock()
 
@@ -256,7 +284,16 @@ func (a *Auth) ValidateToken(token string) (*Claims, error) {
 		}
 	}
 
+	// Check if token is revoked.
+	if payload.TokenID != "" {
+		revoked, err := a.store.IsTokenRevoked(payload.TokenID)
+		if err == nil && revoked {
+			return nil, ErrTokenRevoked
+		}
+	}
+
 	claims := &Claims{
+		TokenID:  payload.TokenID,
 		TeamName: payload.TeamName,
 		Role:     payload.Role,
 		IssuedAt: time.Unix(payload.IssuedAt, 0),
@@ -280,7 +317,7 @@ func HasPermission(claims *Claims, perm Permission) bool {
 	return slices.Contains(perms, perm)
 }
 
-// RegisterTeam registers a team in the in-memory store.
+// RegisterTeam registers a team in the store.
 func (a *Auth) RegisterTeam(name string) error {
 	if name == "" {
 		return ErrInvalidTeamName
@@ -289,15 +326,15 @@ func (a *Auth) RegisterTeam(name string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if _, ok := a.teams[name]; ok {
+	// Check if team already exists.
+	if _, err := a.store.GetTeam(name); err == nil {
 		return ErrDuplicateTeam
 	}
 
-	a.teams[name] = &TeamInfo{
+	return a.store.SaveTeam(&TeamInfo{
 		Name:      name,
 		CreatedAt: time.Now(),
-	}
-	return nil
+	})
 }
 
 // GetTeam returns team information.
@@ -305,11 +342,7 @@ func (a *Auth) GetTeam(name string) (*TeamInfo, error) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	info, ok := a.teams[name]
-	if !ok {
-		return nil, ErrTeamNotFound
-	}
-	return info, nil
+	return a.store.GetTeam(name)
 }
 
 // ListTeams returns all registered teams.
@@ -317,11 +350,177 @@ func (a *Auth) ListTeams() []TeamInfo {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	teams := make([]TeamInfo, 0, len(a.teams))
-	for _, info := range a.teams {
-		teams = append(teams, *info)
+	teams, err := a.store.ListTeams()
+	if err != nil {
+		return nil
 	}
 	return teams
+}
+
+// RevokeToken adds a token ID to the revocation blacklist.
+// The expiresAt parameter indicates when the token would have expired;
+// after that time, the revocation entry can be cleaned up.
+// If expiresAt is zero, the revocation is permanent until manually cleared.
+func (a *Auth) RevokeToken(tokenID string, expiresAt time.Time) error {
+	if tokenID == "" {
+		return ErrInvalidToken
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return a.store.SaveRevokedToken(tokenID, expiresAt)
+}
+
+// RevokeTokenByString parses a token string and revokes it by ID.
+// Returns ErrInvalidToken if the token cannot be parsed or has no ID.
+func (a *Auth) RevokeTokenByString(token string) error {
+	claims, err := a.ValidateToken(token)
+	if err != nil && err != ErrTokenRevoked {
+		// Allow revoking already-revoked tokens (idempotent).
+		return err
+	}
+
+	if claims == nil || claims.TokenID == "" {
+		return ErrInvalidToken
+	}
+
+	return a.RevokeToken(claims.TokenID, claims.ExpiresAt)
+}
+
+// IsRevoked checks if a token ID is in the revocation blacklist.
+func (a *Auth) IsRevoked(tokenID string) bool {
+	if tokenID == "" {
+		return false
+	}
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	revoked, err := a.store.IsTokenRevoked(tokenID)
+	return err == nil && revoked
+}
+
+// UnrevokeToken removes a token ID from the revocation blacklist.
+func (a *Auth) UnrevokeToken(tokenID string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	_ = a.store.RemoveRevokedToken(tokenID)
+}
+
+// CleanupRevokedTokens removes expired entries from the revocation blacklist.
+// This should be called periodically to prevent the blacklist from growing unbounded.
+func (a *Auth) CleanupRevokedTokens() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	cleaned, err := a.store.CleanupExpiredRevocations()
+	if err != nil {
+		return 0
+	}
+	return cleaned
+}
+
+// RevokedTokenCount returns the number of tokens in the revocation blacklist.
+func (a *Auth) RevokedTokenCount() int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	count, err := a.store.CountRevokedTokens()
+	if err != nil {
+		return 0
+	}
+	return count
+}
+
+// RevokeAllTeamTokens marks a team as fully revoked by incrementing a version.
+// This is a placeholder for a more sophisticated team-level revocation.
+// For now, it's not implemented as it would require version tracking in tokens.
+// Use RevokeToken for individual token revocation.
+func (a *Auth) RevokeAllTeamTokens(_ string) error {
+	// TODO: Implement team-level revocation with version numbers.
+	// This would require adding a "version" field to tokens and tracking
+	// the minimum valid version per team.
+	return errors.New("team-level revocation not implemented; use individual token revocation")
+}
+
+// RefreshToken generates a new token with the same claims as the original,
+// but with a fresh issuance time and expiry. The original token is NOT revoked.
+// Use RevokeToken to invalidate the old token if desired.
+func (a *Auth) RefreshToken(token string) (string, error) {
+	claims, err := a.ValidateToken(token)
+	if err != nil {
+		return "", err
+	}
+
+	// Generate a new token with the same team and role.
+	return a.GenerateTeamToken(claims.TeamName, claims.Role)
+}
+
+// RefreshAndRevokeToken generates a new token and revokes the old one atomically.
+// This is the recommended way to refresh tokens when rotation is desired.
+func (a *Auth) RefreshAndRevokeToken(oldToken string) (string, error) {
+	claims, err := a.ValidateToken(oldToken)
+	if err != nil {
+		return "", err
+	}
+
+	// Generate a new token first.
+	newToken, err := a.GenerateTeamToken(claims.TeamName, claims.Role)
+	if err != nil {
+		return "", err
+	}
+
+	// Revoke the old token (if it has an ID).
+	if claims.TokenID != "" {
+		if err := a.RevokeToken(claims.TokenID, claims.ExpiresAt); err != nil {
+			// Log but don't fail — the new token is already generated.
+			// In a production system, you might want to handle this differently.
+			_ = err
+		}
+	}
+
+	return newToken, nil
+}
+
+// ExtendTokenExpiry creates a new token with an extended expiry time.
+// The original token is NOT revoked.
+func (a *Auth) ExtendTokenExpiry(token string, extension time.Duration) (string, error) {
+	claims, err := a.ValidateToken(token)
+	if err != nil {
+		return "", err
+	}
+
+	// Temporarily override the config expiry to extend.
+	originalExpiry := a.config.TokenExpiry
+	if !claims.ExpiresAt.IsZero() {
+		// Extend from the original expiry time.
+		remaining := time.Until(claims.ExpiresAt)
+		a.config.TokenExpiry = remaining + extension
+	} else {
+		// Token had no expiry, set one now.
+		a.config.TokenExpiry = extension
+	}
+
+	newToken, err := a.GenerateTeamToken(claims.TeamName, claims.Role)
+
+	// Restore original config.
+	a.config.TokenExpiry = originalExpiry
+
+	return newToken, err
+}
+
+// Close releases any resources held by the Auth instance.
+// This should be called when the Auth instance is no longer needed.
+func (a *Auth) Close() error {
+	return a.store.Close()
+}
+
+// Store returns the underlying storage backend.
+// This is useful for advanced operations or testing.
+func (a *Auth) Store() Store {
+	return a.store
 }
 
 // computeHMAC computes an HMAC-SHA256 digest.

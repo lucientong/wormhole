@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
-	"github.com/wormhole-tunnel/wormhole/pkg/proto"
-	"github.com/wormhole-tunnel/wormhole/pkg/tunnel"
+	"github.com/lucientong/wormhole/pkg/proto"
+	"github.com/lucientong/wormhole/pkg/tunnel"
 )
 
 // HTTPHandler handles incoming HTTP requests and routes them through tunnels.

@@ -162,6 +162,8 @@ wormhole server \
 | `--auth-tokens` | Comma-separated pre-shared tokens | None |
 | `--auth-secret` | HMAC secret for signed tokens (min 16 chars) | None |
 | `--admin-token` | Token to protect admin API | None |
+| `--persistence` | Storage backend: memory (default) or sqlite | memory |
+| `--persistence-path` | Path to SQLite database | ~/.wormhole/wormhole.db |
 
 ## API
 
@@ -193,6 +195,24 @@ wormhole server --require-auth --auth-secret "my-secret-at-least-16-chars"
 # Protect admin API with a separate token
 wormhole server --admin-token my-admin-secret
 ```
+
+### Persistent Storage
+
+By default, Wormhole uses in-memory storage, which is lost on restart. To persist team data and token revocations, enable SQLite storage:
+
+```bash
+# Enable SQLite persistence (default path: ~/.wormhole/wormhole.db)
+wormhole server --require-auth --auth-secret "my-secret" --persistence sqlite
+
+# Specify custom database path
+wormhole server --require-auth --auth-secret "my-secret" \
+  --persistence sqlite \
+  --persistence-path /var/lib/wormhole/data.db
+```
+
+Persistent storage saves:
+- Team information
+- Revoked token blacklist
 
 ### Inspector API (Client)
 
@@ -260,7 +280,7 @@ wormhole/
 - [x] Phase 2: HTTP routing + TLS + Admin API
 - [x] Phase 3: Traffic inspector UI
 - [x] Phase 4: P2P direct connection — primitives (STUN, hole punch, predictor, signaling)
-- [ ] Phase 4.5: P2P end-to-end integration (peer matching, data transfer, relay→P2P switch)
+- [x] Phase 4.5: P2P end-to-end integration (peer matching, data transfer, relay→P2P switch)
 - [x] Phase 5: Team collaboration (auth, HMAC tokens, RBAC, admin API protection)
 
 ## Contributing

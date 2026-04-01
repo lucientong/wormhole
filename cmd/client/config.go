@@ -3,8 +3,8 @@ package main
 import (
 	"time"
 
-	"github.com/wormhole-tunnel/wormhole/pkg/p2p"
-	"github.com/wormhole-tunnel/wormhole/pkg/tunnel"
+	"github.com/lucientong/wormhole/pkg/p2p"
+	"github.com/lucientong/wormhole/pkg/tunnel"
 )
 
 // Config holds the client configuration.

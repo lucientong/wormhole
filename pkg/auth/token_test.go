@@ -300,3 +300,292 @@ func TestAllRoles(t *testing.T) {
 		assert.Equal(t, role, claims.Role)
 	}
 }
+
+func TestRevokeToken(t *testing.T) {
+	a := newTestAuth(t)
+
+	// Generate a token.
+	token, err := a.GenerateTeamToken("team1", RoleMember)
+	require.NoError(t, err)
+
+	// Validate it works.
+	claims, err := a.ValidateToken(token)
+	require.NoError(t, err)
+	assert.NotEmpty(t, claims.TokenID)
+
+	// Revoke the token.
+	err = a.RevokeToken(claims.TokenID, claims.ExpiresAt)
+	require.NoError(t, err)
+
+	// Validate should now fail.
+	_, err = a.ValidateToken(token)
+	assert.ErrorIs(t, err, ErrTokenRevoked)
+}
+
+func TestRevokeToken_EmptyID(t *testing.T) {
+	a := newTestAuth(t)
+
+	err := a.RevokeToken("", time.Now())
+	assert.ErrorIs(t, err, ErrInvalidToken)
+}
+
+func TestRevokeTokenByString(t *testing.T) {
+	a := newTestAuth(t)
+
+	// Generate a token.
+	token, err := a.GenerateTeamToken("team1", RoleMember)
+	require.NoError(t, err)
+
+	// Revoke using the token string.
+	err = a.RevokeTokenByString(token)
+	require.NoError(t, err)
+
+	// Validate should now fail.
+	_, err = a.ValidateToken(token)
+	assert.ErrorIs(t, err, ErrTokenRevoked)
+}
+
+func TestRevokeTokenByString_InvalidToken(t *testing.T) {
+	a := newTestAuth(t)
+
+	err := a.RevokeTokenByString("invalid-token")
+	assert.ErrorIs(t, err, ErrInvalidToken)
+}
+
+func TestIsRevoked(t *testing.T) {
+	a := newTestAuth(t)
+
+	// Generate a token.
+	token, err := a.GenerateTeamToken("team1", RoleMember)
+	require.NoError(t, err)
+
+	claims, err := a.ValidateToken(token)
+	require.NoError(t, err)
+
+	// Initially not revoked.
+	assert.False(t, a.IsRevoked(claims.TokenID))
+
+	// Revoke it.
+	err = a.RevokeToken(claims.TokenID, time.Now().Add(1*time.Hour))
+	require.NoError(t, err)
+
+	// Now revoked.
+	assert.True(t, a.IsRevoked(claims.TokenID))
+
+	// Empty ID should return false.
+	assert.False(t, a.IsRevoked(""))
+}
+
+func TestUnrevokeToken(t *testing.T) {
+	a := newTestAuth(t)
+
+	// Generate and revoke a token.
+	token, err := a.GenerateTeamToken("team1", RoleMember)
+	require.NoError(t, err)
+
+	claims, err := a.ValidateToken(token)
+	require.NoError(t, err)
+
+	err = a.RevokeToken(claims.TokenID, time.Now().Add(1*time.Hour))
+	require.NoError(t, err)
+
+	// Verify it's revoked.
+	_, err = a.ValidateToken(token)
+	assert.ErrorIs(t, err, ErrTokenRevoked)
+
+	// Unrevoke it.
+	a.UnrevokeToken(claims.TokenID)
+
+	// Now it should work again.
+	_, err = a.ValidateToken(token)
+	require.NoError(t, err)
+}
+
+func TestCleanupRevokedTokens(t *testing.T) {
+	a := newTestAuth(t)
+
+	// Revoke a token that "expired" in the past.
+	err := a.RevokeToken("expired-token", time.Now().Add(-1*time.Hour))
+	require.NoError(t, err)
+
+	// Revoke a token that expires in the future.
+	err = a.RevokeToken("future-token", time.Now().Add(1*time.Hour))
+	require.NoError(t, err)
+
+	// Revoke a permanent token (zero time).
+	err = a.RevokeToken("permanent-token", time.Time{})
+	require.NoError(t, err)
+
+	assert.Equal(t, 3, a.RevokedTokenCount())
+
+	// Cleanup should remove only the expired one.
+	cleaned := a.CleanupRevokedTokens()
+	assert.Equal(t, 1, cleaned)
+	assert.Equal(t, 2, a.RevokedTokenCount())
+
+	// Verify correct tokens remain.
+	assert.False(t, a.IsRevoked("expired-token"))
+	assert.True(t, a.IsRevoked("future-token"))
+	assert.True(t, a.IsRevoked("permanent-token"))
+}
+
+func TestRevokedTokenCount(t *testing.T) {
+	a := newTestAuth(t)
+
+	assert.Equal(t, 0, a.RevokedTokenCount())
+
+	err := a.RevokeToken("token1", time.Now().Add(1*time.Hour))
+	require.NoError(t, err)
+	assert.Equal(t, 1, a.RevokedTokenCount())
+
+	err = a.RevokeToken("token2", time.Now().Add(1*time.Hour))
+	require.NoError(t, err)
+	assert.Equal(t, 2, a.RevokedTokenCount())
+
+	a.UnrevokeToken("token1")
+	assert.Equal(t, 1, a.RevokedTokenCount())
+}
+
+func TestTokenID_InClaims(t *testing.T) {
+	a := newTestAuth(t)
+
+	token, err := a.GenerateTeamToken("team1", RoleMember)
+	require.NoError(t, err)
+
+	claims, err := a.ValidateToken(token)
+	require.NoError(t, err)
+
+	// Token ID should be present and non-empty.
+	assert.NotEmpty(t, claims.TokenID)
+	// Token ID should be unique per token.
+	token2, err := a.GenerateTeamToken("team1", RoleMember)
+	require.NoError(t, err)
+	claims2, err := a.ValidateToken(token2)
+	require.NoError(t, err)
+	assert.NotEqual(t, claims.TokenID, claims2.TokenID)
+}
+
+func TestRevokeAllTeamTokens_NotImplemented(t *testing.T) {
+	a := newTestAuth(t)
+
+	err := a.RevokeAllTeamTokens("team1")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "not implemented")
+}
+
+func TestRefreshToken(t *testing.T) {
+	a := newTestAuth(t)
+
+	// Generate original token.
+	originalToken, err := a.GenerateTeamToken("team1", RoleMember)
+	require.NoError(t, err)
+
+	originalClaims, err := a.ValidateToken(originalToken)
+	require.NoError(t, err)
+
+	// Sleep briefly to ensure different issuance time.
+	time.Sleep(10 * time.Millisecond)
+
+	// Refresh the token.
+	newToken, err := a.RefreshToken(originalToken)
+	require.NoError(t, err)
+	assert.NotEqual(t, originalToken, newToken)
+
+	// Validate new token.
+	newClaims, err := a.ValidateToken(newToken)
+	require.NoError(t, err)
+
+	// Same team and role.
+	assert.Equal(t, originalClaims.TeamName, newClaims.TeamName)
+	assert.Equal(t, originalClaims.Role, newClaims.Role)
+
+	// Different token IDs.
+	assert.NotEqual(t, originalClaims.TokenID, newClaims.TokenID)
+
+	// New issuance time.
+	assert.True(t, newClaims.IssuedAt.After(originalClaims.IssuedAt) ||
+		newClaims.IssuedAt.Equal(originalClaims.IssuedAt))
+
+	// Original token should still work (not revoked).
+	_, err = a.ValidateToken(originalToken)
+	require.NoError(t, err)
+}
+
+func TestRefreshToken_InvalidToken(t *testing.T) {
+	a := newTestAuth(t)
+
+	_, err := a.RefreshToken("invalid-token")
+	assert.Error(t, err)
+}
+
+func TestRefreshAndRevokeToken(t *testing.T) {
+	a := newTestAuth(t)
+
+	// Generate original token.
+	originalToken, err := a.GenerateTeamToken("team1", RoleMember)
+	require.NoError(t, err)
+
+	originalClaims, err := a.ValidateToken(originalToken)
+	require.NoError(t, err)
+
+	// Refresh and revoke.
+	newToken, err := a.RefreshAndRevokeToken(originalToken)
+	require.NoError(t, err)
+	assert.NotEqual(t, originalToken, newToken)
+
+	// New token should work.
+	newClaims, err := a.ValidateToken(newToken)
+	require.NoError(t, err)
+	assert.Equal(t, originalClaims.TeamName, newClaims.TeamName)
+	assert.Equal(t, originalClaims.Role, newClaims.Role)
+
+	// Original token should be revoked.
+	_, err = a.ValidateToken(originalToken)
+	assert.ErrorIs(t, err, ErrTokenRevoked)
+}
+
+func TestRefreshAndRevokeToken_InvalidToken(t *testing.T) {
+	a := newTestAuth(t)
+
+	_, err := a.RefreshAndRevokeToken("invalid-token")
+	assert.Error(t, err)
+}
+
+func TestExtendTokenExpiry(t *testing.T) {
+	a, err := New(Config{
+		Secret:      testSecret,
+		TokenExpiry: 1 * time.Hour,
+	})
+	require.NoError(t, err)
+
+	// Generate original token.
+	originalToken, err := a.GenerateTeamToken("team1", RoleMember)
+	require.NoError(t, err)
+
+	originalClaims, err := a.ValidateToken(originalToken)
+	require.NoError(t, err)
+	assert.False(t, originalClaims.ExpiresAt.IsZero())
+
+	// Extend by 24 hours.
+	newToken, err := a.ExtendTokenExpiry(originalToken, 24*time.Hour)
+	require.NoError(t, err)
+	assert.NotEqual(t, originalToken, newToken)
+
+	// Validate new token has extended expiry.
+	newClaims, err := a.ValidateToken(newToken)
+	require.NoError(t, err)
+
+	// New expiry should be later than original.
+	assert.True(t, newClaims.ExpiresAt.After(originalClaims.ExpiresAt))
+
+	// The extension should be approximately 24 hours from now (not from original expiry).
+	expectedExpiry := time.Now().Add(time.Until(originalClaims.ExpiresAt) + 24*time.Hour)
+	assert.WithinDuration(t, expectedExpiry, newClaims.ExpiresAt, 5*time.Second)
+}
+
+func TestExtendTokenExpiry_InvalidToken(t *testing.T) {
+	a := newTestAuth(t)
+
+	_, err := a.ExtendTokenExpiry("invalid-token", 1*time.Hour)
+	assert.Error(t, err)
+}

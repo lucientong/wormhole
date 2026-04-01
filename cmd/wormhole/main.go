@@ -4,7 +4,7 @@ package main
 import (
 	"os"
 
-	"github.com/wormhole-tunnel/wormhole/cmd/wormhole/cmd"
+	"github.com/lucientong/wormhole/cmd/wormhole/cmd"
 )
 
 func main() {

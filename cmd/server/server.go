@@ -13,9 +13,9 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
-	"github.com/wormhole-tunnel/wormhole/pkg/auth"
-	"github.com/wormhole-tunnel/wormhole/pkg/proto"
-	"github.com/wormhole-tunnel/wormhole/pkg/tunnel"
+	"github.com/lucientong/wormhole/pkg/auth"
+	"github.com/lucientong/wormhole/pkg/proto"
+	"github.com/lucientong/wormhole/pkg/tunnel"
 )
 
 // Server is the wormhole server.
@@ -35,6 +35,7 @@ type Server struct {
 
 	// Authentication.
 	authenticator *auth.Auth
+	rateLimiter   *auth.RateLimiter
 
 	// Client management.
 	clients    map[string]*ClientSession
@@ -67,6 +68,7 @@ type ClientSession struct {
 	// P2P info.
 	P2PPublicAddr string
 	P2PNATType    string
+	P2PLocalAddr  string
 
 	mu sync.Mutex
 }
@@ -112,11 +114,32 @@ func NewServer(config Config) *Server {
 
 	// Initialize authentication.
 	if config.RequireAuth {
+		// Initialize storage backend.
+		var store auth.Store
+		switch config.Persistence {
+		case PersistenceSQLite:
+			sqliteStore, err := auth.NewSQLiteStore(auth.SQLiteStoreConfig{
+				Path:      config.PersistencePath,
+				CreateDir: true,
+			})
+			if err != nil {
+				log.Fatal().Err(err).Msg("Failed to initialize SQLite store")
+			}
+			store = sqliteStore
+			log.Info().
+				Str("path", config.PersistencePath).
+				Msg("Using SQLite persistence for auth data")
+		default:
+			store = auth.NewMemoryStore()
+			log.Info().Msg("Using in-memory storage for auth data (no persistence)")
+		}
+
 		switch {
 		case config.AuthSecret != "":
 			a, err := auth.New(auth.Config{
 				Secret:        []byte(config.AuthSecret),
 				AllowedTokens: config.AuthTokens,
+				Store:         store,
 			})
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to initialize authentication")
@@ -128,6 +151,21 @@ func NewServer(config Config) *Server {
 			log.Info().Int("tokens", len(config.AuthTokens)).Msg("Authentication enabled (simple token mode)")
 		default:
 			log.Warn().Msg("RequireAuth is true but no tokens or secret configured — all connections will be rejected")
+		}
+
+		// Initialize rate limiter for auth failures.
+		if config.RateLimitEnabled {
+			s.rateLimiter = auth.NewRateLimiter(auth.RateLimitConfig{
+				MaxFailures:     config.RateLimitMaxFailures,
+				Window:          config.RateLimitWindow,
+				BlockDuration:   config.RateLimitBlockDuration,
+				CleanupInterval: 1 * time.Minute,
+			})
+			log.Info().
+				Int("max_failures", config.RateLimitMaxFailures).
+				Dur("window", config.RateLimitWindow).
+				Dur("block_duration", config.RateLimitBlockDuration).
+				Msg("Authentication rate limiting enabled")
 		}
 	}
 
@@ -214,6 +252,16 @@ func (s *Server) Shutdown() error {
 		s.portAllocator.CloseAll()
 	}
 
+	// Close rate limiter.
+	if s.rateLimiter != nil {
+		s.rateLimiter.Close()
+	}
+
+	// Close authenticator (and its store).
+	if s.authenticator != nil {
+		_ = s.authenticator.Close()
+	}
+
 	// Close all clients.
 	s.clientLock.Lock()
 	for _, client := range s.clients {
@@ -249,6 +297,16 @@ func (s *Server) handleClient(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr().String()
 	log.Info().Str("remote", remoteAddr).Msg("New client connection")
 
+	// Extract IP for rate limiting (strip port).
+	clientIP := extractIP(remoteAddr)
+
+	// Check rate limit before proceeding.
+	if s.rateLimiter != nil && s.rateLimiter.IsBlocked(clientIP) {
+		log.Warn().Str("ip", clientIP).Msg("Connection rejected: IP is blocked due to auth failures")
+		_ = conn.Close()
+		return
+	}
+
 	// Create multiplexer.
 	mux, err := tunnel.Server(conn, s.config.MuxConfig)
 	if err != nil {
@@ -269,9 +327,24 @@ func (s *Server) handleClient(conn net.Conn) {
 		claims, authSubdomain, authErr := s.authenticateClient(mux, sessionID)
 		if authErr != nil {
 			log.Warn().Err(authErr).Str("remote", remoteAddr).Msg("Authentication failed")
+
+			// Record auth failure for rate limiting.
+			if s.rateLimiter != nil {
+				blocked := s.rateLimiter.RecordFailure(clientIP)
+				if blocked {
+					log.Warn().Str("ip", clientIP).Msg("IP blocked due to repeated auth failures")
+				}
+			}
+
 			_ = mux.Close()
 			return
 		}
+
+		// Auth successful — clear any failure history.
+		if s.rateLimiter != nil {
+			s.rateLimiter.RecordSuccess(clientIP)
+		}
+
 		teamName = claims.TeamName
 		role = claims.Role
 		subdomain = authSubdomain
@@ -554,19 +627,57 @@ func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, re
 	client.mu.Lock()
 	client.P2PPublicAddr = req.PublicAddr
 	client.P2PNATType = req.NATType
+	client.P2PLocalAddr = req.LocalAddr
 	client.mu.Unlock()
 
 	log.Info().
 		Str("client", client.ID).
 		Str("nat_type", req.NATType).
 		Str("public_addr", req.PublicAddr).
+		Str("local_addr", req.LocalAddr).
 		Msg("P2P offer received")
 
-	// For now, we store the P2P info for future peer matching.
-	// In a multi-client scenario, we would look up the peer and relay the offer.
-	// Current single-client-exposes-service model doesn't have a direct peer to
-	// match, so we respond with success=false and the client stays in relay mode.
-	resp := proto.NewP2POfferResponse(false, "no peer available for P2P", "", "")
+	// Try to find a peer that can establish P2P connection.
+	peer := s.FindPeerForP2P(client.ID)
+	if peer == nil {
+		resp := proto.NewP2POfferResponse(false, "no peer available for P2P", "", "")
+		data, err := resp.Encode()
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to encode P2P offer response")
+			return
+		}
+		if _, err := stream.Write(data); err != nil {
+			log.Error().Err(err).Msg("Failed to write P2P offer response")
+		}
+		return
+	}
+
+	// Check if both NAT types are traversable.
+	if !s.isP2PCompatible(req.NATType, peer.P2PNATType) {
+		log.Info().
+			Str("client_nat", req.NATType).
+			Str("peer_nat", peer.P2PNATType).
+			Msg("NAT types not compatible for P2P")
+		resp := proto.NewP2POfferResponse(false, "NAT types not compatible", "", "")
+		data, _ := resp.Encode()
+		_, _ = stream.Write(data)
+		return
+	}
+
+	// Found a compatible peer! Return peer info to initiator.
+	peer.mu.Lock()
+	peerAddr := peer.P2PPublicAddr
+	peerNATType := peer.P2PNATType
+	peer.mu.Unlock()
+
+	log.Info().
+		Str("client", client.ID).
+		Str("peer", peer.ID).
+		Str("peer_addr", peerAddr).
+		Msg("P2P peer matched")
+
+	// Send peer info to initiating client.
+	resp := proto.NewP2POfferResponse(true, "", peerAddr, peerNATType)
 	data, err := resp.Encode()
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to encode P2P offer response")
@@ -574,7 +685,61 @@ func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, re
 	}
 	if _, err := stream.Write(data); err != nil {
 		log.Error().Err(err).Msg("Failed to write P2P offer response")
+		return
 	}
+
+	// Notify the peer about the incoming P2P request (via a new stream).
+	go s.notifyPeerOfP2P(peer, client)
+}
+
+// isP2PCompatible checks if two NAT types can establish a P2P connection.
+func (s *Server) isP2PCompatible(natType1, natType2 string) bool {
+	// Symmetric NAT on both sides is generally not traversable.
+	symmetric := "Symmetric"
+	if natType1 == symmetric && natType2 == symmetric {
+		return false
+	}
+	// At least one side should be traversable (non-symmetric).
+	return true
+}
+
+// notifyPeerOfP2P sends a P2P offer notification to the peer client.
+func (s *Server) notifyPeerOfP2P(peer *ClientSession, initiator *ClientSession) {
+	initiator.mu.Lock()
+	initiatorAddr := initiator.P2PPublicAddr
+	initiatorNATType := initiator.P2PNATType
+	initiator.mu.Unlock()
+
+	// Open a stream to the peer to notify them.
+	stream, err := peer.Mux.OpenStreamContext(context.Background())
+	if err != nil {
+		log.Error().Err(err).Str("peer", peer.ID).Msg("Failed to open stream to notify peer of P2P")
+		return
+	}
+	defer stream.Close()
+
+	// Send P2P offer response (as a notification) with the initiator's info.
+	msg := proto.NewP2POfferResponse(true, "", initiatorAddr, initiatorNATType)
+	data, err := msg.Encode()
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to encode P2P notification")
+		return
+	}
+
+	if err := stream.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		log.Error().Err(err).Msg("Failed to set P2P notification deadline")
+		return
+	}
+
+	if _, err := stream.Write(data); err != nil {
+		log.Error().Err(err).Str("peer", peer.ID).Msg("Failed to write P2P notification")
+		return
+	}
+
+	log.Debug().
+		Str("peer", peer.ID).
+		Str("initiator_addr", initiatorAddr).
+		Msg("P2P notification sent to peer")
 }
 
 // handleP2PResult handles a P2P result notification from a client.
@@ -780,4 +945,15 @@ func generateSubdomain() string {
 	b := make([]byte, 4)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// extractIP extracts the IP address from a remote address string.
+// It handles both IPv4 (host:port) and IPv6 ([host]:port) formats.
+func extractIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		// Couldn't parse, return as-is (might be IP without port).
+		return remoteAddr
+	}
+	return host
 }

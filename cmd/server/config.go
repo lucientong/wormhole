@@ -3,7 +3,17 @@ package main
 import (
 	"time"
 
-	"github.com/wormhole-tunnel/wormhole/pkg/tunnel"
+	"github.com/lucientong/wormhole/pkg/tunnel"
+)
+
+// PersistenceType represents the storage backend type.
+type PersistenceType string
+
+const (
+	// PersistenceMemory uses in-memory storage (no persistence).
+	PersistenceMemory PersistenceType = "memory"
+	// PersistenceSQLite uses SQLite for persistent storage.
+	PersistenceSQLite PersistenceType = "sqlite"
 )
 
 // Config holds the server configuration.
@@ -70,24 +80,50 @@ type Config struct {
 	// AdminToken is the token required to access the admin API.
 	// If empty, the admin API requires no authentication.
 	AdminToken string
+
+	// RateLimitEnabled enables authentication failure rate limiting.
+	RateLimitEnabled bool
+
+	// RateLimitMaxFailures is the max failures before blocking an IP.
+	RateLimitMaxFailures int
+
+	// RateLimitWindow is the time window for counting failures.
+	RateLimitWindow time.Duration
+
+	// RateLimitBlockDuration is how long to block after exceeding failures.
+	RateLimitBlockDuration time.Duration
+
+	// Persistence configures the storage backend for auth data.
+	// Options: "memory" (default), "sqlite"
+	Persistence PersistenceType
+
+	// PersistencePath is the path to the SQLite database file.
+	// Only used when Persistence is "sqlite".
+	// If empty, defaults to ~/.wormhole/wormhole.db
+	PersistencePath string
 }
 
 // DefaultConfig returns the default server configuration.
 func DefaultConfig() Config {
 	return Config{
-		ListenAddr:        ":7000",
-		HTTPAddr:          ":80",
-		AdminAddr:         ":7001",
-		Domain:            "localhost",
-		TLSEnabled:        false,
-		TCPPortRangeStart: 10000,
-		TCPPortRangeEnd:   20000,
-		MuxConfig:         tunnel.DefaultMuxConfig(),
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       5 * time.Minute,
-		MaxClients:        1000,
-		RequireAuth:       false,
-		AuthTimeout:       10 * time.Second,
+		ListenAddr:             ":7000",
+		HTTPAddr:               ":80",
+		AdminAddr:              ":7001",
+		Domain:                 "localhost",
+		TLSEnabled:             false,
+		TCPPortRangeStart:      10000,
+		TCPPortRangeEnd:        20000,
+		MuxConfig:              tunnel.DefaultMuxConfig(),
+		ReadTimeout:            30 * time.Second,
+		WriteTimeout:           30 * time.Second,
+		IdleTimeout:            5 * time.Minute,
+		MaxClients:             1000,
+		RequireAuth:            false,
+		AuthTimeout:            10 * time.Second,
+		RateLimitEnabled:       true,
+		RateLimitMaxFailures:   5,
+		RateLimitWindow:        5 * time.Minute,
+		RateLimitBlockDuration: 15 * time.Minute,
+		Persistence:            PersistenceMemory,
 	}
 }

@@ -162,6 +162,8 @@ wormhole server \
 | `--auth-tokens` | 预共享 Token 列表（逗号分隔） | 无 |
 | `--auth-secret` | HMAC 签名密钥（至少 16 字符） | 无 |
 | `--admin-token` | 管理 API 访问 Token | 无 |
+| `--persistence` | 存储后端：memory（默认）或 sqlite | memory |
+| `--persistence-path` | SQLite 数据库路径 | ~/.wormhole/wormhole.db |
 
 ## API
 
@@ -193,6 +195,24 @@ wormhole server --require-auth --auth-secret "my-secret-at-least-16-chars"
 # 保护管理 API
 wormhole server --admin-token my-admin-secret
 ```
+
+### 持久化存储
+
+默认情况下，Wormhole 使用内存存储，服务重启后数据会丢失。如果需要持久化团队和 Token 吊销数据，可以启用 SQLite 存储：
+
+```bash
+# 使用 SQLite 持久化（默认路径：~/.wormhole/wormhole.db）
+wormhole server --require-auth --auth-secret "my-secret" --persistence sqlite
+
+# 指定自定义数据库路径
+wormhole server --require-auth --auth-secret "my-secret" \
+  --persistence sqlite \
+  --persistence-path /var/lib/wormhole/data.db
+```
+
+持久化存储会保存：
+- 团队信息
+- 已吊销的 Token 黑名单
 
 ### 检查器 API（客户端）
 
@@ -260,7 +280,7 @@ wormhole/
 - [x] Phase 2：HTTP 路由 + TLS + 管理 API
 - [x] Phase 3：流量检查器 UI
 - [x] Phase 4：P2P 直连 — 基础原语（STUN、打洞、端口预测、信令）
-- [ ] Phase 4.5：P2P 端到端集成（peer 匹配、数据传输、Relay→P2P 切换）
+- [x] Phase 4.5：P2P 端到端集成（peer 匹配、数据传输、Relay→P2P 切换）
 - [x] Phase 5：团队协作（认证、HMAC Token、角色权限、Admin API 保护）
 
 ## 贡献

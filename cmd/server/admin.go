@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lucientong/wormhole/pkg/auth"
 	"github.com/rs/zerolog/log"
 )
 
@@ -29,6 +30,13 @@ func (a *AdminAPI) Handler() http.Handler {
 	mux.HandleFunc("/stats", a.requireAdminAuth(a.handleStats))
 	mux.HandleFunc("/clients", a.requireAdminAuth(a.handleClients))
 	mux.HandleFunc("/tunnels", a.requireAdminAuth(a.handleTunnels))
+	mux.HandleFunc("/ratelimit", a.requireAdminAuth(a.handleRateLimit))
+	mux.HandleFunc("/ratelimit/unblock", a.requireAdminAuth(a.handleUnblockIP))
+	mux.HandleFunc("/teams", a.requireAdminAuth(a.handleTeams))
+	mux.HandleFunc("/teams/", a.requireAdminAuth(a.handleTeamByName))
+	mux.HandleFunc("/tokens/generate", a.requireAdminAuth(a.handleGenerateToken))
+	mux.HandleFunc("/tokens/revoke", a.requireAdminAuth(a.handleRevokeToken))
+	mux.HandleFunc("/tokens/refresh", a.requireAdminAuth(a.handleRefreshToken))
 
 	return mux
 }
@@ -230,4 +238,381 @@ func (a *AdminAPI) requireAdminAuth(next http.HandlerFunc) http.HandlerFunc {
 
 		next(w, r)
 	}
+}
+
+// RateLimitResponse is the response for the rate limit status endpoint.
+type RateLimitResponse struct {
+	Enabled    bool     `json:"enabled"`
+	TrackedIPs int      `json:"tracked_ips"`
+	BlockedIPs []string `json:"blocked_ips"`
+}
+
+// handleRateLimit returns the current rate limit status.
+func (a *AdminAPI) handleRateLimit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		return
+	}
+
+	rl := a.server.rateLimiter
+	if rl == nil {
+		writeJSON(w, http.StatusOK, RateLimitResponse{
+			Enabled:    false,
+			TrackedIPs: 0,
+			BlockedIPs: []string{},
+		})
+		return
+	}
+
+	stats := rl.Stats()
+	blocked := rl.GetBlockedIPs()
+	if blocked == nil {
+		blocked = []string{}
+	}
+
+	writeJSON(w, http.StatusOK, RateLimitResponse{
+		Enabled:    true,
+		TrackedIPs: stats.TrackedIPs,
+		BlockedIPs: blocked,
+	})
+}
+
+// UnblockRequest is the request body for unblocking an IP.
+type UnblockRequest struct {
+	IP string `json:"ip"`
+}
+
+// handleUnblockIP unblocks a specific IP address.
+func (a *AdminAPI) handleUnblockIP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		return
+	}
+
+	rl := a.server.rateLimiter
+	if rl == nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "rate limiting is not enabled"})
+		return
+	}
+
+	var req UnblockRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+		return
+	}
+
+	if req.IP == "" {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "ip is required"})
+		return
+	}
+
+	rl.Unblock(req.IP)
+
+	log.Info().Str("ip", req.IP).Msg("IP unblocked via admin API")
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"message": "IP unblocked successfully",
+		"ip":      req.IP,
+	})
+}
+
+// TeamResponse is the response for team endpoints.
+type TeamResponse struct {
+	Name      string `json:"name"`
+	CreatedAt string `json:"created_at"`
+	Tokens    int    `json:"tokens"`
+}
+
+// CreateTeamRequest is the request body for creating a team.
+type CreateTeamRequest struct {
+	Name string `json:"name"`
+}
+
+// handleTeams handles GET /teams (list) and POST /teams (create).
+func (a *AdminAPI) handleTeams(w http.ResponseWriter, r *http.Request) {
+	if a.server.authenticator == nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "authentication is not enabled"})
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		teams := a.server.authenticator.ListTeams()
+		response := make([]TeamResponse, 0, len(teams))
+		for _, t := range teams {
+			response = append(response, TeamResponse{
+				Name:      t.Name,
+				CreatedAt: t.CreatedAt.Format(time.RFC3339),
+				Tokens:    t.Tokens,
+			})
+		}
+		writeJSON(w, http.StatusOK, response)
+
+	case http.MethodPost:
+		var req CreateTeamRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+			return
+		}
+		if req.Name == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "name is required"})
+			return
+		}
+
+		if err := a.server.authenticator.RegisterTeam(req.Name); err != nil {
+			writeJSON(w, http.StatusConflict, ErrorResponse{Error: err.Error()})
+			return
+		}
+
+		log.Info().Str("team", req.Name).Msg("Team created via admin API")
+
+		writeJSON(w, http.StatusCreated, map[string]string{
+			"message": "team created successfully",
+			"name":    req.Name,
+		})
+
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+	}
+}
+
+// handleTeamByName handles GET /teams/{name}.
+func (a *AdminAPI) handleTeamByName(w http.ResponseWriter, r *http.Request) {
+	if a.server.authenticator == nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "authentication is not enabled"})
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		return
+	}
+
+	// Extract team name from path: /teams/{name}.
+	path := strings.TrimPrefix(r.URL.Path, "/teams/")
+	if path == "" {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "team name is required"})
+		return
+	}
+
+	team, err := a.server.authenticator.GetTeam(path)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, ErrorResponse{Error: err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, TeamResponse{
+		Name:      team.Name,
+		CreatedAt: team.CreatedAt.Format(time.RFC3339),
+		Tokens:    team.Tokens,
+	})
+}
+
+// GenerateTokenRequest is the request body for token generation.
+type GenerateTokenRequest struct {
+	Team string `json:"team"`
+	Role string `json:"role"`
+}
+
+// GenerateTokenResponse is the response for token generation.
+type GenerateTokenResponse struct {
+	Token   string `json:"token"`
+	Team    string `json:"team"`
+	Role    string `json:"role"`
+	Expires string `json:"expires,omitempty"`
+}
+
+// handleGenerateToken handles POST /tokens/generate.
+func (a *AdminAPI) handleGenerateToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		return
+	}
+
+	if a.server.authenticator == nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "authentication is not enabled"})
+		return
+	}
+
+	var req GenerateTokenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+		return
+	}
+
+	if req.Team == "" {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "team is required"})
+		return
+	}
+
+	// Default to member role.
+	role := auth.RoleMember
+	if req.Role != "" {
+		switch req.Role {
+		case "admin":
+			role = auth.RoleAdmin
+		case "member":
+			role = auth.RoleMember
+		case "viewer":
+			role = auth.RoleViewer
+		default:
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid role, must be: admin, member, or viewer"})
+			return
+		}
+	}
+
+	token, err := a.server.authenticator.GenerateTeamToken(req.Team, role)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+		return
+	}
+
+	// Validate to get expiry.
+	claims, _ := a.server.authenticator.ValidateToken(token)
+	expires := ""
+	if claims != nil && !claims.ExpiresAt.IsZero() {
+		expires = claims.ExpiresAt.Format(time.RFC3339)
+	}
+
+	log.Info().Str("team", req.Team).Str("role", req.Role).Msg("Token generated via admin API")
+
+	writeJSON(w, http.StatusOK, GenerateTokenResponse{
+		Token:   token,
+		Team:    req.Team,
+		Role:    req.Role,
+		Expires: expires,
+	})
+}
+
+// RevokeTokenRequest is the request body for token revocation.
+type RevokeTokenRequest struct {
+	Token   string `json:"token,omitempty"`
+	TokenID string `json:"token_id,omitempty"`
+}
+
+// handleRevokeToken handles POST /tokens/revoke.
+func (a *AdminAPI) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		return
+	}
+
+	if a.server.authenticator == nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "authentication is not enabled"})
+		return
+	}
+
+	var req RevokeTokenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+		return
+	}
+
+	if req.Token == "" && req.TokenID == "" {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "token or token_id is required"})
+		return
+	}
+
+	var tokenID string
+
+	if req.Token != "" {
+		// Revoke by token string.
+		if err := a.server.authenticator.RevokeTokenByString(req.Token); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+			return
+		}
+		// Extract token ID for logging.
+		claims, _ := a.server.authenticator.ValidateToken(req.Token)
+		if claims != nil {
+			tokenID = claims.TokenID
+		}
+	} else {
+		// Revoke by token ID.
+		if err := a.server.authenticator.RevokeToken(req.TokenID, time.Time{}); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+			return
+		}
+		tokenID = req.TokenID
+	}
+
+	log.Info().Str("token_id", tokenID).Msg("Token revoked via admin API")
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"message":  "token revoked successfully",
+		"token_id": tokenID,
+	})
+}
+
+// RefreshTokenRequest is the request body for token refresh.
+type RefreshTokenRequest struct {
+	Token      string `json:"token"`
+	RevokeOld  bool   `json:"revoke_old"`
+	ExtendBy   string `json:"extend_by,omitempty"`
+}
+
+// handleRefreshToken handles POST /tokens/refresh.
+func (a *AdminAPI) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		return
+	}
+
+	if a.server.authenticator == nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "authentication is not enabled"})
+		return
+	}
+
+	var req RefreshTokenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+		return
+	}
+
+	if req.Token == "" {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "token is required"})
+		return
+	}
+
+	var newToken string
+	var err error
+
+	if req.ExtendBy != "" {
+		// Extend token expiry.
+		duration, parseErr := time.ParseDuration(req.ExtendBy)
+		if parseErr != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid extend_by duration"})
+			return
+		}
+		newToken, err = a.server.authenticator.ExtendTokenExpiry(req.Token, duration)
+	} else if req.RevokeOld {
+		// Refresh and revoke old token.
+		newToken, err = a.server.authenticator.RefreshAndRevokeToken(req.Token)
+	} else {
+		// Simple refresh.
+		newToken, err = a.server.authenticator.RefreshToken(req.Token)
+	}
+
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+		return
+	}
+
+	// Validate new token to get claims.
+	claims, _ := a.server.authenticator.ValidateToken(newToken)
+	expires := ""
+	if claims != nil && !claims.ExpiresAt.IsZero() {
+		expires = claims.ExpiresAt.Format(time.RFC3339)
+	}
+
+	log.Info().
+		Str("team", claims.TeamName).
+		Bool("revoke_old", req.RevokeOld).
+		Msg("Token refreshed via admin API")
+
+	writeJSON(w, http.StatusOK, GenerateTokenResponse{
+		Token:   newToken,
+		Team:    claims.TeamName,
+		Role:    string(claims.Role),
+		Expires: expires,
+	})
 }

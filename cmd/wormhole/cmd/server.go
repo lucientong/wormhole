@@ -6,17 +6,19 @@ import (
 )
 
 var (
-	serverPort        int
-	serverHost        string
-	serverDomain      string
-	serverTLSEnabled  bool
-	serverTLSCert     string
-	serverTLSKey      string
-	serverAdminPort   int
-	serverRequireAuth bool
-	serverAuthTokens  []string
-	serverAuthSecret  string
-	serverAdminToken  string
+	serverPort           int
+	serverHost           string
+	serverDomain         string
+	serverTLSEnabled     bool
+	serverTLSCert        string
+	serverTLSKey         string
+	serverAdminPort      int
+	serverRequireAuth    bool
+	serverAuthTokens     []string
+	serverAuthSecret     string
+	serverAdminToken     string
+	serverPersistence    string
+	serverPersistencePath string
 )
 
 // serverCmd represents the server command.
@@ -49,7 +51,13 @@ Examples:
   wormhole server --require-auth --auth-secret my-secret-key-at-least-16
 
   # Start server with admin API protection
-  wormhole server --admin-token my-admin-secret`,
+  wormhole server --admin-token my-admin-secret
+
+  # Start server with SQLite persistence for auth data
+  wormhole server --require-auth --auth-secret my-secret --persistence sqlite
+
+  # Specify custom database path
+  wormhole server --require-auth --auth-secret my-secret --persistence sqlite --persistence-path /var/lib/wormhole/data.db`,
 	Run: runServer,
 }
 
@@ -65,6 +73,8 @@ func init() {
 	serverCmd.Flags().StringSliceVar(&serverAuthTokens, "auth-tokens", nil, "Comma-separated list of valid authentication tokens")
 	serverCmd.Flags().StringVar(&serverAuthSecret, "auth-secret", "", "HMAC secret for signed tokens (min 16 chars)")
 	serverCmd.Flags().StringVar(&serverAdminToken, "admin-token", "", "Token for admin API authentication")
+	serverCmd.Flags().StringVar(&serverPersistence, "persistence", "memory", "Storage backend: memory (default) or sqlite")
+	serverCmd.Flags().StringVar(&serverPersistencePath, "persistence-path", "", "Path to SQLite database (default: ~/.wormhole/wormhole.db)")
 }
 
 func runServer(_ *cobra.Command, _ []string) {
