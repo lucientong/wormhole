@@ -555,7 +555,7 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 		if allocErr != nil {
 			log.Error().Err(allocErr).Msg("Failed to allocate TCP port")
 		} else {
-			tcpPort = uint32(port)
+			tcpPort = uint32(port) // #nosec G115 -- port from allocator is always in valid range (1024-65535)
 			// Start TCP listener for this tunnel.
 			go s.serveTCPTunnel(ln, client)
 		}

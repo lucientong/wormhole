@@ -394,12 +394,12 @@ func (c *Client) acceptStreams(ctx context.Context) {
 			continue
 		}
 
-		go c.handleStream(stream) //nolint:contextcheck // stream handling runs as background goroutine
+		go c.handleStream(ctx, stream)
 	}
 }
 
 // handleStream handles an incoming stream from the server.
-func (c *Client) handleStream(stream *tunnel.Stream) {
+func (c *Client) handleStream(ctx context.Context, stream *tunnel.Stream) {
 	defer stream.Close()
 
 	// Read stream request
@@ -422,11 +422,11 @@ func (c *Client) handleStream(stream *tunnel.Stream) {
 		req := msg.StreamRequest
 		atomic.AddUint64(&c.stats.Requests, 1)
 		// Forward to local service.
-		c.forwardToLocal(stream, req)
+		c.forwardToLocal(ctx, stream, req)
 
 	case msg.P2POfferResponse != nil:
 		// Server is notifying us about a peer that wants to connect.
-		c.handleP2PNotification(context.Background(), msg.P2POfferResponse)
+		c.handleP2PNotification(ctx, msg.P2POfferResponse)
 
 	default:
 		log.Warn().Int("type", int(msg.Type)).Msg("Unexpected message type in stream")
@@ -434,34 +434,34 @@ func (c *Client) handleStream(stream *tunnel.Stream) {
 }
 
 // forwardToLocal forwards a stream to the local service.
-func (c *Client) forwardToLocal(stream *tunnel.Stream, req *proto.StreamRequest) {
+func (c *Client) forwardToLocal(ctx context.Context, stream *tunnel.Stream, req *proto.StreamRequest) {
 	// Use HTTP-aware forwarding when inspector is active and protocol is HTTP.
 	if req.Protocol == proto.ProtocolHTTP && c.inspector.IsEnabled() {
-		c.forwardHTTPWithInspect(stream, req)
+		c.forwardHTTPWithInspect(ctx, stream, req)
 		return
 	}
 
 	// Fallback: raw TCP bidirectional proxy.
-	c.forwardRawTCP(stream, req)
+	c.forwardRawTCP(ctx, stream, req)
 }
 
 // forwardRawTCP forwards a stream to the local service using raw TCP proxy.
-func (c *Client) forwardRawTCP(stream *tunnel.Stream, req *proto.StreamRequest) {
-	c.dialAndProxy(stream, stream, req)
+func (c *Client) forwardRawTCP(ctx context.Context, stream *tunnel.Stream, req *proto.StreamRequest) {
+	c.dialAndProxy(ctx, stream, stream, req)
 }
 
 // forwardRawTCPWithReader is like forwardRawTCP but uses a custom reader
 // for the stream->local direction (used when we've partially consumed the stream).
-func (c *Client) forwardRawTCPWithReader(reader io.Reader, stream *tunnel.Stream, sreq *proto.StreamRequest) {
-	c.dialAndProxy(reader, stream, sreq)
+func (c *Client) forwardRawTCPWithReader(ctx context.Context, reader io.Reader, stream *tunnel.Stream, sreq *proto.StreamRequest) {
+	c.dialAndProxy(ctx, reader, stream, sreq)
 }
 
 // dialAndProxy connects to the local service and proxies data bidirectionally
 // between the given reader/writer pair and the local connection.
-func (c *Client) dialAndProxy(inReader io.Reader, outWriter io.Writer, sreq *proto.StreamRequest) {
+func (c *Client) dialAndProxy(ctx context.Context, inReader io.Reader, outWriter io.Writer, sreq *proto.StreamRequest) {
 	localAddr := net.JoinHostPort(c.config.LocalHost, fmt.Sprintf("%d", c.config.LocalPort))
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	localConn, err := dialer.DialContext(context.Background(), "tcp", localAddr)
+	localConn, err := dialer.DialContext(ctx, "tcp", localAddr)
 	if err != nil {
 		log.Error().Err(err).Str("addr", localAddr).Msg("Connect to local failed")
 		resp := proto.NewStreamResponse(sreq.RequestID, false, "Local service unavailable")
@@ -499,7 +499,7 @@ func (c *Client) dialAndProxy(inReader io.Reader, outWriter io.Writer, sreq *pro
 // traffic inspection. It parses the raw HTTP request from the stream,
 // forwards it to the local service via http.Transport, captures the
 // request/response pair in the inspector, and writes the response back.
-func (c *Client) forwardHTTPWithInspect(stream *tunnel.Stream, sreq *proto.StreamRequest) {
+func (c *Client) forwardHTTPWithInspect(ctx context.Context, stream *tunnel.Stream, sreq *proto.StreamRequest) {
 	localAddr := net.JoinHostPort(c.config.LocalHost, fmt.Sprintf("%d", c.config.LocalPort))
 
 	start := time.Now()
@@ -516,9 +516,9 @@ func (c *Client) forwardHTTPWithInspect(stream *tunnel.Stream, sreq *proto.Strea
 		if buffered > 0 {
 			peeked, _ := br.Peek(buffered)
 			combined := io.MultiReader(bytes.NewReader(peeked), stream)
-			c.forwardRawTCPWithReader(combined, stream, sreq)
+			c.forwardRawTCPWithReader(ctx, combined, stream, sreq)
 		} else {
-			c.forwardRawTCP(stream, sreq)
+			c.forwardRawTCP(ctx, stream, sreq)
 		}
 		return
 	}
@@ -545,7 +545,7 @@ func (c *Client) forwardHTTPWithInspect(stream *tunnel.Stream, sreq *proto.Strea
 		DialContext: (&net.Dialer{
 			Timeout: 5 * time.Second,
 		}).DialContext,
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // local service may use self-signed certs
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true}, // #nosec G402 -- local service may use self-signed certs
 		MaxIdleConnsPerHost:   10,
 		ResponseHeaderTimeout: 60 * time.Second,
 	}
@@ -999,7 +999,7 @@ func (c *Client) forwardP2PDataToLocal(data []byte) {
 		return
 	}
 
-	atomic.AddUint64(&c.stats.BytesIn, uint64(n))
+	atomic.AddUint64(&c.stats.BytesIn, uint64(n)) // #nosec G115 -- n from Write is always non-negative
 
 	// Read response from local and send back via P2P.
 	respBuf := make([]byte, 64*1024)

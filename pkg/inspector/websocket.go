@@ -175,7 +175,7 @@ func (h *WSHub) Close() {
 func (c *WSClient) readPump() {
 	defer func() {
 		c.hub.removeClient(c)
-		c.conn.Close()
+		_ = c.conn.Close()
 		close(c.done)
 	}()
 
@@ -204,7 +204,7 @@ func (c *WSClient) writePump() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer func() {
 		ticker.Stop()
-		c.conn.Close()
+		_ = c.conn.Close()
 	}()
 
 	for {

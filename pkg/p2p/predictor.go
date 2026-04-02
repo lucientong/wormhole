@@ -101,7 +101,7 @@ func (p *Predictor) spreadPorts(center, count int) []int {
 	// Limit iterations to avoid infinite loop when near port boundaries.
 	maxIterations := count * 20
 	for i := 0; len(candidates) < count && i < maxIterations; i++ {
-		offset := rand.IntN(256) - 128 //nolint:gosec // non-security random for port prediction
+		offset := rand.IntN(256) - 128 // #nosec G404 -- non-security random for port prediction
 		port := center + offset
 		if port > 1024 && port < 65536 && !seen[port] {
 			candidates = append(candidates, port)

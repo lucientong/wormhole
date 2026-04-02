@@ -57,7 +57,7 @@ func NewSQLiteStore(config SQLiteStoreConfig) (*SQLiteStore, error) {
 
 	// Initialize schema.
 	if err := store.initSchema(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 

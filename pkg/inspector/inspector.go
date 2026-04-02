@@ -188,7 +188,7 @@ func (i *Inspector) Wrap(next http.Handler) http.Handler {
 		var reqBody []byte
 		if r.Body != nil {
 			reqBody, _ = io.ReadAll(io.LimitReader(r.Body, i.config.MaxBodySize+1))
-			r.Body.Close()
+			_ = r.Body.Close()
 			r.Body = io.NopCloser(bytes.NewReader(reqBody))
 		}
 

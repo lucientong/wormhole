@@ -101,7 +101,7 @@ func (h *HTTPHandler) forwardHTTP(client *ClientSession, w http.ResponseWriter, 
 	written, _ := io.Copy(w, resp.Body)
 
 	// Update stats.
-	atomic.AddUint64(&client.BytesOut, uint64(written))
+	atomic.AddUint64(&client.BytesOut, uint64(written)) // #nosec G115 -- written from io.Copy is always non-negative
 
 	return nil
 }
