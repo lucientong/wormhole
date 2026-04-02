@@ -24,9 +24,9 @@ ARG BUILD_TIME=unknown
 # Build the binary
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -ldflags "-s -w \
-        -X github.com/wormhole-tunnel/wormhole/pkg/version.Version=${VERSION} \
-        -X github.com/wormhole-tunnel/wormhole/pkg/version.Commit=${COMMIT} \
-        -X github.com/wormhole-tunnel/wormhole/pkg/version.BuildTime=${BUILD_TIME}" \
+        -X github.com/lucientong/wormhole/pkg/version.Version=${VERSION} \
+        -X github.com/lucientong/wormhole/pkg/version.Commit=${COMMIT} \
+        -X github.com/lucientong/wormhole/pkg/version.BuildTime=${BUILD_TIME}" \
     -o /wormhole ./cmd/wormhole
 
 # Runtime stage

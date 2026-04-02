@@ -1,6 +1,6 @@
 [Unit]
 Description=Wormhole Tunnel Server
-Documentation=https://github.com/wormhole-tunnel/wormhole
+Documentation=https://github.com/lucientong/wormhole
 After=network-online.target
 Wants=network-online.target
 

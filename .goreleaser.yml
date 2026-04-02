@@ -26,9 +26,9 @@ builds:
         goarch: arm64
     ldflags:
       - -s -w
-      - -X github.com/wormhole-tunnel/wormhole/pkg/version.Version={{.Version}}
-      - -X github.com/wormhole-tunnel/wormhole/pkg/version.Commit={{.ShortCommit}}
-      - -X github.com/wormhole-tunnel/wormhole/pkg/version.BuildTime={{.Date}}
+      - -X github.com/lucientong/wormhole/pkg/version.Version={{.Version}}
+      - -X github.com/lucientong/wormhole/pkg/version.Commit={{.ShortCommit}}
+      - -X github.com/lucientong/wormhole/pkg/version.BuildTime={{.Date}}
 
 archives:
   - id: default
@@ -97,7 +97,7 @@ brews:
     folder: Formula
     homepage: https://github.com/lucientong/wormhole
     description: Zero-config tunnel tool to expose local services to the internet
-    license: MIT
+    license: Apache-2.0
     install: |
       bin.install "wormhole"
     test: |
@@ -109,7 +109,7 @@ nfpms:
     vendor: Wormhole
     homepage: https://github.com/lucientong/wormhole
     description: Zero-config tunnel tool to expose local services to the internet
-    license: MIT
+    license: Apache-2.0
     formats:
       - deb
       - rpm

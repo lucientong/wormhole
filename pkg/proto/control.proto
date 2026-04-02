@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package wormhole;
 
-option go_package = "github.com/wormhole-tunnel/wormhole/pkg/proto";
+option go_package = "github.com/lucientong/wormhole/pkg/proto";
 
 // AuthRequest is sent by client to authenticate with the server.
 message AuthRequest {

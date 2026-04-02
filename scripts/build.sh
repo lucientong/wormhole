@@ -12,9 +12,9 @@ VERSION=${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo "d
 COMMIT=${COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")}
 BUILD_TIME=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
-LDFLAGS="-X github.com/wormhole-tunnel/wormhole/pkg/version.Version=$VERSION"
-LDFLAGS="$LDFLAGS -X github.com/wormhole-tunnel/wormhole/pkg/version.Commit=$COMMIT"
-LDFLAGS="$LDFLAGS -X github.com/wormhole-tunnel/wormhole/pkg/version.BuildTime=$BUILD_TIME"
+LDFLAGS="-X github.com/lucientong/wormhole/pkg/version.Version=$VERSION"
+LDFLAGS="$LDFLAGS -X github.com/lucientong/wormhole/pkg/version.Commit=$COMMIT"
+LDFLAGS="$LDFLAGS -X github.com/lucientong/wormhole/pkg/version.BuildTime=$BUILD_TIME"
 
 # Colors
 GREEN='\033[0;32m'
