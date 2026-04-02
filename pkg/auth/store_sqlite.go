@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"database/sql"
 	"os"
 	"path/filepath"
@@ -82,13 +83,15 @@ func (s *SQLiteStore) initSchema() error {
 		ON revoked_tokens(expires_at);
 	`
 
-	_, err := s.db.Exec(schema)
+	ctx := context.Background()
+	_, err := s.db.ExecContext(ctx, schema)
 	return err
 }
 
 // SaveTeam saves a team to SQLite.
 func (s *SQLiteStore) SaveTeam(team *TeamInfo) error {
-	_, err := s.db.Exec(`
+	ctx := context.Background()
+	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO teams (name, created_at, tokens) 
 		VALUES (?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET tokens = excluded.tokens
@@ -101,7 +104,8 @@ func (s *SQLiteStore) GetTeam(name string) (*TeamInfo, error) {
 	var team TeamInfo
 	var createdAt int64
 
-	err := s.db.QueryRow(`
+	ctx := context.Background()
+	err := s.db.QueryRowContext(ctx, `
 		SELECT name, created_at, tokens FROM teams WHERE name = ?
 	`, name).Scan(&team.Name, &createdAt, &team.Tokens)
 
@@ -118,7 +122,8 @@ func (s *SQLiteStore) GetTeam(name string) (*TeamInfo, error) {
 
 // ListTeams returns all teams from SQLite.
 func (s *SQLiteStore) ListTeams() ([]TeamInfo, error) {
-	rows, err := s.db.Query(`SELECT name, created_at, tokens FROM teams`)
+	ctx := context.Background()
+	rows, err := s.db.QueryContext(ctx, `SELECT name, created_at, tokens FROM teams`)
 	if err != nil {
 		return nil, err
 	}
@@ -140,7 +145,8 @@ func (s *SQLiteStore) ListTeams() ([]TeamInfo, error) {
 
 // DeleteTeam removes a team from SQLite.
 func (s *SQLiteStore) DeleteTeam(name string) error {
-	_, err := s.db.Exec(`DELETE FROM teams WHERE name = ?`, name)
+	ctx := context.Background()
+	_, err := s.db.ExecContext(ctx, `DELETE FROM teams WHERE name = ?`, name)
 	return err
 }
 
@@ -151,7 +157,8 @@ func (s *SQLiteStore) SaveRevokedToken(tokenID string, expiresAt time.Time) erro
 		expiresAtUnix = expiresAt.Unix()
 	}
 
-	_, err := s.db.Exec(`
+	ctx := context.Background()
+	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO revoked_tokens (token_id, expires_at)
 		VALUES (?, ?)
 		ON CONFLICT(token_id) DO UPDATE SET expires_at = excluded.expires_at
@@ -162,7 +169,8 @@ func (s *SQLiteStore) SaveRevokedToken(tokenID string, expiresAt time.Time) erro
 // IsTokenRevoked checks if a token is revoked.
 func (s *SQLiteStore) IsTokenRevoked(tokenID string) (bool, error) {
 	var count int
-	err := s.db.QueryRow(`
+	ctx := context.Background()
+	err := s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM revoked_tokens WHERE token_id = ?
 	`, tokenID).Scan(&count)
 
@@ -174,7 +182,8 @@ func (s *SQLiteStore) IsTokenRevoked(tokenID string) (bool, error) {
 
 // RemoveRevokedToken removes a token from the revocation list.
 func (s *SQLiteStore) RemoveRevokedToken(tokenID string) error {
-	_, err := s.db.Exec(`DELETE FROM revoked_tokens WHERE token_id = ?`, tokenID)
+	ctx := context.Background()
+	_, err := s.db.ExecContext(ctx, `DELETE FROM revoked_tokens WHERE token_id = ?`, tokenID)
 	return err
 }
 
@@ -182,7 +191,8 @@ func (s *SQLiteStore) RemoveRevokedToken(tokenID string) error {
 func (s *SQLiteStore) CleanupExpiredRevocations() (int, error) {
 	now := time.Now().Unix()
 
-	result, err := s.db.Exec(`
+	ctx := context.Background()
+	result, err := s.db.ExecContext(ctx, `
 		DELETE FROM revoked_tokens 
 		WHERE expires_at > 0 AND expires_at < ?
 	`, now)
@@ -198,7 +208,8 @@ func (s *SQLiteStore) CleanupExpiredRevocations() (int, error) {
 // CountRevokedTokens returns the number of revoked tokens.
 func (s *SQLiteStore) CountRevokedTokens() (int, error) {
 	var count int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM revoked_tokens`).Scan(&count)
+	ctx := context.Background()
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM revoked_tokens`).Scan(&count)
 	return count, err
 }
 

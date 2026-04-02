@@ -202,18 +202,18 @@ func (a *Auth) GenerateTeamToken(teamName string, role Role) (string, error) {
 	// Track team.
 	a.mu.Lock()
 	info, err := a.store.GetTeam(teamName)
-	switch err {
-	case ErrTeamNotFound:
+	switch {
+	case errors.Is(err, ErrTeamNotFound):
 		info = &TeamInfo{
 			Name:      teamName,
 			CreatedAt: now,
 			Tokens:    1,
 		}
-	case nil:
+	case err == nil:
 		info.Tokens++
 	default:
 	}
-	if err == nil || err == ErrTeamNotFound {
+	if err == nil || errors.Is(err, ErrTeamNotFound) {
 		_ = a.store.SaveTeam(info)
 	}
 	a.mu.Unlock()
@@ -229,23 +229,35 @@ func (a *Auth) ValidateToken(token string) (*Claims, error) {
 	}
 
 	// Try simple pre-shared token mode first.
-	if len(a.config.AllowedTokens) > 0 {
-		for _, allowed := range a.config.AllowedTokens {
-			if hmac.Equal([]byte(token), []byte(allowed)) {
-				return &Claims{
-					TeamName: "default",
-					Role:     RoleMember,
-					IssuedAt: time.Now(),
-				}, nil
-			}
-		}
-		// If only simple mode is configured, reject unmatched tokens.
-		if len(a.config.Secret) < 16 {
-			return nil, ErrInvalidToken
-		}
+	if claims := a.checkPreSharedToken(token); claims != nil {
+		return claims, nil
+	}
+
+	// If only simple mode is configured (no HMAC secret), reject unmatched tokens.
+	if len(a.config.AllowedTokens) > 0 && len(a.config.Secret) < 16 {
+		return nil, ErrInvalidToken
 	}
 
 	// HMAC-signed token validation.
+	return a.validateHMACToken(token)
+}
+
+// checkPreSharedToken checks if the token matches any pre-shared allowed token.
+func (a *Auth) checkPreSharedToken(token string) *Claims {
+	for _, allowed := range a.config.AllowedTokens {
+		if hmac.Equal([]byte(token), []byte(allowed)) {
+			return &Claims{
+				TeamName: "default",
+				Role:     RoleMember,
+				IssuedAt: time.Now(),
+			}
+		}
+	}
+	return nil
+}
+
+// validateHMACToken validates an HMAC-signed token.
+func (a *Auth) validateHMACToken(token string) (*Claims, error) {
 	parts := strings.SplitN(token, ".", 2)
 	if len(parts) != 2 {
 		return nil, ErrInvalidToken
@@ -253,45 +265,55 @@ func (a *Auth) ValidateToken(token string) (*Claims, error) {
 
 	payloadB64, sigB64 := parts[0], parts[1]
 
-	// Decode payload.
+	// Decode and verify signature.
 	payloadJSON, err := base64.RawURLEncoding.DecodeString(payloadB64)
 	if err != nil {
 		return nil, ErrInvalidToken
 	}
 
-	// Decode signature.
 	sig, err := base64.RawURLEncoding.DecodeString(sigB64)
 	if err != nil {
 		return nil, ErrInvalidToken
 	}
 
-	// Verify HMAC signature.
 	expectedSig := computeHMAC(a.config.Secret, payloadJSON)
 	if !hmac.Equal(sig, expectedSig) {
 		return nil, ErrInvalidToken
 	}
 
-	// Unmarshal payload.
+	// Unmarshal and validate payload.
 	var payload tokenPayload
 	if err := json.Unmarshal(payloadJSON, &payload); err != nil {
 		return nil, ErrInvalidToken
 	}
 
+	if err := a.validatePayload(&payload); err != nil {
+		return nil, err
+	}
+
+	return a.payloadToClaims(&payload), nil
+}
+
+// validatePayload checks expiration and revocation status.
+func (a *Auth) validatePayload(payload *tokenPayload) error {
 	// Check expiration.
-	if payload.ExpiresAt > 0 {
-		if time.Now().Unix() > payload.ExpiresAt {
-			return nil, ErrTokenExpired
-		}
+	if payload.ExpiresAt > 0 && time.Now().Unix() > payload.ExpiresAt {
+		return ErrTokenExpired
 	}
 
 	// Check if token is revoked.
 	if payload.TokenID != "" {
 		revoked, err := a.store.IsTokenRevoked(payload.TokenID)
 		if err == nil && revoked {
-			return nil, ErrTokenRevoked
+			return ErrTokenRevoked
 		}
 	}
 
+	return nil
+}
+
+// payloadToClaims converts a token payload to claims.
+func (a *Auth) payloadToClaims(payload *tokenPayload) *Claims {
 	claims := &Claims{
 		TokenID:  payload.TokenID,
 		TeamName: payload.TeamName,
@@ -301,8 +323,7 @@ func (a *Auth) ValidateToken(token string) (*Claims, error) {
 	if payload.ExpiresAt > 0 {
 		claims.ExpiresAt = time.Unix(payload.ExpiresAt, 0)
 	}
-
-	return claims, nil
+	return claims
 }
 
 // HasPermission checks if the claims grant the specified permission.
@@ -376,7 +397,7 @@ func (a *Auth) RevokeToken(tokenID string, expiresAt time.Time) error {
 // Returns ErrInvalidToken if the token cannot be parsed or has no ID.
 func (a *Auth) RevokeTokenByString(token string) error {
 	claims, err := a.ValidateToken(token)
-	if err != nil && err != ErrTokenRevoked {
+	if err != nil && !errors.Is(err, ErrTokenRevoked) {
 		// Allow revoking already-revoked tokens (idempotent).
 		return err
 	}

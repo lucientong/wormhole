@@ -12,9 +12,7 @@ import (
 func TestPersistentConfig_SaveAndLoad(t *testing.T) {
 	// Create a temporary home directory.
 	tmpHome := t.TempDir()
-	origHome := os.Getenv("HOME")
-	os.Setenv("HOME", tmpHome)
-	defer os.Setenv("HOME", origHome)
+	t.Setenv("HOME", tmpHome)
 
 	// Initially, config should be empty.
 	cfg, err := LoadPersistentConfig()
@@ -106,9 +104,7 @@ func TestApplyPersistentConfig_FlagsOverride(t *testing.T) {
 func TestClearToken(t *testing.T) {
 	// Create a temporary home directory.
 	tmpHome := t.TempDir()
-	origHome := os.Getenv("HOME")
-	os.Setenv("HOME", tmpHome)
-	defer os.Setenv("HOME", origHome)
+	t.Setenv("HOME", tmpHome)
 
 	// Save a config with token.
 	cfg := &PersistentConfig{
@@ -132,9 +128,7 @@ func TestClearToken(t *testing.T) {
 func TestLoadPersistentConfig_NonExistent(t *testing.T) {
 	// Create a temporary home directory with no config.
 	tmpHome := t.TempDir()
-	origHome := os.Getenv("HOME")
-	os.Setenv("HOME", tmpHome)
-	defer os.Setenv("HOME", origHome)
+	t.Setenv("HOME", tmpHome)
 
 	// Should return empty config, not error.
 	cfg, err := LoadPersistentConfig()
@@ -146,9 +140,7 @@ func TestLoadPersistentConfig_NonExistent(t *testing.T) {
 func TestUpdatePersistentConfig(t *testing.T) {
 	// Create a temporary home directory.
 	tmpHome := t.TempDir()
-	origHome := os.Getenv("HOME")
-	os.Setenv("HOME", tmpHome)
-	defer os.Setenv("HOME", origHome)
+	t.Setenv("HOME", tmpHome)
 
 	// Runtime config.
 	cfg := &Config{
@@ -177,9 +169,7 @@ func TestUpdatePersistentConfig(t *testing.T) {
 func TestUpdatePersistentConfig_NoTokenSave(t *testing.T) {
 	// Create a temporary home directory.
 	tmpHome := t.TempDir()
-	origHome := os.Getenv("HOME")
-	os.Setenv("HOME", tmpHome)
-	defer os.Setenv("HOME", origHome)
+	t.Setenv("HOME", tmpHome)
 
 	// Pre-existing config with token.
 	existing := &PersistentConfig{

@@ -91,8 +91,8 @@ func SavePersistentConfig(cfg *PersistentConfig) error {
 	}
 
 	// Create config directory if it doesn't exist.
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return err
+	if mkdirErr := os.MkdirAll(dir, 0700); mkdirErr != nil {
+		return mkdirErr
 	}
 
 	path, err := configPath()

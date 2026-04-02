@@ -13,9 +13,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/rs/zerolog/log"
 	"github.com/lucientong/wormhole/pkg/proto"
 	"github.com/lucientong/wormhole/pkg/tunnel"
+	"github.com/rs/zerolog/log"
 )
 
 // HTTPHandler handles incoming HTTP requests and routes them through tunnels.

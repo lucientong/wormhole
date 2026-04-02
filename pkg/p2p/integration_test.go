@@ -297,7 +297,7 @@ func TestP2PIntegration_ReconnectScenario(t *testing.T) {
 	_ = conn2.Close()
 
 	// Attempt to write after peer is gone - write to closed transport should error.
-	_, err = t1.Write([]byte("test"))
+	_, _ = t1.Write([]byte("test"))
 	// This may succeed (UDP is connectionless) or fail if transport detects closure.
 	// The key is that no panic occurs and behavior is predictable.
 

@@ -12,10 +12,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/rs/zerolog/log"
 	"github.com/lucientong/wormhole/pkg/auth"
 	"github.com/lucientong/wormhole/pkg/proto"
 	"github.com/lucientong/wormhole/pkg/tunnel"
+	"github.com/rs/zerolog/log"
 )
 
 // Server is the wormhole server.

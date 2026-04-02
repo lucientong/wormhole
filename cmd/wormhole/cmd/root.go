@@ -4,10 +4,10 @@ package cmd
 import (
 	"os"
 
+	"github.com/lucientong/wormhole/pkg/version"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
-	"github.com/lucientong/wormhole/pkg/version"
 )
 
 var (

@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -12,9 +11,7 @@ import (
 
 func TestSQLiteStore_TeamOperations(t *testing.T) {
 	// Create temp directory.
-	tmpDir, err := os.MkdirTemp("", "wormhole-test-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	dbPath := filepath.Join(tmpDir, "test.db")
 	store, err := NewSQLiteStore(SQLiteStoreConfig{
@@ -69,9 +66,7 @@ func TestSQLiteStore_TeamOperations(t *testing.T) {
 }
 
 func TestSQLiteStore_RevokedTokenOperations(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "wormhole-test-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	dbPath := filepath.Join(tmpDir, "test.db")
 	store, err := NewSQLiteStore(SQLiteStoreConfig{
@@ -116,9 +111,7 @@ func TestSQLiteStore_RevokedTokenOperations(t *testing.T) {
 }
 
 func TestSQLiteStore_CleanupExpiredRevocations(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "wormhole-test-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	dbPath := filepath.Join(tmpDir, "test.db")
 	store, err := NewSQLiteStore(SQLiteStoreConfig{
@@ -159,9 +152,7 @@ func TestSQLiteStore_CleanupExpiredRevocations(t *testing.T) {
 }
 
 func TestSQLiteStore_Persistence(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "wormhole-test-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	dbPath := filepath.Join(tmpDir, "test.db")
 
@@ -204,9 +195,7 @@ func TestSQLiteStore_Persistence(t *testing.T) {
 }
 
 func TestSQLiteStore_UpdateTeam(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "wormhole-test-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	dbPath := filepath.Join(tmpDir, "test.db")
 	store, err := NewSQLiteStore(SQLiteStoreConfig{

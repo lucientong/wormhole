@@ -6,18 +6,18 @@ import (
 )
 
 var (
-	serverPort           int
-	serverHost           string
-	serverDomain         string
-	serverTLSEnabled     bool
-	serverTLSCert        string
-	serverTLSKey         string
-	serverAdminPort      int
-	serverRequireAuth    bool
-	serverAuthTokens     []string
-	serverAuthSecret     string
-	serverAdminToken     string
-	serverPersistence    string
+	serverPort            int
+	serverHost            string
+	serverDomain          string
+	serverTLSEnabled      bool
+	serverTLSCert         string
+	serverTLSKey          string
+	serverAdminPort       int
+	serverRequireAuth     bool
+	serverAuthTokens      []string
+	serverAuthSecret      string
+	serverAdminToken      string
+	serverPersistence     string
 	serverPersistencePath string
 )
 

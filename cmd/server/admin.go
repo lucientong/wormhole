@@ -545,9 +545,9 @@ func (a *AdminAPI) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 
 // RefreshTokenRequest is the request body for token refresh.
 type RefreshTokenRequest struct {
-	Token      string `json:"token"`
-	RevokeOld  bool   `json:"revoke_old"`
-	ExtendBy   string `json:"extend_by,omitempty"`
+	Token     string `json:"token"`
+	RevokeOld bool   `json:"revoke_old"`
+	ExtendBy  string `json:"extend_by,omitempty"`
 }
 
 // handleRefreshToken handles POST /tokens/refresh.
@@ -576,7 +576,8 @@ func (a *AdminAPI) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 	var newToken string
 	var err error
 
-	if req.ExtendBy != "" {
+	switch {
+	case req.ExtendBy != "":
 		// Extend token expiry.
 		duration, parseErr := time.ParseDuration(req.ExtendBy)
 		if parseErr != nil {
@@ -584,10 +585,10 @@ func (a *AdminAPI) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		newToken, err = a.server.authenticator.ExtendTokenExpiry(req.Token, duration)
-	} else if req.RevokeOld {
+	case req.RevokeOld:
 		// Refresh and revoke old token.
 		newToken, err = a.server.authenticator.RefreshAndRevokeToken(req.Token)
-	} else {
+	default:
 		// Simple refresh.
 		newToken, err = a.server.authenticator.RefreshToken(req.Token)
 	}
