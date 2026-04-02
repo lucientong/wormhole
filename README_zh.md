@@ -68,7 +68,7 @@ wormhole client --local 8080 --p2p=false
 ```
 ┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
 │   外部用户       │   HTTP  │  Wormhole       │   隧道  │  你的本地        │
-│   (互联网)      │ ──────► │  Server (VPS)   │ ──────► │  服务 :8080     │
+│   (互联网)       │ ──────► │  Server (VPS)   │ ──────► │  服务 :8080     │
 └─────────────────┘         └─────────────────┘         └─────────────────┘
                                     │
                             ┌───────┴───────┐
@@ -273,6 +273,76 @@ wormhole/
 ├── deployments/      # Docker、systemd 配置
 └── scripts/          # 构建和安装脚本
 ```
+
+## 安全
+
+Wormhole 在设计时充分考虑了安全性，但作为一个将本地服务暴露到公网的隧道工具，正确的配置至关重要。
+
+### 安全特性
+
+| 特性 | 说明 |
+|------|------|
+| **TLS 加密** | 所有 HTTP 流量通过 TLS 1.2+ 加密，支持 Let's Encrypt 自动证书 |
+| **HMAC-SHA256 Token** | 签名的团队 Token，支持过期和吊销 |
+| **RBAC 权限控制** | 基于角色的访问控制（admin / member / viewer） |
+| **速率限制** | 认证失败后自动封锁 IP |
+| **Token 吊销** | 支持将已泄露的 Token 加入黑名单，配合持久化存储 |
+| **常量时间比较** | Admin Token 使用 `crypto/subtle` 比较，防止时序攻击 |
+| **请求限制** | MaxHeaderBytes 和请求体大小限制，缓解 DoS 攻击 |
+
+### 生产环境部署清单
+
+> ⚠️ **请勿在生产环境中使用默认配置。** 按照以下清单加固你的部署。
+
+```bash
+wormhole server \
+  --domain tunnel.example.com \
+  --tls \
+  --tls-email admin@example.com \
+  --require-auth \
+  --auth-secret "$(openssl rand -base64 32)" \
+  --admin-token "$(openssl rand -hex 16)" \
+  --persistence sqlite \
+  --persistence-path /var/lib/wormhole/wormhole.db
+```
+
+- [ ] **启用 TLS**（`--tls`）：不启用 TLS 时，所有流量（包括认证 Token）都是明文传输。生产环境必须启用 TLS。
+- [ ] **启用认证**（`--require-auth`）：不启用认证时，任何人都可以在你的服务器上创建隧道。
+- [ ] **设置强密钥**（`--auth-secret`）：使用至少 32 个随机字符。该密钥用于签名所有团队 Token。
+- [ ] **保护管理 API**（`--admin-token`）：不设置时，任何能访问管理端口的人都可以管理你的服务器。
+- [ ] **使用持久化存储**（`--persistence sqlite`）：确保 Token 吊销记录在服务器重启后不会丢失。
+- [ ] **限制管理端口访问**：将管理端口绑定到 localhost 或配合防火墙规则（如 `--admin-port 127.0.0.1:7001`）。
+
+### 安全注意事项
+
+#### P2P 模式
+
+P2P 直连在 NAT 打洞完成后使用**未加密的 UDP** 进行数据传输。虽然 P2P 可以降低延迟，但传输层没有加密。对于敏感数据：
+
+```bash
+# 禁用 P2P，强制所有流量走加密的中继通道
+wormhole client --local 8080 --p2p=false
+```
+
+#### 流量检查器
+
+流量检查器会捕获并展示 HTTP 请求/响应数据。在生产环境中：
+
+- **不要在面向公网的部署中启用检查器**
+- 检查器 API 默认绑定到 localhost，但要注意局域网内的访问风险
+
+#### 未配置 Token 的管理 API
+
+如果未配置 `--admin-token`，管理 API **完全开放**，无任何认证。这意味着任何能访问管理端口的人可以：
+- 查看所有已连接的客户端和隧道
+- 生成和吊销 Token
+- 管理团队
+
+生产环境请务必配置 `--admin-token`。
+
+#### 子域名随机性
+
+自动生成的子域名使用 64 位加密随机数（`crypto/rand`），产生 16 字符的十六进制字符串，使暴力猜测子域名在计算上不可行。
 
 ## 路线图
 

@@ -274,6 +274,76 @@ wormhole/
 └── scripts/          # Build and install scripts
 ```
 
+## Security
+
+Wormhole is designed with security in mind, but as a tunneling tool that exposes local services to the internet, proper configuration is essential.
+
+### Security Features
+
+| Feature | Description |
+|---------|-------------|
+| **TLS Encryption** | All HTTP traffic encrypted via TLS 1.2+ with Let's Encrypt auto-certificates |
+| **HMAC-SHA256 Tokens** | Signed team tokens with expiration and revocation support |
+| **RBAC** | Role-based access control (admin / member / viewer) |
+| **Rate Limiting** | Automatic IP blocking after repeated authentication failures |
+| **Token Revocation** | Blacklist compromised tokens with persistent storage |
+| **Constant-time Auth** | Admin token comparison uses `crypto/subtle` to prevent timing attacks |
+| **Request Limits** | MaxHeaderBytes and request body size limits to mitigate DoS |
+
+### Production Deployment Checklist
+
+> ⚠️ **Do not use default settings in production.** Follow this checklist to harden your deployment.
+
+```bash
+wormhole server \
+  --domain tunnel.example.com \
+  --tls \
+  --tls-email admin@example.com \
+  --require-auth \
+  --auth-secret "$(openssl rand -base64 32)" \
+  --admin-token "$(openssl rand -hex 16)" \
+  --persistence sqlite \
+  --persistence-path /var/lib/wormhole/wormhole.db
+```
+
+- [ ] **Enable TLS** (`--tls`): Without TLS, all traffic (including auth tokens) is transmitted in plaintext. Always enable TLS in production.
+- [ ] **Enable Authentication** (`--require-auth`): Without auth, anyone can create tunnels on your server.
+- [ ] **Set a strong auth secret** (`--auth-secret`): Use at least 32 random characters. This secret signs all team tokens.
+- [ ] **Protect the Admin API** (`--admin-token`): Without this, anyone with network access to the admin port can manage your server.
+- [ ] **Use persistent storage** (`--persistence sqlite`): Ensures token revocations survive server restarts.
+- [ ] **Restrict admin port access**: Bind the admin port to localhost or use firewall rules (e.g., `--admin-port 127.0.0.1:7001`).
+
+### Security Considerations
+
+#### P2P Mode
+
+P2P direct connections use **unencrypted UDP** for data transfer after NAT hole punching. While P2P reduces latency, the traffic is not encrypted at the transport layer. For sensitive data:
+
+```bash
+# Disable P2P to force all traffic through the encrypted relay
+wormhole client --local 8080 --p2p=false
+```
+
+#### Inspector
+
+The traffic inspector captures and displays HTTP request/response data. In production:
+
+- **Do not enable the inspector** on public-facing deployments
+- The inspector API binds to localhost by default, but be cautious if your network allows local access
+
+#### Admin API Without Token
+
+If `--admin-token` is not configured, the Admin API is **completely open** with no authentication. This allows anyone with network access to:
+- View all connected clients and tunnels
+- Generate and revoke tokens
+- Manage teams
+
+Always configure `--admin-token` in production.
+
+#### Subdomain Randomness
+
+Auto-generated subdomains use 64-bit cryptographic randomness (`crypto/rand`), producing 16-character hex strings. This makes brute-force subdomain guessing infeasible.
+
 ## Roadmap
 
 - [x] Phase 1: Basic TCP tunnel with multiplexing

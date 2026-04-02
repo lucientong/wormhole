@@ -38,7 +38,18 @@ func (a *AdminAPI) Handler() http.Handler {
 	mux.HandleFunc("/tokens/revoke", a.requireAdminAuth(a.handleRevokeToken))
 	mux.HandleFunc("/tokens/refresh", a.requireAdminAuth(a.handleRefreshToken))
 
-	return mux
+	// Wrap with request body size limiter to mitigate DoS via large payloads.
+	return a.maxBodySize(mux, 1<<20) // 1 MB.
+}
+
+// maxBodySize wraps a handler to enforce a maximum request body size.
+func (a *AdminAPI) maxBodySize(next http.Handler, maxBytes int64) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // HealthResponse is the response for the health endpoint.

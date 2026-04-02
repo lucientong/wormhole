@@ -776,10 +776,11 @@ func (s *Server) serveHTTP() {
 	defer s.closeWg.Done()
 
 	server := &http.Server{
-		Handler:      s.httpHandler,
-		ReadTimeout:  s.config.ReadTimeout,
-		WriteTimeout: s.config.WriteTimeout,
-		IdleTimeout:  s.config.IdleTimeout,
+		Handler:        s.httpHandler,
+		ReadTimeout:    s.config.ReadTimeout,
+		WriteTimeout:   s.config.WriteTimeout,
+		IdleTimeout:    s.config.IdleTimeout,
+		MaxHeaderBytes: 1 << 20, // 1 MB — mitigate large-header DoS.
 	}
 
 	if err := server.Serve(s.httpListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -792,9 +793,10 @@ func (s *Server) serveAdmin() {
 	defer s.closeWg.Done()
 
 	server := &http.Server{
-		Handler:      s.adminAPI.Handler(),
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		Handler:        s.adminAPI.Handler(),
+		ReadTimeout:    10 * time.Second,
+		WriteTimeout:   10 * time.Second,
+		MaxHeaderBytes: 1 << 20, // 1 MB — mitigate large-header DoS.
 	}
 
 	if err := server.Serve(s.adminListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -942,7 +944,7 @@ func generateID() string {
 }
 
 func generateSubdomain() string {
-	b := make([]byte, 4)
+	b := make([]byte, 8)
 	rand.Read(b)
 	return hex.EncodeToString(b)
 }
