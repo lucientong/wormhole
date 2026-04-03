@@ -174,6 +174,8 @@ type P2POfferRequest struct {
 	PublicAddr string `json:"public_addr"`
 	// LocalAddr is the sender's local endpoint.
 	LocalAddr string `json:"local_addr,omitempty"`
+	// PublicKey is the sender's ECDH X25519 public key (base64-encoded).
+	PublicKey string `json:"public_key,omitempty"`
 }
 
 // P2POfferResponse is the server's response to a P2P offer.
@@ -186,6 +188,8 @@ type P2POfferResponse struct {
 	PeerAddr string `json:"peer_addr,omitempty"`
 	// PeerNATType is the peer's NAT type.
 	PeerNATType string `json:"peer_nat_type,omitempty"`
+	// PeerPublicKey is the peer's ECDH X25519 public key (base64-encoded).
+	PeerPublicKey string `json:"peer_public_key,omitempty"`
 }
 
 // P2PCandidates carries additional candidate endpoints for hole punching.
@@ -369,7 +373,7 @@ func NewCloseResponse(success bool) *ControlMessage {
 }
 
 // NewP2POfferRequest creates a P2P offer request message.
-func NewP2POfferRequest(tunnelID, natType, publicAddr, localAddr string) *ControlMessage {
+func NewP2POfferRequest(tunnelID, natType, publicAddr, localAddr, publicKey string) *ControlMessage {
 	return &ControlMessage{
 		Type: MessageTypeP2POfferRequest,
 		P2POfferRequest: &P2POfferRequest{
@@ -377,19 +381,21 @@ func NewP2POfferRequest(tunnelID, natType, publicAddr, localAddr string) *Contro
 			NATType:    natType,
 			PublicAddr: publicAddr,
 			LocalAddr:  localAddr,
+			PublicKey:  publicKey,
 		},
 	}
 }
 
 // NewP2POfferResponse creates a P2P offer response message.
-func NewP2POfferResponse(success bool, err, peerAddr, peerNATType string) *ControlMessage {
+func NewP2POfferResponse(success bool, err, peerAddr, peerNATType, peerPublicKey string) *ControlMessage {
 	return &ControlMessage{
 		Type: MessageTypeP2POfferResponse,
 		P2POfferResponse: &P2POfferResponse{
-			Success:     success,
-			Error:       err,
-			PeerAddr:    peerAddr,
-			PeerNATType: peerNATType,
+			Success:       success,
+			Error:         err,
+			PeerAddr:      peerAddr,
+			PeerNATType:   peerNATType,
+			PeerPublicKey: peerPublicKey,
 		},
 	}
 }

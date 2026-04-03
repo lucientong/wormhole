@@ -130,7 +130,8 @@ func (m *Manager) IsEnabled() bool {
 
 // AttemptP2P tries to establish a P2P connection with a peer.
 // It returns the established UDP connection or an error (caller should fallback to relay).
-func (m *Manager) AttemptP2P(ctx context.Context, peerEndpoint Endpoint) (net.PacketConn, *net.UDPAddr, error) {
+// If a SessionCipher is provided, hole-punch probes will be HMAC-authenticated.
+func (m *Manager) AttemptP2P(ctx context.Context, peerEndpoint Endpoint, cipher *SessionCipher) (net.PacketConn, *net.UDPAddr, error) {
 	if !m.IsEnabled() {
 		if m.natInfo == nil {
 			return nil, nil, fmt.Errorf("P2P not available (NAT discovery not completed)")
@@ -152,6 +153,9 @@ func (m *Manager) AttemptP2P(ctx context.Context, peerEndpoint Endpoint) (net.Pa
 	if err != nil {
 		return nil, nil, fmt.Errorf("listen udp: %w", err)
 	}
+
+	// Set cipher on hole puncher for authenticated probes.
+	m.holePuncher.SetCipher(cipher)
 
 	// Attempt hole punch.
 	peerAddr, punchErr := m.holePuncher.Punch(ctx, conn, peerEndpoint)

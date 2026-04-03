@@ -17,7 +17,7 @@ Wormhole folds network space like a wormhole, allowing developers to expose loca
 - 🌐 **HTTP/HTTPS** — Full HTTP support with Host-based routing
 - 🔌 **TCP Tunnels** — Support for any TCP protocol (gRPC, WebSocket, etc.)
 - 📊 **Inspector** — Built-in traffic inspection UI with real-time WebSocket streaming
-- 🤝 **P2P** — NAT traversal and direct peer-to-peer connections when possible
+- 🤝 **P2P** — NAT traversal and direct peer-to-peer connections with end-to-end encryption (X25519 + AES-256-GCM)
 - 🔑 **Auth & RBAC** — HMAC-SHA256 team tokens with role-based access control
 - 🐳 **Docker Ready** — Easy deployment with Docker and systemd
 
@@ -283,6 +283,7 @@ Wormhole is designed with security in mind, but as a tunneling tool that exposes
 | Feature | Description |
 |---------|-------------|
 | **TLS Encryption** | All HTTP traffic encrypted via TLS 1.2+ with Let's Encrypt auto-certificates |
+| **P2P E2E Encryption** | X25519 ECDH key exchange + AES-256-GCM for direct P2P connections |
 | **HMAC-SHA256 Tokens** | Signed team tokens with expiration and revocation support |
 | **RBAC** | Role-based access control (admin / member / viewer) |
 | **Rate Limiting** | Automatic IP blocking after repeated authentication failures |
@@ -317,7 +318,14 @@ wormhole server \
 
 #### P2P Mode
 
-P2P direct connections use **unencrypted UDP** for data transfer after NAT hole punching. While P2P reduces latency, the traffic is not encrypted at the transport layer. For sensitive data:
+P2P direct connections feature **end-to-end encryption** using X25519 ECDH key exchange and AES-256-GCM authenticated encryption. The key exchange happens via the server's signaling channel, but the server never sees the shared secret — only public keys are relayed. This provides:
+
+- **X25519 ECDH** key agreement for perfect forward secrecy per session
+- **AES-256-GCM** authenticated encryption for all data packets
+- **HMAC-SHA256** authentication of hole-punch probes to prevent injection
+- **HKDF-SHA256** key derivation with separate keys for encryption and probe authentication
+
+If P2P hole punching fails, the client automatically falls back to the encrypted relay channel:
 
 ```bash
 # Disable P2P to force all traffic through the encrypted relay
@@ -352,6 +360,7 @@ Auto-generated subdomains use 64-bit cryptographic randomness (`crypto/rand`), p
 - [x] Phase 4: P2P direct connection — primitives (STUN, hole punch, predictor, signaling)
 - [x] Phase 4.5: P2P end-to-end integration (peer matching, data transfer, relay→P2P switch)
 - [x] Phase 5: Team collaboration (auth, HMAC tokens, RBAC, admin API protection)
+- [x] Phase 6: P2P end-to-end encryption (X25519 ECDH, AES-256-GCM, HMAC-authenticated hole punch)
 
 ## Contributing
 

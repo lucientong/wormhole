@@ -870,6 +870,47 @@ p2p_enabled: true
 - Server supports TLS termination (Let's Encrypt auto-certs or manual certificates)
 - Client-Server tunnel connection optionally TLS encrypted
 
+### P2P End-to-End Encryption
+
+P2P direct connections use end-to-end encryption to protect data confidentiality and integrity, even when the signaling server is untrusted:
+
+```
+  Client A                    Server (Signaling)                Client B
+    │                              │                              │
+    │  1. Generate X25519 keypair  │                              │
+    │     (privA, pubA)            │                              │
+    │                              │  2. Generate X25519 keypair  │
+    │                              │     (privB, pubB)            │
+    │                              │                              │
+    │  ── P2POfferRequest ──────►  │  ── P2POfferResponse ──────► │
+    │     { public_key: pubA }     │     { peer_public_key: pubA }│
+    │                              │                              │
+    │  ◄── P2POfferResponse ─────  │  ◄── P2POfferRequest ─────   │
+    │     { peer_public_key: pubB }│     { public_key: pubB }     │
+    │                              │                              │
+    │  3. ECDH(privA, pubB)        │                              │
+    │     → shared secret          │  3. ECDH(privB, pubA)        │
+    │     → HKDF derive:           │     → same shared secret     │
+    │       - AES-256 enc key      │     → HKDF derive:           │
+    │       - HMAC punch key       │       - AES-256 enc key      │
+    │                              │       - HMAC punch key       │
+    │                              │                              │
+    │  4. HMAC-authenticated hole punch ◄════════════════════►    │
+    │                              │                              │
+    │  5. AES-256-GCM encrypted data ◄═══════════════════════►    │
+```
+
+Key components:
+
+| Component | Description |
+|-----------|-------------|
+| **Key Exchange** | X25519 ECDH — each peer generates an ephemeral keypair per session |
+| **Key Derivation** | HKDF-SHA256 with separate info labels: `"wormhole-p2p-encryption"` for AES key, `"wormhole-p2p-punch-hmac"` for probe HMAC key |
+| **Data Encryption** | AES-256-GCM with monotonic nonce counter (8-byte counter + 4 zero bytes) |
+| **Probe Authentication** | HMAC-SHA256 on hole-punch probe payloads, preventing injection of spoofed probes |
+| **Forward Secrecy** | Ephemeral keys per session — compromising one session does not affect others |
+| **Server Blindness** | Server relays only public keys; it cannot derive the shared secret or decrypt data |
+
 ### Authentication
 
 - Dual-mode token authentication: HMAC-SHA256 signed tokens (team management) + simple pre-shared tokens (quick deployment)

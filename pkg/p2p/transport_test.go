@@ -28,10 +28,10 @@ func TestTransport_BasicSendReceive(t *testing.T) {
 	config.RetransmitTimeout = 100 * time.Millisecond
 
 	// Create transports.
-	t1 := NewTransport(conn1, addr2, config)
+	t1 := NewTransport(conn1, addr2, config, nil)
 	defer t1.Close()
 
-	t2 := NewTransport(conn2, addr1, config)
+	t2 := NewTransport(conn2, addr1, config, nil)
 	defer t2.Close()
 
 	// Send data from t1 to t2.
@@ -76,10 +76,10 @@ func TestTransport_Bidirectional(t *testing.T) {
 	config := DefaultTransportConfig()
 	config.RetransmitTimeout = 100 * time.Millisecond
 
-	t1 := NewTransport(conn1, addr2, config)
+	t1 := NewTransport(conn1, addr2, config, nil)
 	defer t1.Close()
 
-	t2 := NewTransport(conn2, addr1, config)
+	t2 := NewTransport(conn2, addr1, config, nil)
 	defer t2.Close()
 
 	var wg sync.WaitGroup
@@ -144,10 +144,10 @@ func TestTransport_LargeMessage(t *testing.T) {
 	config.RetransmitTimeout = 100 * time.Millisecond
 	config.MaxPacketSize = 100 // Small packets to test fragmentation.
 
-	t1 := NewTransport(conn1, addr2, config)
+	t1 := NewTransport(conn1, addr2, config, nil)
 	defer t1.Close()
 
-	t2 := NewTransport(conn2, addr1, config)
+	t2 := NewTransport(conn2, addr1, config, nil)
 	defer t2.Close()
 
 	// Send large data that will be split into multiple packets.
@@ -190,8 +190,8 @@ func TestTransport_Close(t *testing.T) {
 	addr2 := conn2.LocalAddr().(*net.UDPAddr)
 
 	config := DefaultTransportConfig()
-	t1 := NewTransport(conn1, addr2, config)
-	t2 := NewTransport(conn2, addr1, config)
+	t1 := NewTransport(conn1, addr2, config, nil)
+	t2 := NewTransport(conn2, addr1, config, nil)
 
 	// Close t1.
 	err = t1.Close()
@@ -219,7 +219,7 @@ func TestTransport_Stats(t *testing.T) {
 	addr2 := conn2.LocalAddr().(*net.UDPAddr)
 
 	config := DefaultTransportConfig()
-	tr := NewTransport(conn1, addr2, config)
+	tr := NewTransport(conn1, addr2, config, nil)
 	defer tr.Close()
 
 	// Initial stats should be zero.

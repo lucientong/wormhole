@@ -32,11 +32,19 @@ func DefaultHolePunchConfig() HolePunchConfig {
 // HolePuncher performs UDP hole punching between two peers.
 type HolePuncher struct {
 	config HolePunchConfig
+	// cipher is the optional session cipher for authenticated probes.
+	// When set, probes include an HMAC tag for peer authentication.
+	cipher *SessionCipher
 }
 
 // NewHolePuncher creates a new hole puncher.
 func NewHolePuncher(config HolePunchConfig) *HolePuncher {
 	return &HolePuncher{config: config}
+}
+
+// SetCipher sets the session cipher for authenticated hole punching.
+func (h *HolePuncher) SetCipher(c *SessionCipher) {
+	h.cipher = c
 }
 
 // punchMagic is the 4-byte magic prefix for hole punch packets.
@@ -94,11 +102,20 @@ func (h *HolePuncher) Punch(ctx context.Context, localConn net.PacketConn, peerE
 
 // sendProbes sends periodic UDP probe packets to the peer.
 func (h *HolePuncher) sendProbes(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) {
-	// Probe packet: magic + "probe".
+	// Build probe packet: magic + "probe" [+ HMAC tag].
 	probePayload := []byte("probe")
-	probe := make([]byte, 0, len(punchMagic)+len(probePayload))
-	probe = append(probe, punchMagic...)
-	probe = append(probe, probePayload...)
+	baseProbe := make([]byte, 0, len(punchMagic)+len(probePayload))
+	baseProbe = append(baseProbe, punchMagic...)
+	baseProbe = append(baseProbe, probePayload...)
+
+	// If cipher is set, append HMAC tag for authenticated probes.
+	probe := baseProbe
+	if h.cipher != nil {
+		tag := h.cipher.SignProbe(baseProbe)
+		probe = make([]byte, 0, len(baseProbe)+len(tag))
+		probe = append(probe, baseProbe...)
+		probe = append(probe, tag...)
+	}
 
 	// Send the first probe immediately (avoid ticker startup delay).
 	if _, err := conn.WriteTo(probe, peer); err != nil {
@@ -123,6 +140,8 @@ func (h *HolePuncher) sendProbes(ctx context.Context, conn net.PacketConn, peer 
 // receiveProbe listens for probe packets from the peer.
 func (h *HolePuncher) receiveProbe(ctx context.Context, conn net.PacketConn) *net.UDPAddr {
 	buf := make([]byte, 256)
+	// hmacTagLen is the HMAC-SHA256 tag length (32 bytes).
+	const hmacTagLen = 32
 
 	for {
 		select {
@@ -142,17 +161,47 @@ func (h *HolePuncher) receiveProbe(ctx context.Context, conn net.PacketConn) *ne
 		}
 
 		// Verify magic prefix.
-		if n >= len(punchMagic) && string(buf[:len(punchMagic)]) == string(punchMagic) {
-			udpAddr, ok := addr.(*net.UDPAddr)
-			if ok {
-				// Send ack back.
-				ackPayload := []byte("ack")
-				ack := make([]byte, 0, len(punchMagic)+len(ackPayload))
-				ack = append(ack, punchMagic...)
-				ack = append(ack, ackPayload...)
-				_, _ = conn.WriteTo(ack, addr)
-				return udpAddr
+		if n < len(punchMagic) || string(buf[:len(punchMagic)]) != string(punchMagic) {
+			continue
+		}
+
+		// If cipher is set, verify HMAC authentication on the probe.
+		if h.cipher != nil {
+			// Authenticated probe format: [magic + payload][HMAC-SHA256 tag].
+			// Minimum length: magic (4) + "probe" (5) + tag (32) = 41.
+			baseLen := n - hmacTagLen
+			if baseLen < len(punchMagic) {
+				log.Debug().Msg("Probe too short for HMAC verification, ignoring")
+				continue
+			}
+			payload := buf[:baseLen]
+			tag := buf[baseLen:n]
+			if !h.cipher.VerifyProbe(payload, tag) {
+				log.Debug().Msg("Probe HMAC verification failed, ignoring")
+				continue
 			}
 		}
+
+		udpAddr, ok := addr.(*net.UDPAddr)
+		if !ok {
+			continue
+		}
+
+		// Build authenticated ack.
+		ackPayload := []byte("ack")
+		baseAck := make([]byte, 0, len(punchMagic)+len(ackPayload))
+		baseAck = append(baseAck, punchMagic...)
+		baseAck = append(baseAck, ackPayload...)
+
+		ack := baseAck
+		if h.cipher != nil {
+			tag := h.cipher.SignProbe(baseAck)
+			ack = make([]byte, 0, len(baseAck)+len(tag))
+			ack = append(ack, baseAck...)
+			ack = append(ack, tag...)
+		}
+
+		_, _ = conn.WriteTo(ack, addr)
+		return udpAddr
 	}
 }

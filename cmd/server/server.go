@@ -69,6 +69,7 @@ type ClientSession struct {
 	P2PPublicAddr string
 	P2PNATType    string
 	P2PLocalAddr  string
+	P2PPublicKey  string // ECDH public key (base64-encoded) for E2E encryption.
 
 	mu sync.Mutex
 }
@@ -623,11 +624,12 @@ func (s *Server) handlePing(client *ClientSession, stream *tunnel.Stream, req *p
 // handleP2POffer handles a P2P connection offer from a client.
 // It stores the client's P2P info and returns the peer's info if available.
 func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, req *proto.P2POfferRequest) {
-	// Store client's P2P info.
+	// Store client's P2P info (including ECDH public key).
 	client.mu.Lock()
 	client.P2PPublicAddr = req.PublicAddr
 	client.P2PNATType = req.NATType
 	client.P2PLocalAddr = req.LocalAddr
+	client.P2PPublicKey = req.PublicKey
 	client.mu.Unlock()
 
 	log.Info().
@@ -635,12 +637,13 @@ func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, re
 		Str("nat_type", req.NATType).
 		Str("public_addr", req.PublicAddr).
 		Str("local_addr", req.LocalAddr).
+		Bool("has_public_key", req.PublicKey != "").
 		Msg("P2P offer received")
 
 	// Try to find a peer that can establish P2P connection.
 	peer := s.FindPeerForP2P(client.ID)
 	if peer == nil {
-		resp := proto.NewP2POfferResponse(false, "no peer available for P2P", "", "")
+		resp := proto.NewP2POfferResponse(false, "no peer available for P2P", "", "", "")
 		data, err := resp.Encode()
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to encode P2P offer response")
@@ -658,7 +661,7 @@ func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, re
 			Str("client_nat", req.NATType).
 			Str("peer_nat", peer.P2PNATType).
 			Msg("NAT types not compatible for P2P")
-		resp := proto.NewP2POfferResponse(false, "NAT types not compatible", "", "")
+		resp := proto.NewP2POfferResponse(false, "NAT types not compatible", "", "", "")
 		data, _ := resp.Encode()
 		_, _ = stream.Write(data)
 		return
@@ -668,16 +671,18 @@ func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, re
 	peer.mu.Lock()
 	peerAddr := peer.P2PPublicAddr
 	peerNATType := peer.P2PNATType
+	peerPublicKey := peer.P2PPublicKey
 	peer.mu.Unlock()
 
 	log.Info().
 		Str("client", client.ID).
 		Str("peer", peer.ID).
 		Str("peer_addr", peerAddr).
+		Bool("has_peer_key", peerPublicKey != "").
 		Msg("P2P peer matched")
 
-	// Send peer info to initiating client.
-	resp := proto.NewP2POfferResponse(true, "", peerAddr, peerNATType)
+	// Send peer info (including ECDH public key) to initiating client.
+	resp := proto.NewP2POfferResponse(true, "", peerAddr, peerNATType, peerPublicKey)
 	data, err := resp.Encode()
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to encode P2P offer response")
@@ -708,6 +713,7 @@ func (s *Server) notifyPeerOfP2P(peer *ClientSession, initiator *ClientSession) 
 	initiator.mu.Lock()
 	initiatorAddr := initiator.P2PPublicAddr
 	initiatorNATType := initiator.P2PNATType
+	initiatorPublicKey := initiator.P2PPublicKey
 	initiator.mu.Unlock()
 
 	// Open a stream to the peer to notify them.
@@ -718,8 +724,8 @@ func (s *Server) notifyPeerOfP2P(peer *ClientSession, initiator *ClientSession) 
 	}
 	defer stream.Close()
 
-	// Send P2P offer response (as a notification) with the initiator's info.
-	msg := proto.NewP2POfferResponse(true, "", initiatorAddr, initiatorNATType)
+	// Send P2P offer response (as a notification) with the initiator's info and public key.
+	msg := proto.NewP2POfferResponse(true, "", initiatorAddr, initiatorNATType, initiatorPublicKey)
 	data, err := msg.Encode()
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to encode P2P notification")
@@ -739,6 +745,7 @@ func (s *Server) notifyPeerOfP2P(peer *ClientSession, initiator *ClientSession) 
 	log.Debug().
 		Str("peer", peer.ID).
 		Str("initiator_addr", initiatorAddr).
+		Bool("has_key", initiatorPublicKey != "").
 		Msg("P2P notification sent to peer")
 }
 

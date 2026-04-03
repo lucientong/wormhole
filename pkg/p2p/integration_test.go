@@ -31,10 +31,10 @@ func TestP2PIntegration_DirectConnection(t *testing.T) {
 	config := DefaultTransportConfig()
 	config.RetransmitTimeout = 50 * time.Millisecond
 
-	t1 := NewTransport(conn1, addr2, config)
+	t1 := NewTransport(conn1, addr2, config, nil)
 	defer t1.Close()
 
-	t2 := NewTransport(conn2, addr1, config)
+	t2 := NewTransport(conn2, addr1, config, nil)
 	defer t2.Close()
 
 	// Test bidirectional echo.
@@ -100,10 +100,10 @@ func TestP2PIntegration_ProtocolMessage(t *testing.T) {
 	config := DefaultTransportConfig()
 	config.RetransmitTimeout = 50 * time.Millisecond
 
-	t1 := NewTransport(conn1, addr2, config)
+	t1 := NewTransport(conn1, addr2, config, nil)
 	defer t1.Close()
 
-	t2 := NewTransport(conn2, addr1, config)
+	t2 := NewTransport(conn2, addr1, config, nil)
 	defer t2.Close()
 
 	// Simulate a P2P stream request as JSON.
@@ -152,10 +152,10 @@ func TestP2PIntegration_ConcurrentStreams(t *testing.T) {
 	config := DefaultTransportConfig()
 	config.RetransmitTimeout = 50 * time.Millisecond
 
-	t1 := NewTransport(conn1, addr2, config)
+	t1 := NewTransport(conn1, addr2, config, nil)
 	defer t1.Close()
 
-	t2 := NewTransport(conn2, addr1, config)
+	t2 := NewTransport(conn2, addr1, config, nil)
 	defer t2.Close()
 
 	numMessages := 10
@@ -229,8 +229,8 @@ func TestP2PIntegration_GracefulClose(t *testing.T) {
 	config := DefaultTransportConfig()
 	config.RetransmitTimeout = 50 * time.Millisecond
 
-	t1 := NewTransport(conn1, addr2, config)
-	t2 := NewTransport(conn2, addr1, config)
+	t1 := NewTransport(conn1, addr2, config, nil)
+	t2 := NewTransport(conn2, addr1, config, nil)
 
 	// Send some data first.
 	_, err = t1.Write([]byte("test"))
@@ -281,8 +281,8 @@ func TestP2PIntegration_ReconnectScenario(t *testing.T) {
 	config := DefaultTransportConfig()
 	config.RetransmitTimeout = 50 * time.Millisecond
 
-	t1 := NewTransport(conn1, addr2, config)
-	t2 := NewTransport(conn2, addr1, config)
+	t1 := NewTransport(conn1, addr2, config, nil)
+	t2 := NewTransport(conn2, addr1, config, nil)
 
 	// Initial communication works.
 	_, err = t1.Write([]byte("hello"))
@@ -346,7 +346,7 @@ func TestP2PIntegration_Timeout(t *testing.T) {
 	config.RetransmitTimeout = 50 * time.Millisecond
 	config.MaxRetransmits = 2 // Quick timeout.
 
-	tr := NewTransport(conn, fakePeer, config)
+	tr := NewTransport(conn, fakePeer, config, nil)
 	defer tr.Close()
 
 	// Send data - should succeed (local operation).
@@ -412,7 +412,7 @@ func TestManager_AttemptP2P_NotEnabled(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	_, _, err := m.AttemptP2P(ctx, Endpoint{IP: "127.0.0.1", Port: 8080})
+	_, _, err := m.AttemptP2P(ctx, Endpoint{IP: "127.0.0.1", Port: 8080}, nil)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "P2P not available")
 }

@@ -15,6 +15,8 @@ import (
 // Transport provides a reliable stream-like interface over UDP.
 // It implements a simple ARQ (Automatic Repeat reQuest) protocol
 // for data reliability over the unreliable UDP connection.
+// When a SessionCipher is set, all data packets are encrypted with
+// AES-256-GCM, providing confidentiality and integrity.
 type Transport struct {
 	conn     net.PacketConn
 	peerAddr *net.UDPAddr
@@ -36,6 +38,9 @@ type Transport struct {
 
 	// Configuration.
 	config TransportConfig
+
+	// End-to-end encryption cipher (nil = plaintext for backward compat).
+	cipher *SessionCipher
 
 	// State.
 	closed  uint32
@@ -87,11 +92,13 @@ const (
 const headerSize = 5
 
 // NewTransport creates a new UDP transport.
-func NewTransport(conn net.PacketConn, peerAddr *net.UDPAddr, config TransportConfig) *Transport {
+// An optional SessionCipher enables end-to-end encryption for all data packets.
+func NewTransport(conn net.PacketConn, peerAddr *net.UDPAddr, config TransportConfig, cipher *SessionCipher) *Transport {
 	t := &Transport{
 		conn:     conn,
 		peerAddr: peerAddr,
 		config:   config,
+		cipher:   cipher,
 		sendBuf:  make(map[uint32]*packet),
 		recvBuf:  make(map[uint32][]byte),
 		recvCh:   make(chan []byte, config.RecvBufferSize),
@@ -105,14 +112,22 @@ func NewTransport(conn net.PacketConn, peerAddr *net.UDPAddr, config TransportCo
 	return t
 }
 
+// IsEncrypted returns whether this transport is using end-to-end encryption.
+func (t *Transport) IsEncrypted() bool {
+	return t.cipher != nil
+}
+
 // Write sends data to the peer with reliability.
 func (t *Transport) Write(data []byte) (int, error) {
 	if atomic.LoadUint32(&t.closed) == 1 {
 		return 0, io.ErrClosedPipe
 	}
 
-	// Split data into packets if needed.
+	// Account for encryption overhead when calculating max payload.
 	maxPayload := t.config.MaxPacketSize - headerSize
+	if t.cipher != nil {
+		maxPayload -= t.cipher.Overhead()
+	}
 	totalWritten := 0
 
 	for len(data) > 0 {
@@ -124,8 +139,18 @@ func (t *Transport) Write(data []byte) (int, error) {
 		chunk := data[:chunkSize]
 		data = data[chunkSize:]
 
+		// Encrypt payload if cipher is available.
+		payload := chunk
+		if t.cipher != nil {
+			encrypted, encErr := t.cipher.Encrypt(chunk)
+			if encErr != nil {
+				return totalWritten, fmt.Errorf("encrypt payload: %w", encErr)
+			}
+			payload = encrypted
+		}
+
 		seq := atomic.AddUint32(&t.sendSeq, 1)
-		pkt := t.buildPacket(pktTypeData, seq, chunk)
+		pkt := t.buildPacket(pktTypeData, seq, payload)
 
 		// Store in send buffer for potential retransmission.
 		t.sendBufLock.Lock()
@@ -253,6 +278,17 @@ func (t *Transport) handleDataPacket(seq uint32, payload []byte) {
 	ackPkt := t.buildPacket(pktTypeAck, seq, nil)
 	_, _ = t.conn.WriteTo(ackPkt, t.peerAddr)
 
+	// Decrypt payload if cipher is available.
+	plaintext := payload
+	if t.cipher != nil {
+		decrypted, decErr := t.cipher.Decrypt(payload)
+		if decErr != nil {
+			log.Warn().Err(decErr).Uint32("seq", seq).Msg("P2P transport: decrypt failed, dropping packet")
+			return
+		}
+		plaintext = decrypted
+	}
+
 	t.recvBufLock.Lock()
 	defer t.recvBufLock.Unlock()
 
@@ -260,8 +296,8 @@ func (t *Transport) handleDataPacket(seq uint32, payload []byte) {
 
 	if seq == expectedSeq {
 		// In-order packet - deliver immediately.
-		data := make([]byte, len(payload))
-		copy(data, payload)
+		data := make([]byte, len(plaintext))
+		copy(data, plaintext)
 		select {
 		case t.recvCh <- data:
 		default:
@@ -286,8 +322,8 @@ func (t *Transport) handleDataPacket(seq uint32, payload []byte) {
 	} else if seq > expectedSeq {
 		// Out-of-order packet - buffer for later.
 		if _, exists := t.recvBuf[seq]; !exists {
-			data := make([]byte, len(payload))
-			copy(data, payload)
+			data := make([]byte, len(plaintext))
+			copy(data, plaintext)
 			t.recvBuf[seq] = data
 		}
 	}

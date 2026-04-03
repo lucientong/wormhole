@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -41,11 +42,13 @@ type Client struct {
 
 	// P2P
 	p2pManager   *p2p.Manager
-	p2pConn      net.PacketConn // UDP connection for P2P
-	p2pPeer      *net.UDPAddr   // Peer's confirmed UDP address
-	p2pTransport *p2p.Transport // Reliable UDP transport for P2P data
-	p2pMode      uint32         // 1 if using P2P, 0 for relay
-	p2pCloseCh   chan struct{}  // Signal to stop P2P read loop
+	p2pConn      net.PacketConn   // UDP connection for P2P
+	p2pPeer      *net.UDPAddr     // Peer's confirmed UDP address
+	p2pTransport *p2p.Transport   // Reliable UDP transport for P2P data
+	p2pMode      uint32           // 1 if using P2P, 0 for relay
+	p2pCloseCh   chan struct{}    // Signal to stop P2P read loop
+	p2pKeyPair   *p2p.KeyPair    // ECDH key pair for this session
+	p2pCipher    *p2p.SessionCipher // Derived session cipher for E2E encryption
 
 	// Statistics
 	stats ClientStats
@@ -669,13 +672,22 @@ func (c *Client) sendPing(ctx context.Context, pingID uint64) error {
 }
 
 // sendP2POffer sends a P2P offer to the server with this client's NAT info.
+// It also generates an ECDH key pair and includes the public key for E2E encryption.
 func (c *Client) sendP2POffer(ctx context.Context) {
 	natInfo := c.p2pManager.NATInfo()
 	if natInfo == nil {
 		return
 	}
 
+	// Generate ECDH key pair for this P2P session.
+	keyPair, keyErr := p2p.GenerateKeyPair()
+	if keyErr != nil {
+		log.Error().Err(keyErr).Msg("Failed to generate ECDH key pair for P2P")
+		return
+	}
+
 	c.mu.Lock()
+	c.p2pKeyPair = keyPair
 	mux := c.mux
 	tunnelID := c.tunnelID
 	c.mu.Unlock()
@@ -691,11 +703,15 @@ func (c *Client) sendP2POffer(ctx context.Context) {
 	}
 	defer stream.Close()
 
+	// Encode public key as base64 for transmission in JSON.
+	pubKeyB64 := base64.StdEncoding.EncodeToString(keyPair.Public)
+
 	req := proto.NewP2POfferRequest(
 		tunnelID,
 		natInfo.Type.String(),
 		natInfo.PublicAddr.String(),
 		natInfo.LocalAddr.String(),
+		pubKeyB64,
 	)
 	data, err := req.Encode()
 	if err != nil {
@@ -729,9 +745,18 @@ func (c *Client) sendP2POffer(ctx context.Context) {
 
 	resp := msg.P2POfferResponse
 	if resp.Success && resp.PeerAddr != "" {
+		// Derive session cipher from peer's public key.
+		if resp.PeerPublicKey != "" {
+			if derivErr := c.deriveP2PCipher(resp.PeerPublicKey); derivErr != nil {
+				log.Error().Err(derivErr).Msg("Failed to derive P2P session cipher")
+				return
+			}
+		}
+
 		log.Info().
 			Str("peer_addr", resp.PeerAddr).
 			Str("peer_nat", resp.PeerNATType).
+			Bool("encrypted", c.p2pCipher != nil).
 			Msg("P2P peer found, attempting connection")
 
 		// Initiate hole punching with the peer endpoint.
@@ -741,6 +766,34 @@ func (c *Client) sendP2POffer(ctx context.Context) {
 			Str("reason", resp.Error).
 			Msg("P2P offer: no peer available, staying in relay mode")
 	}
+}
+
+// deriveP2PCipher derives the E2E session cipher from the peer's public key.
+func (c *Client) deriveP2PCipher(peerPubKeyB64 string) error {
+	peerPubBytes, err := base64.StdEncoding.DecodeString(peerPubKeyB64)
+	if err != nil {
+		return fmt.Errorf("decode peer public key: %w", err)
+	}
+
+	c.mu.Lock()
+	keyPair := c.p2pKeyPair
+	c.mu.Unlock()
+
+	if keyPair == nil {
+		return fmt.Errorf("local key pair not generated")
+	}
+
+	cipher, err := p2p.DeriveSession(keyPair.Private, peerPubBytes)
+	if err != nil {
+		return fmt.Errorf("derive session: %w", err)
+	}
+
+	c.mu.Lock()
+	c.p2pCipher = cipher
+	c.mu.Unlock()
+
+	log.Info().Msg("P2P E2E session cipher derived successfully")
+	return nil
 }
 
 // attemptP2P attempts to establish a P2P connection with the given peer address.
@@ -757,16 +810,21 @@ func (c *Client) attemptP2P(ctx context.Context, peerAddr string) {
 		Str("peer", peerAddr).
 		Msg("Attempting P2P hole punching")
 
-	// Attempt P2P connection through the manager.
-	conn, confirmedPeer, p2pErr := c.p2pManager.AttemptP2P(ctx, peerEndpoint)
+	// Get cipher for authenticated hole punching.
+	c.mu.Lock()
+	cipher := c.p2pCipher
+	c.mu.Unlock()
+
+	// Attempt P2P connection through the manager (with optional cipher for authenticated probes).
+	conn, confirmedPeer, p2pErr := c.p2pManager.AttemptP2P(ctx, peerEndpoint, cipher)
 	if p2pErr != nil {
 		log.Warn().Err(p2pErr).Msg("P2P hole punching failed")
 		c.sendP2PResult(ctx, false, "", p2pErr.Error())
 		return
 	}
 
-	// Create reliable transport over the UDP connection.
-	transport := p2p.NewTransport(conn, confirmedPeer, p2p.DefaultTransportConfig())
+	// Create reliable transport over the UDP connection (with optional E2E encryption).
+	transport := p2p.NewTransport(conn, confirmedPeer, p2p.DefaultTransportConfig(), cipher)
 
 	// Create P2P close channel for graceful shutdown.
 	p2pCloseCh := make(chan struct{})
@@ -781,9 +839,11 @@ func (c *Client) attemptP2P(ctx context.Context, peerAddr string) {
 	c.mu.Unlock()
 
 	peerAddrStr := confirmedPeer.String()
+	encrypted := transport.IsEncrypted()
 	log.Info().
 		Str("peer", peerAddrStr).
 		Str("local", conn.LocalAddr().String()).
+		Bool("encrypted", encrypted).
 		Msg("P2P connection established successfully")
 
 	// Notify server of successful P2P connection.
@@ -792,7 +852,11 @@ func (c *Client) attemptP2P(ctx context.Context, peerAddr string) {
 	// Start P2P data read loop in background.
 	go c.p2pReadLoop(ctx, p2pCloseCh)
 
-	fmt.Printf("  🎉 P2P Mode: Direct connection to %s\n", peerAddrStr)
+	if encrypted {
+		fmt.Printf("  🎉 P2P Mode: Direct connection to %s (encrypted)\n", peerAddrStr)
+	} else {
+		fmt.Printf("  🎉 P2P Mode: Direct connection to %s\n", peerAddrStr)
+	}
 }
 
 // parseEndpoint parses a string address into a p2p.Endpoint.
@@ -867,7 +931,29 @@ func (c *Client) handleP2PNotification(ctx context.Context, resp *proto.P2POffer
 	log.Info().
 		Str("peer_addr", resp.PeerAddr).
 		Str("peer_nat", resp.PeerNATType).
+		Bool("has_peer_key", resp.PeerPublicKey != "").
 		Msg("Received P2P notification from server, attempting connection")
+
+	// Generate our ECDH key pair if not already done.
+	c.mu.Lock()
+	if c.p2pKeyPair == nil {
+		keyPair, keyErr := p2p.GenerateKeyPair()
+		if keyErr != nil {
+			c.mu.Unlock()
+			log.Error().Err(keyErr).Msg("Failed to generate ECDH key pair for P2P notification")
+			return
+		}
+		c.p2pKeyPair = keyPair
+	}
+	c.mu.Unlock()
+
+	// Derive session cipher from peer's public key if available.
+	if resp.PeerPublicKey != "" {
+		if derivErr := c.deriveP2PCipher(resp.PeerPublicKey); derivErr != nil {
+			log.Error().Err(derivErr).Msg("Failed to derive P2P session cipher from notification")
+			return
+		}
+	}
 
 	// Attempt hole punching with the peer.
 	go c.attemptP2P(ctx, resp.PeerAddr)
@@ -1074,6 +1160,9 @@ func (c *Client) fallbackToRelay(reason string) {
 		close(c.p2pCloseCh)
 		c.p2pCloseCh = nil
 	}
+	// Clear crypto state so a fresh key pair is generated on next attempt.
+	c.p2pKeyPair = nil
+	c.p2pCipher = nil
 
 	// Set mode back to relay.
 	atomic.StoreUint32(&c.p2pMode, 0)
