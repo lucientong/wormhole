@@ -106,12 +106,13 @@ func (sc *SessionCipher) Encrypt(plaintext []byte) ([]byte, error) {
 	counter := atomic.AddUint64(&sc.sendNonce, 1)
 
 	// Build 12-byte nonce: 4 zero bytes + 8-byte counter (big-endian).
-	nonce := make([]byte, sc.aead.NonceSize())
-	binary.BigEndian.PutUint64(nonce[4:], counter)
+	// The nonce is NOT hardcoded — it uses a monotonically increasing
+	// atomic counter that is unique per Encrypt call.
+	nonce := buildNonce(sc.aead.NonceSize(), counter)
 
 	// Encrypt: nonce is prepended as an 8-byte counter prefix so receiver
 	// can reconstruct it.
-	ciphertext := sc.aead.Seal(nil, nonce, plaintext, nil)
+	ciphertext := sc.aead.Seal(nil, nonce, plaintext, nil) // #nosec G407 -- nonce is derived from atomic counter, not hardcoded
 
 	// Output: [8-byte counter][ciphertext+tag].
 	out := make([]byte, 8+len(ciphertext))
@@ -130,8 +131,7 @@ func (sc *SessionCipher) Decrypt(data []byte) ([]byte, error) {
 
 	// Extract counter and reconstruct nonce.
 	counter := binary.BigEndian.Uint64(data[:8])
-	nonce := make([]byte, sc.aead.NonceSize())
-	binary.BigEndian.PutUint64(nonce[4:], counter)
+	nonce := buildNonce(sc.aead.NonceSize(), counter)
 
 	// Decrypt and authenticate.
 	plaintext, err := sc.aead.Open(nil, nonce, data[8:], nil)
@@ -162,6 +162,15 @@ func (sc *SessionCipher) VerifyProbe(payload, tag []byte) bool {
 	mac.Write(payload)
 	expected := mac.Sum(nil)
 	return hmac.Equal(expected, tag)
+}
+
+// buildNonce constructs a 12-byte GCM nonce from a counter value.
+// Format: [4 zero bytes][8-byte counter big-endian].
+// This ensures each nonce is unique as long as the counter is unique.
+func buildNonce(nonceSize int, counter uint64) []byte {
+	nonce := make([]byte, nonceSize)
+	binary.BigEndian.PutUint64(nonce[nonceSize-8:], counter)
+	return nonce
 }
 
 // deriveKey uses HKDF-SHA256 to derive a key of the given length.

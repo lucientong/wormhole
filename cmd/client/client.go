@@ -42,12 +42,12 @@ type Client struct {
 
 	// P2P
 	p2pManager   *p2p.Manager
-	p2pConn      net.PacketConn   // UDP connection for P2P
-	p2pPeer      *net.UDPAddr     // Peer's confirmed UDP address
-	p2pTransport *p2p.Transport   // Reliable UDP transport for P2P data
-	p2pMode      uint32           // 1 if using P2P, 0 for relay
-	p2pCloseCh   chan struct{}    // Signal to stop P2P read loop
-	p2pKeyPair   *p2p.KeyPair    // ECDH key pair for this session
+	p2pConn      net.PacketConn     // UDP connection for P2P
+	p2pPeer      *net.UDPAddr       // Peer's confirmed UDP address
+	p2pTransport *p2p.Transport     // Reliable UDP transport for P2P data
+	p2pMode      uint32             // 1 if using P2P, 0 for relay
+	p2pCloseCh   chan struct{}      // Signal to stop P2P read loop
+	p2pKeyPair   *p2p.KeyPair       // ECDH key pair for this session
 	p2pCipher    *p2p.SessionCipher // Derived session cipher for E2E encryption
 
 	// Statistics
