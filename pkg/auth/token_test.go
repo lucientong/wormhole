@@ -589,3 +589,52 @@ func TestExtendTokenExpiry_InvalidToken(t *testing.T) {
 	_, err := a.ExtendTokenExpiry("invalid-token", 1*time.Hour)
 	assert.Error(t, err)
 }
+
+// ---------------------------------------------------------------------------
+// Benchmarks
+// ---------------------------------------------------------------------------
+
+func BenchmarkIssueToken(b *testing.B) {
+	a, err := New(Config{
+		Secret:      testSecret,
+		TokenExpiry: 1 * time.Hour,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = a.GenerateTeamToken("bench-team", RoleMember)
+	}
+}
+
+func BenchmarkValidateToken(b *testing.B) {
+	a, err := New(Config{
+		Secret:      testSecret,
+		TokenExpiry: 1 * time.Hour,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	token, err := a.GenerateTeamToken("bench-team", RoleMember)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		_, _ = a.ValidateToken(token)
+	}
+}
+
+func BenchmarkHasPermission(b *testing.B) {
+	claims := &Claims{Role: RoleMember}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = HasPermission(claims, PermissionConnect)
+	}
+}

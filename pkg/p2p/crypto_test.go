@@ -654,6 +654,110 @@ func TestTransport_Encrypted_GracefulClose(t *testing.T) {
 	_ = conn2.Close()
 }
 
+// ---------------------------------------------------------------------------
+// Benchmarks
+// ---------------------------------------------------------------------------
+
+func BenchmarkGenerateKeyPair(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = GenerateKeyPair()
+	}
+}
+
+func BenchmarkDeriveSession(b *testing.B) {
+	kpA, _ := GenerateKeyPair()
+	kpB, _ := GenerateKeyPair()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = DeriveSession(kpA.Private, kpB.Public)
+	}
+}
+
+func BenchmarkEncrypt(b *testing.B) {
+	kpA, _ := GenerateKeyPair()
+	kpB, _ := GenerateKeyPair()
+	cipher, _ := DeriveSession(kpA.Private, kpB.Public)
+
+	sizes := []struct {
+		name string
+		size int
+	}{
+		{"64B", 64},
+		{"1KB", 1024},
+		{"32KB", 32 * 1024},
+	}
+
+	for _, s := range sizes {
+		plaintext := make([]byte, s.size)
+		b.Run(s.name, func(b *testing.B) {
+			b.SetBytes(int64(s.size))
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				_, _ = cipher.Encrypt(plaintext)
+			}
+		})
+	}
+}
+
+func BenchmarkDecrypt(b *testing.B) {
+	kpA, _ := GenerateKeyPair()
+	kpB, _ := GenerateKeyPair()
+	cipherA, _ := DeriveSession(kpA.Private, kpB.Public)
+	cipherB, _ := DeriveSession(kpB.Private, kpA.Public)
+
+	sizes := []struct {
+		name string
+		size int
+	}{
+		{"64B", 64},
+		{"1KB", 1024},
+		{"32KB", 32 * 1024},
+	}
+
+	for _, s := range sizes {
+		plaintext := make([]byte, s.size)
+		ct, _ := cipherA.Encrypt(plaintext)
+
+		b.Run(s.name, func(b *testing.B) {
+			b.SetBytes(int64(s.size))
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				_, _ = cipherB.Decrypt(ct)
+			}
+		})
+	}
+}
+
+func BenchmarkSignProbe(b *testing.B) {
+	kpA, _ := GenerateKeyPair()
+	kpB, _ := GenerateKeyPair()
+	cipher, _ := DeriveSession(kpA.Private, kpB.Public)
+	payload := []byte("WHPPprobe-benchmark")
+
+	
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = cipher.SignProbe(payload)
+	}
+}
+
+func BenchmarkVerifyProbe(b *testing.B) {
+	kpA, _ := GenerateKeyPair()
+	kpB, _ := GenerateKeyPair()
+	cipher, _ := DeriveSession(kpA.Private, kpB.Public)
+	payload := []byte("WHPPprobe-benchmark")
+	tag := cipher.SignProbe(payload)
+
+	
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = cipher.VerifyProbe(payload, tag)
+	}
+}
+
 // TestTransport_IsEncrypted tests the IsEncrypted method.
 func TestTransport_IsEncrypted(t *testing.T) {
 	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")

@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -249,6 +250,47 @@ func TestRateLimiter_Cleanup(t *testing.T) {
 	// Records should be cleaned up.
 	stats = rl.Stats()
 	assert.Equal(t, 0, stats.TrackedIPs)
+}
+
+// ---------------------------------------------------------------------------
+// Benchmarks
+// ---------------------------------------------------------------------------
+
+func BenchmarkRateLimiter_IsBlocked(b *testing.B) {
+	rl := NewRateLimiter(RateLimitConfig{
+		MaxFailures:     5,
+		Window:          5 * time.Minute,
+		BlockDuration:   15 * time.Minute,
+		CleanupInterval: 1 * time.Hour,
+	})
+	defer rl.Close()
+
+	// Pre-populate some records.
+	for i := range 100 {
+		rl.RecordFailure(fmt.Sprintf("192.168.1.%d", i))
+	}
+
+	
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = rl.IsBlocked("192.168.1.50")
+	}
+}
+
+func BenchmarkRateLimiter_RecordFailure(b *testing.B) {
+	rl := NewRateLimiter(RateLimitConfig{
+		MaxFailures:     1000, // High threshold so we never block.
+		Window:          5 * time.Minute,
+		BlockDuration:   15 * time.Minute,
+		CleanupInterval: 1 * time.Hour,
+	})
+	defer rl.Close()
+
+	
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = rl.RecordFailure("192.168.1.1")
+	}
 }
 
 func TestRateLimiter_ContinuedFailuresExtendBlock(t *testing.T) {

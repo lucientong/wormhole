@@ -7,6 +7,7 @@ before:
   hooks:
     - go mod tidy
     - go generate ./...
+    - bash -c "cd web && npm ci && npm run build"
 
 builds:
   - id: wormhole
