@@ -270,7 +270,6 @@ func BenchmarkRateLimiter_IsBlocked(b *testing.B) {
 		rl.RecordFailure(fmt.Sprintf("192.168.1.%d", i))
 	}
 
-	
 	b.ReportAllocs()
 	for b.Loop() {
 		_ = rl.IsBlocked("192.168.1.50")
@@ -286,7 +285,6 @@ func BenchmarkRateLimiter_RecordFailure(b *testing.B) {
 	})
 	defer rl.Close()
 
-	
 	b.ReportAllocs()
 	for b.Loop() {
 		_ = rl.RecordFailure("192.168.1.1")

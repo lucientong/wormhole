@@ -30,14 +30,35 @@ Wormhole folds network space like a wormhole, allowing developers to expose loca
 
 ### Installation
 
+**Homebrew (macOS/Linux)**
+
 ```bash
-# With Go (recommended)
+brew install lucientong/tap/wormhole
+```
+
+**Docker**
+
+```bash
+# Run client
+docker run --rm -it lucientong/wormhole client --server tunnel.example.com:7000 --local 8080
+
+# Run server
+docker run -d -p 7000:7000 -p 80:80 lucientong/wormhole server --domain tunnel.example.com
+```
+
+**Go Install**
+
+```bash
 go install github.com/lucientong/wormhole/cmd/wormhole@latest
+```
 
-# Or download pre-built binaries from releases
-# https://github.com/lucientong/wormhole/releases
+**Pre-built Binaries**
 
-# Or build from source
+Download from [GitHub Releases](https://github.com/lucientong/wormhole/releases).
+
+**Build from Source**
+
+```bash
 git clone https://github.com/lucientong/wormhole.git
 cd wormhole && make build
 ```
@@ -109,7 +130,7 @@ docker run -d \
   -p 80:80 \
   -p 443:443 \
   -e WORMHOLE_DOMAIN=tunnel.example.com \
-  wormhole/wormhole:latest server
+  lucientong/wormhole server
 ```
 
 ### Systemd

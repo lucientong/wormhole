@@ -737,7 +737,6 @@ func BenchmarkSignProbe(b *testing.B) {
 	cipher, _ := DeriveSession(kpA.Private, kpB.Public)
 	payload := []byte("WHPPprobe-benchmark")
 
-	
 	b.ReportAllocs()
 	for b.Loop() {
 		_ = cipher.SignProbe(payload)
@@ -751,7 +750,6 @@ func BenchmarkVerifyProbe(b *testing.B) {
 	payload := []byte("WHPPprobe-benchmark")
 	tag := cipher.SignProbe(payload)
 
-	
 	b.ReportAllocs()
 	for b.Loop() {
 		_ = cipher.VerifyProbe(payload, tag)

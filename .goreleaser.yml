@@ -87,7 +87,7 @@ release:
     ### Docker
     
     ```bash
-    docker pull wormhole/wormhole:{{.Version}}
+    docker pull lucientong/wormhole:{{.Version}}
     ```
 
 brews:
@@ -95,6 +95,7 @@ brews:
     repository:
       owner: lucientong
       name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     folder: Formula
     homepage: https://github.com/lucientong/wormhole
     description: Zero-config tunnel tool to expose local services to the internet
