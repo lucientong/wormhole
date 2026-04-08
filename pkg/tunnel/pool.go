@@ -200,10 +200,18 @@ func (p *Pool) IsClosed() bool {
 
 // Stats returns the current pool statistics.
 func (p *Pool) Stats() PoolStats {
+	// Read atomic counters first (outside of lock to avoid race between
+	// atomic operations in other goroutines and the struct copy under RLock).
+	stats := PoolStats{
+		TotalConnections:    atomic.LoadInt64(&p.stats.TotalConnections),
+		TotalStreams:        atomic.LoadInt64(&p.stats.TotalStreams),
+		FailedConnections:   atomic.LoadInt64(&p.stats.FailedConnections),
+		HealthCheckFailures: atomic.LoadInt64(&p.stats.HealthCheckFailures),
+	}
+
 	p.connLock.RLock()
 	defer p.connLock.RUnlock()
 
-	stats := p.stats
 	stats.ActiveConnections = int64(len(p.conns))
 
 	idle := int64(0)

@@ -430,6 +430,205 @@ func TestStream_ReadTimeout(t *testing.T) {
 	assert.True(t, elapsed < 200*time.Millisecond, "Should not wait too long")
 }
 
+// TestStream_WriteTimeout verifies that Write returns ErrTimeout when
+// the send window is exhausted and the write deadline expires.
+func TestStream_WriteTimeout(t *testing.T) {
+	clientConn, serverConn := testConn()
+
+	cfg := DefaultMuxConfig()
+	cfg.KeepAliveInterval = 0
+	// Use a very small window so it drains quickly.
+	cfg.StreamConfig.WindowSize = 64
+	cfg.EnableFlowControl = true
+
+	serverMux, err := Server(serverConn, cfg)
+	require.NoError(t, err)
+	defer serverMux.Close()
+
+	clientMux, err := Client(clientConn, cfg)
+	require.NoError(t, err)
+	defer clientMux.Close()
+
+	clientStream, err := clientMux.OpenStream()
+	require.NoError(t, err)
+
+	// Accept on server side but do NOT read — this prevents window updates
+	// from being sent back, so the client's sendWindow will drain.
+	_, err = serverMux.AcceptStream()
+	require.NoError(t, err)
+
+	// Set a tight write deadline.
+	_ = clientStream.SetWriteDeadline(time.Now().Add(200 * time.Millisecond))
+
+	// Write enough data to exhaust the 64-byte send window, then block.
+	// The first writes will succeed (up to 64 bytes), the rest will block
+	// until the deadline fires.
+	largeData := make([]byte, 1024) // Much larger than 64-byte window.
+	_, writeErr := clientStream.Write(largeData)
+	require.Error(t, writeErr)
+	assert.ErrorIs(t, writeErr, ErrTimeout)
+}
+
+// TestStream_WriteClosed verifies that Write returns ErrStreamClosed
+// when the stream is closed (locally) while writing.
+func TestStream_WriteClosed(t *testing.T) {
+	clientConn, serverConn := testConn()
+
+	cfg := DefaultMuxConfig()
+	cfg.KeepAliveInterval = 0
+
+	serverMux, err := Server(serverConn, cfg)
+	require.NoError(t, err)
+	defer serverMux.Close()
+
+	clientMux, err := Client(clientConn, cfg)
+	require.NoError(t, err)
+	defer clientMux.Close()
+
+	clientStream, err := clientMux.OpenStream()
+	require.NoError(t, err)
+
+	_, err = serverMux.AcceptStream()
+	require.NoError(t, err)
+
+	// Close the stream then attempt to write.
+	_ = clientStream.Close()
+
+	_, writeErr := clientStream.Write([]byte("should fail"))
+	require.Error(t, writeErr)
+	assert.ErrorIs(t, writeErr, ErrStreamClosed)
+}
+
+// TestStream_WriteAfterMuxClose verifies that Write returns an error
+// when the underlying mux is closed mid-write.
+func TestStream_WriteAfterMuxClose(t *testing.T) {
+	clientConn, serverConn := testConn()
+
+	cfg := DefaultMuxConfig()
+	cfg.KeepAliveInterval = 0
+	cfg.StreamConfig.WindowSize = 64 // Small window.
+
+	serverMux, err := Server(serverConn, cfg)
+	require.NoError(t, err)
+	defer serverMux.Close()
+
+	clientMux, err := Client(clientConn, cfg)
+	require.NoError(t, err)
+
+	clientStream, err := clientMux.OpenStream()
+	require.NoError(t, err)
+
+	// Accept on server but don't read (exhaust window).
+	_, err = serverMux.AcceptStream()
+	require.NoError(t, err)
+
+	// Close mux while write is blocked.
+	writeDone := make(chan error, 1)
+	go func() {
+		data := make([]byte, 1024)
+		_, writeErr := clientStream.Write(data)
+		writeDone <- writeErr
+	}()
+
+	// Give write goroutine time to start and block on sendWindow.
+	time.Sleep(50 * time.Millisecond)
+
+	// Close the mux — this should unblock the write.
+	_ = clientMux.Close()
+
+	select {
+	case writeErr := <-writeDone:
+		require.Error(t, writeErr)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Write did not unblock after mux close")
+	}
+}
+
+// TestStream_ReceiveClose_AlreadyClosed verifies that receiveClose
+// is a no-op when the stream is already in streamStateClosed.
+func TestStream_ReceiveClose_AlreadyClosed(t *testing.T) {
+	mux := &Mux{
+		streams:    make(map[uint32]*Stream),
+		closeCh:    make(chan struct{}),
+		sendCh:     make(chan *Frame, 64),
+		config:     DefaultMuxConfig(),
+		codec:      NewFrameCodec(),
+		streamLock: sync.RWMutex{},
+	}
+	mux.streams[1] = nil
+
+	s := newStream(1, DefaultStreamConfig(), mux)
+
+	// Manually set state to Closed.
+	s.state = streamStateClosed
+
+	// receiveClose should be a no-op (not panic).
+	s.receiveClose()
+	assert.True(t, s.IsClosed())
+}
+
+// TestStream_ReceiveClose_FromLocalClose verifies that receiveClose
+// transitions from streamStateLocalClose to streamStateClosed.
+func TestStream_ReceiveClose_FromLocalClose(t *testing.T) {
+	mux := &Mux{
+		streams:    make(map[uint32]*Stream),
+		closeCh:    make(chan struct{}),
+		sendCh:     make(chan *Frame, 64),
+		config:     DefaultMuxConfig(),
+		codec:      NewFrameCodec(),
+		streamLock: sync.RWMutex{},
+	}
+	mux.streams[1] = nil
+
+	s := newStream(1, DefaultStreamConfig(), mux)
+
+	// Manually set state to LocalClose (as if we already called Close).
+	s.state = streamStateLocalClose
+
+	// receiveClose from remote should transition to Closed.
+	s.receiveClose()
+	assert.True(t, s.IsClosed())
+}
+
+// TestStream_ReceiveData_ClosedStream verifies that receiveData returns
+// ErrStreamClosed when the stream is already closed.
+func TestStream_ReceiveData_ClosedStream(t *testing.T) {
+	mux := &Mux{
+		streams:    make(map[uint32]*Stream),
+		closeCh:    make(chan struct{}),
+		sendCh:     make(chan *Frame, 64),
+		config:     DefaultMuxConfig(),
+		codec:      NewFrameCodec(),
+		streamLock: sync.RWMutex{},
+	}
+
+	s := newStream(1, DefaultStreamConfig(), mux)
+	s.state = streamStateClosed
+
+	err := s.receiveData([]byte("should fail"))
+	assert.ErrorIs(t, err, ErrStreamClosed)
+}
+
+// TestStream_ReceiveData_Empty verifies that empty data is a no-op.
+func TestStream_ReceiveData_Empty(t *testing.T) {
+	mux := &Mux{
+		streams:    make(map[uint32]*Stream),
+		closeCh:    make(chan struct{}),
+		sendCh:     make(chan *Frame, 64),
+		config:     DefaultMuxConfig(),
+		codec:      NewFrameCodec(),
+		streamLock: sync.RWMutex{},
+	}
+
+	s := newStream(1, DefaultStreamConfig(), mux)
+
+	err := s.receiveData(nil)
+	assert.NoError(t, err)
+
+	err = s.receiveData([]byte{})
+	assert.NoError(t, err)
+}
+
 func TestDefaultStreamConfig(t *testing.T) {
 	config := DefaultStreamConfig()
 

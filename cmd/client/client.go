@@ -563,14 +563,16 @@ func (c *Client) forwardHTTPWithInspect(ctx context.Context, stream *tunnel.Stre
 		// Local service error — send 502 back through the stream.
 		log.Error().Err(roundTripErr).Str("addr", localAddr).Msg("Local service request failed")
 
+		errBody := "Local service unavailable"
 		errResp := &http.Response{
-			StatusCode: http.StatusBadGateway,
-			Status:     "502 Bad Gateway",
-			Proto:      "HTTP/1.1",
-			ProtoMajor: 1,
-			ProtoMinor: 1,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(bytes.NewBufferString("Local service unavailable")),
+			StatusCode:    http.StatusBadGateway,
+			Status:        "502 Bad Gateway",
+			Proto:         "HTTP/1.1",
+			ProtoMajor:    1,
+			ProtoMinor:    1,
+			Header:        make(http.Header),
+			Body:          io.NopCloser(bytes.NewBufferString(errBody)),
+			ContentLength: int64(len(errBody)),
 		}
 		errResp.Header.Set("Content-Type", "text/plain")
 		_ = errResp.Write(stream)

@@ -954,6 +954,246 @@ func TestAdminAPI_RefreshToken_MissingToken(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
+func TestAdminAPI_Teams_MethodNotAllowed(t *testing.T) {
+	server := newTestServerWithAuth(t)
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	// DELETE is not a valid method for /teams.
+	req := httptest.NewRequest(http.MethodDelete, "/teams", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+
+	var resp ErrorResponse
+	err := json.Unmarshal(rec.Body.Bytes(), &resp)
+	require.NoError(t, err)
+	assert.Equal(t, "method not allowed", resp.Error)
+}
+
+func TestAdminAPI_Teams_Create_InvalidBody(t *testing.T) {
+	server := newTestServerWithAuth(t)
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	body := bytes.NewBufferString(`not valid json`)
+	req := httptest.NewRequest(http.MethodPost, "/teams", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+
+	var resp ErrorResponse
+	err := json.Unmarshal(rec.Body.Bytes(), &resp)
+	require.NoError(t, err)
+	assert.Equal(t, "invalid request body", resp.Error)
+}
+
+func TestAdminAPI_TeamByName_MethodNotAllowed(t *testing.T) {
+	server := newTestServerWithAuth(t)
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "/teams/someteam", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+
+	var resp ErrorResponse
+	err := json.Unmarshal(rec.Body.Bytes(), &resp)
+	require.NoError(t, err)
+	assert.Equal(t, "method not allowed", resp.Error)
+}
+
+func TestAdminAPI_TeamByName_EmptyName(t *testing.T) {
+	server := newTestServerWithAuth(t)
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	// /teams/ with empty name after trimming prefix.
+	req := httptest.NewRequest(http.MethodGet, "/teams/", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+
+	var resp ErrorResponse
+	err := json.Unmarshal(rec.Body.Bytes(), &resp)
+	require.NoError(t, err)
+	assert.Equal(t, "team name is required", resp.Error)
+}
+
+func TestAdminAPI_GenerateToken_MethodNotAllowed(t *testing.T) {
+	server := newTestServerWithAuth(t)
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	req := httptest.NewRequest(http.MethodGet, "/tokens/generate", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+
+	var resp ErrorResponse
+	err := json.Unmarshal(rec.Body.Bytes(), &resp)
+	require.NoError(t, err)
+	assert.Equal(t, "method not allowed", resp.Error)
+}
+
+func TestAdminAPI_GenerateToken_InvalidBody(t *testing.T) {
+	server := newTestServerWithAuth(t)
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	body := bytes.NewBufferString(`invalid json`)
+	req := httptest.NewRequest(http.MethodPost, "/tokens/generate", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+
+	var resp ErrorResponse
+	err := json.Unmarshal(rec.Body.Bytes(), &resp)
+	require.NoError(t, err)
+	assert.Equal(t, "invalid request body", resp.Error)
+}
+
+func TestAdminAPI_GenerateToken_AllRoles(t *testing.T) {
+	server := newTestServerWithAuth(t)
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	roles := []struct {
+		role     string
+		expected auth.Role
+	}{
+		{"admin", auth.RoleAdmin},
+		{"viewer", auth.RoleViewer},
+	}
+
+	for _, tt := range roles {
+		t.Run(tt.role, func(t *testing.T) {
+			body := bytes.NewBufferString(`{"team":"role-team","role":"` + tt.role + `"}`)
+			req := httptest.NewRequest(http.MethodPost, "/tokens/generate", body)
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+
+			handler.ServeHTTP(rec, req)
+
+			assert.Equal(t, http.StatusOK, rec.Code)
+
+			var resp GenerateTokenResponse
+			err := json.Unmarshal(rec.Body.Bytes(), &resp)
+			require.NoError(t, err)
+
+			claims, err := server.authenticator.ValidateToken(resp.Token)
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, claims.Role)
+		})
+	}
+}
+
+func TestAdminAPI_RevokeToken_MethodNotAllowed(t *testing.T) {
+	server := newTestServerWithAuth(t)
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	req := httptest.NewRequest(http.MethodGet, "/tokens/revoke", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+}
+
+func TestAdminAPI_RevokeToken_InvalidBody(t *testing.T) {
+	server := newTestServerWithAuth(t)
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	body := bytes.NewBufferString(`bad json`)
+	req := httptest.NewRequest(http.MethodPost, "/tokens/revoke", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+
+	var resp ErrorResponse
+	err := json.Unmarshal(rec.Body.Bytes(), &resp)
+	require.NoError(t, err)
+	assert.Equal(t, "invalid request body", resp.Error)
+}
+
+func TestAdminAPI_RefreshToken_MethodNotAllowed(t *testing.T) {
+	server := newTestServerWithAuth(t)
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	req := httptest.NewRequest(http.MethodGet, "/tokens/refresh", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+}
+
+func TestAdminAPI_RefreshToken_InvalidBody(t *testing.T) {
+	server := newTestServerWithAuth(t)
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	body := bytes.NewBufferString(`bad json`)
+	req := httptest.NewRequest(http.MethodPost, "/tokens/refresh", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+
+	var resp ErrorResponse
+	err := json.Unmarshal(rec.Body.Bytes(), &resp)
+	require.NoError(t, err)
+	assert.Equal(t, "invalid request body", resp.Error)
+}
+
+func TestAdminAPI_RefreshToken_InvalidDuration(t *testing.T) {
+	server := newTestServerWithAuth(t)
+
+	// Generate a token to refresh.
+	token, err := server.authenticator.GenerateTeamToken("team1", auth.RoleMember)
+	require.NoError(t, err)
+
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	body := bytes.NewBufferString(`{"token":"` + token + `","extend_by":"not-a-duration"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tokens/refresh", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+
+	var resp ErrorResponse
+	err = json.Unmarshal(rec.Body.Bytes(), &resp)
+	require.NoError(t, err)
+	assert.Equal(t, "invalid extend_by duration", resp.Error)
+}
+
 func TestAdminAPI_NoAuthenticator(t *testing.T) {
 	server := newTestServer()
 	// server.authenticator is nil.

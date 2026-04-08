@@ -513,6 +513,36 @@ func TestParsePing(t *testing.T) {
 	})
 }
 
+func TestParsePong(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		f := NewPongFrame(54321)
+		pongID, err := ParsePong(f)
+		require.NoError(t, err)
+		assert.Equal(t, uint32(54321), pongID)
+	})
+
+	t.Run("wrong type", func(t *testing.T) {
+		f := NewDataFrame(0, nil)
+		_, err := ParsePong(f)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "expected PONG frame")
+	})
+
+	t.Run("short payload", func(t *testing.T) {
+		f := NewFrame(FramePong, 0, []byte{1, 2})
+		_, err := ParsePong(f)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "PONG payload too short")
+	})
+
+	t.Run("nil payload", func(t *testing.T) {
+		f := NewFrame(FramePong, 0, nil)
+		_, err := ParsePong(f)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "PONG payload too short")
+	})
+}
+
 func TestParseError(t *testing.T) {
 	t.Run("valid", func(t *testing.T) {
 		f := NewErrorFrame(1, 404, "not found")

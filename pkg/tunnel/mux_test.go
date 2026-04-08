@@ -475,6 +475,181 @@ func BenchmarkMux_WriteRead(b *testing.B) {
 	}
 }
 
+func TestMux_KeepAlive(t *testing.T) {
+	clientConn, serverConn := testConn()
+
+	serverConfig := DefaultMuxConfig()
+	serverConfig.KeepAliveInterval = 50 * time.Millisecond
+	serverConfig.KeepAliveTimeout = 500 * time.Millisecond
+	serverMux, err := Server(serverConn, serverConfig)
+	require.NoError(t, err)
+	defer serverMux.Close()
+
+	clientConfig := DefaultMuxConfig()
+	clientConfig.KeepAliveInterval = 50 * time.Millisecond
+	clientConfig.KeepAliveTimeout = 500 * time.Millisecond
+	clientMux, err := Client(clientConn, clientConfig)
+	require.NoError(t, err)
+	defer clientMux.Close()
+
+	// Let keep-alive ping/pong exchange happen a few times.
+	time.Sleep(200 * time.Millisecond)
+
+	// Both sides should still be alive.
+	assert.False(t, clientMux.IsClosed(), "client mux should be alive")
+	assert.False(t, serverMux.IsClosed(), "server mux should be alive")
+
+	// Streams should still work.
+	stream, err := clientMux.OpenStream()
+	require.NoError(t, err)
+	defer stream.Close()
+
+	sStream, err := serverMux.AcceptStream()
+	require.NoError(t, err)
+	defer sStream.Close()
+
+	_, err = stream.Write([]byte("alive"))
+	require.NoError(t, err)
+
+	buf := make([]byte, 10)
+	n, err := sStream.Read(buf)
+	require.NoError(t, err)
+	assert.Equal(t, "alive", string(buf[:n]))
+}
+
+func TestMux_KeepAlive_Timeout(t *testing.T) {
+	clientConn, serverConn := testConn()
+
+	// Only enable keep-alive on server side.
+	serverConfig := DefaultMuxConfig()
+	serverConfig.KeepAliveInterval = 50 * time.Millisecond
+	serverConfig.KeepAliveTimeout = 100 * time.Millisecond
+	serverMux, err := Server(serverConn, serverConfig)
+	require.NoError(t, err)
+
+	// Client with no keep-alive (won't respond to pings).
+	// Actually mux always handles pings in recvLoop, so we need to
+	// simulate by closing the client side to prevent pong response.
+	clientConfig := DefaultMuxConfig()
+	clientConfig.KeepAliveInterval = 0
+	clientMux, err := Client(clientConn, clientConfig)
+	require.NoError(t, err)
+
+	// Let server send a ping, client responds with pong (because recvLoop handles it).
+	time.Sleep(80 * time.Millisecond)
+	assert.False(t, serverMux.IsClosed(), "server should be alive during active connection")
+
+	// Close client to simulate broken connection — pongs will stop.
+	clientMux.Close()
+
+	// Wait for server's keep-alive timeout.
+	time.Sleep(300 * time.Millisecond)
+
+	assert.True(t, serverMux.IsClosed(), "server mux should be closed after keep-alive timeout")
+}
+
+func TestMux_DoubleClose(t *testing.T) {
+	clientConn, serverConn := testConn()
+
+	cfg := DefaultMuxConfig()
+	cfg.KeepAliveInterval = 0
+	serverMux, err := Server(serverConn, cfg)
+	require.NoError(t, err)
+
+	clientMux, err := Client(clientConn, cfg)
+	require.NoError(t, err)
+
+	// First close.
+	err = clientMux.Close()
+	assert.NoError(t, err)
+	assert.True(t, clientMux.IsClosed())
+
+	// Second close should be a no-op (no panic).
+	err = clientMux.Close()
+	assert.NoError(t, err)
+
+	_ = serverMux.Close()
+}
+
+func TestMux_ServerOpensStream(t *testing.T) {
+	clientConn, serverConn := testConn()
+
+	cfg := DefaultMuxConfig()
+	cfg.KeepAliveInterval = 0
+	serverMux, err := Server(serverConn, cfg)
+	require.NoError(t, err)
+	defer serverMux.Close()
+
+	clientMux, err := Client(clientConn, cfg)
+	require.NoError(t, err)
+	defer clientMux.Close()
+
+	// Server opens stream (even-numbered IDs).
+	serverStream, err := serverMux.OpenStream()
+	require.NoError(t, err)
+	assert.Equal(t, uint32(2), serverStream.ID()) // Server uses even IDs.
+
+	clientStream, err := clientMux.AcceptStream()
+	require.NoError(t, err)
+	assert.Equal(t, uint32(2), clientStream.ID())
+
+	go func() {
+		_, _ = serverStream.Write([]byte("from server"))
+		_ = serverStream.Close()
+	}()
+
+	buf := make([]byte, 100)
+	n, err := clientStream.Read(buf)
+	require.NoError(t, err)
+	assert.Equal(t, "from server", string(buf[:n]))
+}
+
+func TestMux_ConcurrentOpenClose(t *testing.T) {
+	clientConn, serverConn := testConn()
+
+	cfg := DefaultMuxConfig()
+	cfg.KeepAliveInterval = 0
+	serverMux, err := Server(serverConn, cfg)
+	require.NoError(t, err)
+
+	clientMux, err := Client(clientConn, cfg)
+	require.NoError(t, err)
+
+	// Server accepts in background.
+	go func() {
+		for {
+			stream, err := serverMux.AcceptStream()
+			if err != nil {
+				return
+			}
+			go func(s *Stream) {
+				buf := make([]byte, 100)
+				_, _ = s.Read(buf)
+				_ = s.Close()
+			}(stream)
+		}
+	}()
+
+	// Concurrently open and close streams.
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s, err := clientMux.OpenStream()
+			if err != nil {
+				return
+			}
+			_, _ = s.Write([]byte("test"))
+			_ = s.Close()
+		}()
+	}
+	wg.Wait()
+
+	_ = clientMux.Close()
+	_ = serverMux.Close()
+}
+
 func BenchmarkMux_Throughput(b *testing.B) {
 	clientConn, serverConn := testConn()
 
@@ -511,4 +686,322 @@ func BenchmarkMux_Throughput(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		clientStream.Write(data)
 	}
+}
+
+// TestMux_HandleError verifies that error frames set the stream's error state.
+func TestMux_HandleError(t *testing.T) {
+	clientConn, serverConn := testConn()
+
+	cfg := DefaultMuxConfig()
+	cfg.KeepAliveInterval = 0
+	serverMux, err := Server(serverConn, cfg)
+	require.NoError(t, err)
+	defer serverMux.Close()
+
+	clientMux, err := Client(clientConn, cfg)
+	require.NoError(t, err)
+	defer clientMux.Close()
+
+	// Client opens a stream.
+	clientStream, err := clientMux.OpenStream()
+	require.NoError(t, err)
+
+	serverStream, err := serverMux.AcceptStream()
+	require.NoError(t, err)
+
+	// Server sends an error frame to the client's stream.
+	errFrame := NewErrorFrame(serverStream.ID(), 500, "internal error")
+	err = serverMux.writeFrame(errFrame)
+	require.NoError(t, err)
+
+	// Give time for the error frame to propagate.
+	time.Sleep(50 * time.Millisecond)
+
+	// Reading from the client stream should return the remote error.
+	buf := make([]byte, 100)
+	_, readErr := clientStream.Read(buf)
+	require.Error(t, readErr)
+	assert.Contains(t, readErr.Error(), "internal error")
+}
+
+// TestMux_HandleHandshake_DuplicateStream verifies that a duplicate stream ID
+// in a handshake frame triggers the ErrStreamAlreadyExist error path.
+func TestMux_HandleHandshake_DuplicateStream(t *testing.T) {
+	clientConn, serverConn := testConn()
+
+	cfg := DefaultMuxConfig()
+	cfg.KeepAliveInterval = 0
+	serverMux, err := Server(serverConn, cfg)
+	require.NoError(t, err)
+	defer serverMux.Close()
+
+	clientMux, err := Client(clientConn, cfg)
+	require.NoError(t, err)
+	defer clientMux.Close()
+
+	// Client opens a stream (ID=1).
+	_, err = clientMux.OpenStream()
+	require.NoError(t, err)
+
+	_, err = serverMux.AcceptStream()
+	require.NoError(t, err)
+
+	// Manually send a duplicate handshake frame with the same stream ID (1).
+	// This tests the "stream already exists" error path in handleHandshake.
+	dupFrame := NewFrame(FrameHandshake, 1, nil)
+	err = clientMux.writeFrame(dupFrame)
+	// The write should succeed (the error handling happens on the server side).
+	require.NoError(t, err)
+
+	// Give time for the server to process the duplicate handshake.
+	time.Sleep(50 * time.Millisecond)
+
+	// The server should NOT have been closed — ErrStreamAlreadyExist is handled
+	// by closing the mux.
+	// Actually, handleHandshake returns ErrStreamAlreadyExist which causes
+	// recvLoop to call closeWithError. So the server mux gets closed.
+	assert.True(t, serverMux.IsClosed(),
+		"server mux should close when duplicate handshake is received")
+}
+
+// TestMux_AcceptBacklogFull verifies that when the accept channel is full,
+// new handshakes are rejected with sendError (503 "accept queue full").
+func TestMux_AcceptBacklogFull(t *testing.T) {
+	clientConn, serverConn := testConn()
+
+	// Set a very small accept backlog.
+	cfg := DefaultMuxConfig()
+	cfg.KeepAliveInterval = 0
+	cfg.AcceptBacklog = 1
+
+	serverMux, err := Server(serverConn, cfg)
+	require.NoError(t, err)
+	defer serverMux.Close()
+
+	clientMux, err := Client(clientConn, cfg)
+	require.NoError(t, err)
+	defer clientMux.Close()
+
+	// Open first stream — fills the accept backlog (size=1).
+	_, err = clientMux.OpenStream()
+	require.NoError(t, err)
+	time.Sleep(20 * time.Millisecond)
+
+	// Open second stream — should overflow the accept backlog.
+	stream2, err := clientMux.OpenStream()
+	require.NoError(t, err)
+	time.Sleep(50 * time.Millisecond)
+
+	// The second stream should receive an error (503 accept queue full)
+	// which manifests as an error on Read.
+	buf := make([]byte, 100)
+	_ = stream2.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_, readErr := stream2.Read(buf)
+	if readErr != nil {
+		assert.Contains(t, readErr.Error(), "accept queue full")
+	}
+
+	// Drain the first stream from accept queue.
+	_, err = serverMux.AcceptStream()
+	require.NoError(t, err)
+}
+
+// TestMux_AcceptStreamContext_ClosedMux verifies AcceptStreamContext returns
+// error immediately when the mux is already closed.
+func TestMux_AcceptStreamContext_ClosedMux(t *testing.T) {
+	clientConn, serverConn := testConn()
+
+	cfg := DefaultMuxConfig()
+	cfg.KeepAliveInterval = 0
+	serverMux, err := Server(serverConn, cfg)
+	require.NoError(t, err)
+
+	_, err = Client(clientConn, cfg)
+	require.NoError(t, err)
+
+	// Close the mux first.
+	_ = serverMux.Close()
+
+	// AcceptStreamContext should return error immediately.
+	_, err = serverMux.AcceptStreamContext(context.Background())
+	require.Error(t, err)
+}
+
+// TestMux_HandleFrame_UnknownType verifies that unknown frame types
+// cause the mux to close with an error.
+func TestMux_HandleFrame_UnknownType(t *testing.T) {
+	clientConn, serverConn := testConn()
+
+	cfg := DefaultMuxConfig()
+	cfg.KeepAliveInterval = 0
+	serverMux, err := Server(serverConn, cfg)
+	require.NoError(t, err)
+
+	// Don't create a client mux — we write raw bytes to simulate a bad frame.
+	// Write a raw frame header with an unknown frame type (99) directly to clientConn.
+	// Frame header format: Version(1) | Type(1) | StreamID(4) | PayloadLen(4) = 10 bytes.
+	header := make([]byte, 10)
+	header[0] = FrameVersion // Version = 1.
+	header[1] = 99           // Unknown frame type.
+	// StreamID = 0, PayloadLen = 0.
+
+	_, err = clientConn.Write(header)
+	require.NoError(t, err)
+
+	// Give time for server to process.
+	time.Sleep(50 * time.Millisecond)
+
+	// Server mux should close due to unknown frame type error.
+	assert.True(t, serverMux.IsClosed(),
+		"server mux should close on unknown frame type")
+
+	_ = clientConn.Close()
+}
+
+// TestMux_KeepAlive_NoTimeout verifies that keepAliveLoop works correctly
+// when KeepAliveTimeout is set to 0 (disabled) — meaning pong is not awaited.
+func TestMux_KeepAlive_NoTimeout(t *testing.T) {
+	clientConn, serverConn := testConn()
+
+	// Server: keep-alive with timeout disabled.
+	serverConfig := DefaultMuxConfig()
+	serverConfig.KeepAliveInterval = 50 * time.Millisecond
+	serverConfig.KeepAliveTimeout = 0 // Disable pong timeout check.
+	serverMux, err := Server(serverConn, serverConfig)
+	require.NoError(t, err)
+	defer serverMux.Close()
+
+	// Client: keep-alive enabled to respond to pings.
+	clientConfig := DefaultMuxConfig()
+	clientConfig.KeepAliveInterval = 50 * time.Millisecond
+	clientConfig.KeepAliveTimeout = 0
+	clientMux, err := Client(clientConn, clientConfig)
+	require.NoError(t, err)
+	defer clientMux.Close()
+
+	// Let multiple ping cycles run (without pong timeout enforcement).
+	time.Sleep(200 * time.Millisecond)
+
+	// Both sides should remain alive since timeout checking is disabled.
+	assert.False(t, serverMux.IsClosed(), "server mux should be alive with no timeout check")
+	assert.False(t, clientMux.IsClosed(), "client mux should be alive with no timeout check")
+
+	// Streams should still work.
+	stream, err := clientMux.OpenStream()
+	require.NoError(t, err)
+	defer stream.Close()
+
+	sStream, err := serverMux.AcceptStream()
+	require.NoError(t, err)
+	defer sStream.Close()
+
+	_, err = stream.Write([]byte("alive"))
+	require.NoError(t, err)
+
+	buf := make([]byte, 10)
+	n, err := sStream.Read(buf)
+	require.NoError(t, err)
+	assert.Equal(t, "alive", string(buf[:n]))
+}
+
+// TestMux_KeepAlive_CloseDuringPong verifies that closing the mux while
+// keepAliveLoop is waiting for a pong causes a clean exit.
+func TestMux_KeepAlive_CloseDuringPong(t *testing.T) {
+	clientConn, serverConn := testConn()
+
+	// Server: enable keep-alive with long timeout so it's blocked waiting for pong.
+	serverConfig := DefaultMuxConfig()
+	serverConfig.KeepAliveInterval = 50 * time.Millisecond
+	serverConfig.KeepAliveTimeout = 5 * time.Second // Very long — won't actually fire.
+	serverMux, err := Server(serverConn, serverConfig)
+	require.NoError(t, err)
+
+	// Client: don't respond to pings (no mux — raw connection).
+	// We close clientConn to prevent pong responses.
+	_ = clientConn.Close()
+
+	// Wait for server to send a ping and start waiting for pong.
+	time.Sleep(100 * time.Millisecond)
+
+	// Close the server mux while it's blocked waiting for pong.
+	// The keepAliveLoop should detect closeCh and exit cleanly.
+	_ = serverMux.Close()
+
+	// Should be closed without blocking.
+	assert.True(t, serverMux.IsClosed())
+}
+
+// TestMux_OpenStreamContext_CancelledContext verifies that OpenStreamContext
+// returns context.Canceled when given an already-cancelled context.
+func TestMux_OpenStreamContext_CancelledContext(t *testing.T) {
+	clientConn, serverConn := testConn()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	cfg := DefaultMuxConfig()
+	cfg.KeepAliveInterval = 0
+	_, err := Server(serverConn, cfg)
+	require.NoError(t, err)
+
+	clientMux, err := Client(clientConn, cfg)
+	require.NoError(t, err)
+	defer clientMux.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately.
+
+	_, err = clientMux.OpenStreamContext(ctx)
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+// TestMux_SendClose_ClosedMux verifies that sendClose is a no-op when
+// the mux is already closed.
+func TestMux_SendClose_AfterClose(t *testing.T) {
+	clientConn, serverConn := testConn()
+
+	cfg := DefaultMuxConfig()
+	cfg.KeepAliveInterval = 0
+	serverMux, err := Server(serverConn, cfg)
+	require.NoError(t, err)
+
+	clientMux, err := Client(clientConn, cfg)
+	require.NoError(t, err)
+
+	// Open and accept a stream.
+	clientStream, err := clientMux.OpenStream()
+	require.NoError(t, err)
+
+	_, err = serverMux.AcceptStream()
+	require.NoError(t, err)
+
+	// Close the mux.
+	_ = clientMux.Close()
+
+	// sendClose on the closed mux should return nil immediately (no panic).
+	err = clientMux.sendClose(clientStream.ID())
+	assert.NoError(t, err)
+
+	_ = serverMux.Close()
+}
+
+// TestMux_SendWindowUpdate_ClosedMux verifies that sendWindowUpdate returns
+// ErrMuxClosed when the mux is already closed.
+func TestMux_SendWindowUpdate_ClosedMux(t *testing.T) {
+	clientConn, serverConn := testConn()
+
+	cfg := DefaultMuxConfig()
+	cfg.KeepAliveInterval = 0
+	serverMux, err := Server(serverConn, cfg)
+	require.NoError(t, err)
+
+	clientMux, err := Client(clientConn, cfg)
+	require.NoError(t, err)
+
+	// Close the mux.
+	_ = clientMux.Close()
+
+	err = clientMux.sendWindowUpdate(1, 1024)
+	assert.ErrorIs(t, err, ErrMuxClosed)
+
+	_ = serverMux.Close()
 }

@@ -495,7 +495,12 @@ func (m *Mux) sendData(streamID uint32, data []byte) error {
 		return ErrMuxClosed
 	}
 
-	frame := NewDataFrame(streamID, data)
+	// Copy the payload because the caller (e.g., io.CopyBuffer) may
+	// reuse the underlying buffer before the sendLoop writes the frame.
+	payload := make([]byte, len(data))
+	copy(payload, data)
+
+	frame := NewDataFrame(streamID, payload)
 	select {
 	case m.sendCh <- frame:
 		return nil
