@@ -12,6 +12,7 @@ Wormhole folds network space like a wormhole, allowing developers to expose loca
 [![Go Version](https://img.shields.io/github/go-mod/go-version/lucientong/wormhole)](go.mod)
 [![License](https://img.shields.io/github/license/lucientong/wormhole)](LICENSE)
 [![Docker Pulls](https://img.shields.io/docker/pulls/lucientong/wormhole)](https://hub.docker.com/r/lucientong/wormhole)
+[![GitHub Downloads](https://img.shields.io/github/downloads/lucientong/wormhole/total)](https://github.com/lucientong/wormhole/releases)
 
 **[中文文档](README_zh.md)**
 

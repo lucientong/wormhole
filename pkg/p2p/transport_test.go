@@ -243,3 +243,33 @@ func TestTransportConfig_Defaults(t *testing.T) {
 	assert.Equal(t, 5*time.Second, config.AckTimeout)
 	assert.Equal(t, 256, config.RecvBufferSize)
 }
+
+func TestTransport_LocalAddr(t *testing.T) {
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer conn.Close()
+
+	peerAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 65000}
+	config := DefaultTransportConfig()
+	tr := NewTransport(conn, peerAddr, config, nil)
+	defer tr.Close()
+
+	localAddr := tr.LocalAddr()
+	assert.NotNil(t, localAddr)
+	assert.Contains(t, localAddr.String(), "127.0.0.1:")
+}
+
+func TestTransport_RemoteAddr(t *testing.T) {
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer conn.Close()
+
+	peerAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 65000}
+	config := DefaultTransportConfig()
+	tr := NewTransport(conn, peerAddr, config, nil)
+	defer tr.Close()
+
+	remoteAddr := tr.RemoteAddr()
+	assert.NotNil(t, remoteAddr)
+	assert.Equal(t, "127.0.0.1:65000", remoteAddr.String())
+}

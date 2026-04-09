@@ -335,14 +335,27 @@ func (c *Client) registerTunnel(ctx context.Context) error {
 	fmt.Printf("\n")
 	fmt.Printf("  🕳️  Wormhole is ready!\n")
 	fmt.Printf("\n")
-	fmt.Printf("  Forwarding: %s -> http://%s:%d\n", resp.PublicURL, c.config.LocalHost, c.config.LocalPort)
-	fmt.Printf("  Version:    %s\n", version.Short())
-	if c.p2pManager != nil && c.p2pManager.NATInfo() != nil {
+	fmt.Printf("  Forwarding:   %s -> http://%s:%d\n", resp.PublicURL, c.config.LocalHost, c.config.LocalPort)
+	fmt.Printf("  Version:      %s\n", version.Short())
+	switch {
+	case c.p2pManager != nil && c.p2pManager.NATInfo() != nil:
 		info := c.p2pManager.NATInfo()
-		fmt.Printf("  NAT Type:   %s\n", info.Type)
-		fmt.Printf("  Public:     %s\n", info.PublicAddr)
-		fmt.Printf("  P2P Mode:   %s\n", c.p2pManager.Mode())
+		traversable := info.Type.IsTraversable()
+		fmt.Printf("  NAT Type:     %s\n", info.Type)
+		fmt.Printf("  Public Addr:  %s\n", info.PublicAddr)
+		if traversable {
+			fmt.Printf("  Traversable:  ✅ Yes (P2P direct connections possible)\n")
+		} else {
+			fmt.Printf("  Traversable:  ⚠️  Limited (P2P only with non-Symmetric peers)\n")
+		}
+		fmt.Printf("  P2P Mode:     %s\n", c.p2pManager.Mode())
+	case c.config.P2PEnabled:
+		fmt.Printf("  P2P:          ⚠️  NAT discovery failed, using relay mode\n")
+	default:
+		fmt.Printf("  P2P:          Disabled\n")
 	}
+	fmt.Printf("\n")
+	fmt.Printf("  Tip: Run 'wormhole nat-check' for detailed NAT diagnostics\n")
 	fmt.Printf("\n")
 	fmt.Printf("  Press Ctrl+C to stop\n")
 	fmt.Printf("\n")
