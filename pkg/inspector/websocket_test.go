@@ -64,8 +64,9 @@ func TestWSHub_HandleWebSocket(t *testing.T) {
 	// Connect a WebSocket client.
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
 	dialer := websocket.Dialer{}
-	conn, _, err := dialer.Dial(url, nil)
+	conn, resp, err := dialer.Dial(url, nil)
 	require.NoError(t, err)
+	defer resp.Body.Close()
 	defer conn.Close()
 
 	// Give time for the connection to be registered.
@@ -97,9 +98,10 @@ func TestWSHub_HandleWebSocket_MultipleClients(t *testing.T) {
 
 	// Connect 3 clients.
 	var conns []*websocket.Conn
-	for i := 0; i < 3; i++ {
-		conn, _, err := dialer.Dial(url, nil)
+	for range 3 {
+		conn, resp, err := dialer.Dial(url, nil)
 		require.NoError(t, err)
+		resp.Body.Close()
 		conns = append(conns, conn)
 	}
 
@@ -132,8 +134,9 @@ func TestWSHub_HandleMessage_Ping(t *testing.T) {
 	defer server.Close()
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
-	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	conn, resp, err := websocket.DefaultDialer.Dial(url, nil)
 	require.NoError(t, err)
+	defer resp.Body.Close()
 	defer conn.Close()
 
 	// Read initial stats message.
@@ -167,8 +170,9 @@ func TestWSHub_HandleMessage_Subscribe(t *testing.T) {
 	defer server.Close()
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
-	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	conn, resp, err := websocket.DefaultDialer.Dial(url, nil)
 	require.NoError(t, err)
+	defer resp.Body.Close()
 	defer conn.Close()
 
 	// Read initial stats message.
@@ -214,8 +218,9 @@ func TestWSHub_HandleMessage_Clear(t *testing.T) {
 	defer server.Close()
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
-	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	conn, resp, err := websocket.DefaultDialer.Dial(url, nil)
 	require.NoError(t, err)
+	defer resp.Body.Close()
 	defer conn.Close()
 
 	// Read initial stats.
@@ -251,8 +256,9 @@ func TestWSHub_HandleMessage_Unknown(t *testing.T) {
 	defer server.Close()
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
-	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	conn, resp, err := websocket.DefaultDialer.Dial(url, nil)
 	require.NoError(t, err)
+	defer resp.Body.Close()
 	defer conn.Close()
 
 	// Read initial stats.
@@ -285,8 +291,9 @@ func TestWSHub_HandleMessage_InvalidJSON(t *testing.T) {
 	defer server.Close()
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
-	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	conn, resp, err := websocket.DefaultDialer.Dial(url, nil)
 	require.NoError(t, err)
+	defer resp.Body.Close()
 	defer conn.Close()
 
 	// Read initial stats.
@@ -319,12 +326,14 @@ func TestWSHub_Broadcast(t *testing.T) {
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
 
 	// Connect two clients.
-	conn1, _, err := websocket.DefaultDialer.Dial(url, nil)
+	conn1, resp1, err := websocket.DefaultDialer.Dial(url, nil)
 	require.NoError(t, err)
+	defer resp1.Body.Close()
 	defer conn1.Close()
 
-	conn2, _, err := websocket.DefaultDialer.Dial(url, nil)
+	conn2, resp2, err := websocket.DefaultDialer.Dial(url, nil)
 	require.NoError(t, err)
+	defer resp2.Body.Close()
 	defer conn2.Close()
 
 	// Read initial stats for both.
@@ -360,8 +369,9 @@ func TestWSHub_RemoveClient(t *testing.T) {
 	defer server.Close()
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
-	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	conn, resp, err := websocket.DefaultDialer.Dial(url, nil)
 	require.NoError(t, err)
+	resp.Body.Close()
 
 	time.Sleep(50 * time.Millisecond)
 	assert.Equal(t, 1, hub.ClientCount())
