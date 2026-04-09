@@ -1296,16 +1296,16 @@ func TestClient_DialAndProxy_Success(t *testing.T) {
 
 	go func() {
 		for {
-			conn, err := ln.Accept()
-			if err != nil {
+			conn, acceptErr := ln.Accept()
+			if acceptErr != nil {
 				return
 			}
 			go func(c net.Conn) {
 				defer c.Close()
 				// Echo: read data and write it back.
 				buf := make([]byte, 4096)
-				n, err := c.Read(buf)
-				if err != nil {
+				n, readErr := c.Read(buf)
+				if readErr != nil {
 					return
 				}
 				_, _ = c.Write(buf[:n])
@@ -1373,15 +1373,15 @@ func TestClient_ForwardRawTCPWithReader(t *testing.T) {
 
 	go func() {
 		for {
-			conn, err := ln.Accept()
-			if err != nil {
+			conn, acceptErr := ln.Accept()
+			if acceptErr != nil {
 				return
 			}
 			go func(c net.Conn) {
 				defer c.Close()
 				buf := make([]byte, 4096)
-				n, err := c.Read(buf)
-				if err != nil {
+				n, readErr := c.Read(buf)
+				if readErr != nil {
 					return
 				}
 				_, _ = c.Write([]byte("echo:" + string(buf[:n])))
@@ -1652,8 +1652,8 @@ func TestClient_HandleP2PData_ValidStreamRequest(t *testing.T) {
 
 	go func() {
 		for {
-			conn, err := ln.Accept()
-			if err != nil {
+			conn, acceptErr := ln.Accept()
+			if acceptErr != nil {
 				return
 			}
 			conn.Close()
@@ -1703,8 +1703,8 @@ func TestClient_ForwardP2PDataToLocal_Success(t *testing.T) {
 
 	go func() {
 		for {
-			conn, err := ln.Accept()
-			if err != nil {
+			conn, acceptErr := ln.Accept()
+			if acceptErr != nil {
 				return
 			}
 			go func(c net.Conn) {
@@ -1757,8 +1757,8 @@ func TestClient_ForwardP2PRequestToLocal_Success(t *testing.T) {
 
 	go func() {
 		for {
-			conn, err := ln.Accept()
-			if err != nil {
+			conn, acceptErr := ln.Accept()
+			if acceptErr != nil {
 				return
 			}
 			conn.Close()

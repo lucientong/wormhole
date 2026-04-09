@@ -232,8 +232,8 @@ type fakeFile struct {
 }
 
 func (f *fakeFile) Stat() (fs.FileInfo, error) { return f.info, nil }
-func (f *fakeFile) Read(p []byte) (int, error)  { return f.reader.Read(p) }
-func (f *fakeFile) Close() error                { return nil }
+func (f *fakeFile) Read(p []byte) (int, error) { return f.reader.Read(p) }
+func (f *fakeFile) Close() error               { return nil }
 
 // seekableFile implements fs.File AND io.ReadSeeker (seekable).
 type seekableFile struct {
@@ -241,8 +241,8 @@ type seekableFile struct {
 	reader *bytes.Reader
 }
 
-func (f *seekableFile) Stat() (fs.FileInfo, error)              { return f.info, nil }
-func (f *seekableFile) Read(p []byte) (int, error)               { return f.reader.Read(p) }
+func (f *seekableFile) Stat() (fs.FileInfo, error) { return f.info, nil }
+func (f *seekableFile) Read(p []byte) (int, error) { return f.reader.Read(p) }
 func (f *seekableFile) Seek(offset int64, whence int) (int64, error) {
 	return f.reader.Seek(offset, whence)
 }

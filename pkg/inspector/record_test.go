@@ -52,7 +52,7 @@ func TestRecord_SetRequestBody_Truncated(t *testing.T) {
 	body := []byte("0123456789ABCDEF")
 	record.SetRequestBody(body, 10)
 
-	assert.Equal(t, "0123456789", record.Body) // Truncated.
+	assert.Equal(t, "0123456789", record.Body)  // Truncated.
 	assert.Equal(t, int64(16), record.BodySize) // Original size.
 }
 
