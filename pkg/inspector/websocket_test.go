@@ -97,7 +97,7 @@ func TestWSHub_HandleWebSocket_MultipleClients(t *testing.T) {
 	dialer := websocket.Dialer{}
 
 	// Connect 3 clients.
-	var conns []*websocket.Conn
+	conns := make([]*websocket.Conn, 0, 3)
 	for range 3 {
 		conn, resp, err := dialer.Dial(url, nil)
 		require.NoError(t, err)

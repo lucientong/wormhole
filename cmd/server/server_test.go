@@ -213,35 +213,41 @@ func TestExtractIP_IPv6FullAddr(t *testing.T) {
 }
 
 func TestClientSession_Struct(t *testing.T) {
+	now := time.Now()
 	session := &ClientSession{
 		ID:        "session-1",
 		Subdomain: "myapp",
 		TeamName:  "engineering",
 		Role:      auth.RoleAdmin,
-		CreatedAt: time.Now(),
-		LastSeen:  time.Now(),
+		CreatedAt: now,
+		LastSeen:  now,
 	}
 
 	assert.Equal(t, "session-1", session.ID)
 	assert.Equal(t, "myapp", session.Subdomain)
 	assert.Equal(t, "engineering", session.TeamName)
 	assert.Equal(t, auth.RoleAdmin, session.Role)
+	assert.Equal(t, now, session.CreatedAt)
+	assert.Equal(t, now, session.LastSeen)
 }
 
 func TestTunnelInfo_Struct(t *testing.T) {
-	tunnel := &TunnelInfo{
+	now := time.Now()
+	tun := &TunnelInfo{
 		ID:        "tunnel-1",
 		LocalPort: 8080,
 		Protocol:  proto.ProtocolHTTP,
 		PublicURL: "https://myapp.example.com",
 		TCPPort:   0,
-		CreatedAt: time.Now(),
+		CreatedAt: now,
 	}
 
-	assert.Equal(t, "tunnel-1", tunnel.ID)
-	assert.Equal(t, uint32(8080), tunnel.LocalPort)
-	assert.Equal(t, proto.ProtocolHTTP, tunnel.Protocol)
-	assert.Equal(t, "https://myapp.example.com", tunnel.PublicURL)
+	assert.Equal(t, "tunnel-1", tun.ID)
+	assert.Equal(t, uint32(8080), tun.LocalPort)
+	assert.Equal(t, proto.ProtocolHTTP, tun.Protocol)
+	assert.Equal(t, "https://myapp.example.com", tun.PublicURL)
+	assert.Equal(t, uint32(0), tun.TCPPort)
+	assert.Equal(t, now, tun.CreatedAt)
 }
 
 func TestServer_ClientManagement(t *testing.T) {
@@ -336,34 +342,34 @@ func TestServer_AuthenticateClient_Success(t *testing.T) {
 	// Client goroutine: open stream, send AuthRequest, read response.
 	errCh := make(chan error, 1)
 	go func() {
-		stream, err := clientMux.OpenStream()
-		if err != nil {
-			errCh <- err
+		stream, openErr := clientMux.OpenStream()
+		if openErr != nil {
+			errCh <- openErr
 			return
 		}
 		defer stream.Close()
 
 		req := proto.NewAuthRequest("valid-token", "1.0.0", "myapp")
-		data, err := req.Encode()
-		if err != nil {
-			errCh <- err
+		data, encErr := req.Encode()
+		if encErr != nil {
+			errCh <- encErr
 			return
 		}
-		if _, err := stream.Write(data); err != nil {
-			errCh <- err
+		if _, writeErr := stream.Write(data); writeErr != nil {
+			errCh <- writeErr
 			return
 		}
 
 		buf := make([]byte, 4096)
-		n, err := stream.Read(buf)
-		if err != nil {
-			errCh <- err
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			errCh <- readErr
 			return
 		}
 
-		msg, err := proto.DecodeControlMessage(buf[:n])
-		if err != nil {
-			errCh <- err
+		msg, decErr := proto.DecodeControlMessage(buf[:n])
+		if decErr != nil {
+			errCh <- decErr
 			return
 		}
 		if msg.AuthResponse == nil || !msg.AuthResponse.Success {
@@ -476,26 +482,26 @@ func TestServer_HandleRegister_HTTP(t *testing.T) {
 		defer stream.Close()
 
 		req := proto.NewRegisterRequest(8080, proto.ProtocolHTTP, "myapp")
-		data, err := req.Encode()
-		if err != nil {
-			errCh <- err
+		data, encErr := req.Encode()
+		if encErr != nil {
+			errCh <- encErr
 			return
 		}
-		if _, err := stream.Write(data); err != nil {
-			errCh <- err
+		if _, writeErr := stream.Write(data); writeErr != nil {
+			errCh <- writeErr
 			return
 		}
 
 		buf := make([]byte, 4096)
-		n, err := stream.Read(buf)
-		if err != nil {
-			errCh <- err
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			errCh <- readErr
 			return
 		}
 
-		msg, err := proto.DecodeControlMessage(buf[:n])
-		if err != nil {
-			errCh <- err
+		msg, decErr := proto.DecodeControlMessage(buf[:n])
+		if decErr != nil {
+			errCh <- decErr
 			return
 		}
 		if msg.RegisterResponse == nil {
@@ -556,34 +562,34 @@ func TestServer_HandlePing(t *testing.T) {
 	// Client goroutine: send ping, receive pong.
 	errCh := make(chan error, 1)
 	go func() {
-		stream, err := clientMux.OpenStream()
-		if err != nil {
-			errCh <- err
+		stream, openErr := clientMux.OpenStream()
+		if openErr != nil {
+			errCh <- openErr
 			return
 		}
 		defer stream.Close()
 
 		req := proto.NewPingRequest(12345)
-		data, err := req.Encode()
-		if err != nil {
-			errCh <- err
+		data, encErr := req.Encode()
+		if encErr != nil {
+			errCh <- encErr
 			return
 		}
-		if _, err := stream.Write(data); err != nil {
-			errCh <- err
+		if _, writeErr := stream.Write(data); writeErr != nil {
+			errCh <- writeErr
 			return
 		}
 
 		buf := make([]byte, 4096)
-		n, err := stream.Read(buf)
-		if err != nil {
-			errCh <- err
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			errCh <- readErr
 			return
 		}
 
-		msg, err := proto.DecodeControlMessage(buf[:n])
-		if err != nil {
-			errCh <- err
+		msg, decErr := proto.DecodeControlMessage(buf[:n])
+		if decErr != nil {
+			errCh <- decErr
 			return
 		}
 		if msg.PingResponse == nil {
@@ -622,7 +628,7 @@ func TestServer_HandlePing(t *testing.T) {
 	require.NoError(t, <-errCh)
 }
 
-func TestServer_HandleP2PResult_Success(t *testing.T) {
+func TestServer_HandleP2PResult_Success(_ *testing.T) {
 	s := newTestServerForIntegration()
 
 	client := &ClientSession{ID: "test-client"}
@@ -637,7 +643,7 @@ func TestServer_HandleP2PResult_Success(t *testing.T) {
 	s.handleP2PResult(client, result)
 }
 
-func TestServer_HandleP2PResult_Failure(t *testing.T) {
+func TestServer_HandleP2PResult_Failure(_ *testing.T) {
 	s := newTestServerForIntegration()
 
 	client := &ClientSession{ID: "test-client"}
@@ -1240,8 +1246,8 @@ func TestServer_ServeTCPTunnel(t *testing.T) {
 		}
 
 		// Read one message and echo it back.
-		dn, err := stream.Read(buf)
-		if err != nil {
+		dn, dataErr := stream.Read(buf)
+		if dataErr != nil {
 			return
 		}
 		_, _ = stream.Write(buf[:dn])
@@ -1489,26 +1495,26 @@ func TestServer_HandleRegister_TCP(t *testing.T) {
 		defer stream.Close()
 
 		req := proto.NewRegisterRequest(3306, proto.ProtocolTCP, "tcpreg")
-		data, err := req.Encode()
-		if err != nil {
-			errCh <- err
+		data, encErr := req.Encode()
+		if encErr != nil {
+			errCh <- encErr
 			return
 		}
-		if _, err := stream.Write(data); err != nil {
-			errCh <- err
+		if _, writeErr := stream.Write(data); writeErr != nil {
+			errCh <- writeErr
 			return
 		}
 
 		buf := make([]byte, 4096)
-		n, err := stream.Read(buf)
-		if err != nil {
-			errCh <- err
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			errCh <- readErr
 			return
 		}
 
-		msg, err := proto.DecodeControlMessage(buf[:n])
-		if err != nil {
-			errCh <- err
+		msg, decErr := proto.DecodeControlMessage(buf[:n])
+		if decErr != nil {
+			errCh <- decErr
 			return
 		}
 		if msg.RegisterResponse == nil || !msg.RegisterResponse.Success {
@@ -1648,21 +1654,21 @@ func TestServer_HandleRegister_CustomHostname(t *testing.T) {
 		req := proto.NewRegisterRequest(8080, proto.ProtocolHTTP, "hostapp")
 		req.RegisterRequest.Hostname = "custom.example.com"
 		data, _ := req.Encode()
-		if _, err := stream.Write(data); err != nil {
-			errCh <- err
+		if _, writeErr := stream.Write(data); writeErr != nil {
+			errCh <- writeErr
 			return
 		}
 
 		buf := make([]byte, 4096)
-		n, err := stream.Read(buf)
-		if err != nil {
-			errCh <- err
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			errCh <- readErr
 			return
 		}
 
-		msg, err := proto.DecodeControlMessage(buf[:n])
-		if err != nil {
-			errCh <- err
+		msg, decErr := proto.DecodeControlMessage(buf[:n])
+		if decErr != nil {
+			errCh <- decErr
 			return
 		}
 		if msg.RegisterResponse == nil || !msg.RegisterResponse.Success {

@@ -931,9 +931,9 @@ func TestMux_KeepAlive_CloseDuringPong(t *testing.T) {
 	assert.True(t, serverMux.IsClosed())
 }
 
-// TestMux_OpenStreamContext_CancelledContext verifies that OpenStreamContext
-// returns context.Canceled when given an already-cancelled context.
-func TestMux_OpenStreamContext_CancelledContext(t *testing.T) {
+// TestMux_OpenStreamContext_CanceledContext verifies that OpenStreamContext
+// returns context.Canceled when given an already-canceled context.
+func TestMux_OpenStreamContext_CanceledContext(t *testing.T) {
 	clientConn, serverConn := testConn()
 	defer clientConn.Close()
 	defer serverConn.Close()

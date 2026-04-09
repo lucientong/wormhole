@@ -978,7 +978,7 @@ func TestPool_CreateConn_AllClosedRecovery(t *testing.T) {
 }
 
 // TestPool_OpenStream_ContextCancel verifies that OpenStream returns an
-// error when the context is cancelled but the mux is still healthy
+// error when the context is canceled but the mux is still healthy
 // (covers the non-closed mux error path in OpenStream).
 func TestPool_OpenStream_ContextCancel(t *testing.T) {
 	config := DefaultPoolConfig()
@@ -1004,7 +1004,7 @@ func TestPool_OpenStream_ContextCancel(t *testing.T) {
 	_, err := pool.Get(context.Background())
 	require.NoError(t, err)
 
-	// Use an already-cancelled context.
+	// Use an already-canceled context.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 

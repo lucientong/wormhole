@@ -843,7 +843,7 @@ func TestClient_ForwardHTTPWithInspect_LocalDown(t *testing.T) {
 // --- heartbeatLoop tests ---
 
 // TestClient_HeartbeatLoop verifies that the heartbeat loop sends periodic
-// pings and exits when the context is cancelled.
+// pings and exits when the context is canceled.
 func TestClient_HeartbeatLoop(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.HeartbeatInterval = 50 * time.Millisecond
@@ -971,7 +971,7 @@ func TestClient_ConnectWithRetry_MaxAttempts(t *testing.T) {
 }
 
 // TestClient_ConnectWithRetry_ContextCancel verifies that connectWithRetry
-// returns ctx.Err() when the context is cancelled during backoff.
+// returns ctx.Err() when the context is canceled during backoff.
 func TestClient_ConnectWithRetry_ContextCancel(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ServerAddr = "127.0.0.1:1"
@@ -997,7 +997,7 @@ func TestClient_ConnectWithRetry_ContextCancel(t *testing.T) {
 }
 
 // TestClient_ConnectWithRetry_CloseCh verifies that connectWithRetry
-// returns nil when closeCh is signalled.
+// returns nil when closeCh is signaled.
 func TestClient_ConnectWithRetry_CloseCh(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ServerAddr = "127.0.0.1:1"
@@ -1635,7 +1635,7 @@ func TestClient_HandleStream_P2POfferResponse(t *testing.T) {
 // TestClient_ForwardP2PRequestToLocal_Success + TestClient_ForwardP2PDataToLocal_Success.
 
 // TestClient_SendP2PResponse_NilTransport verifies no-op when transport is nil.
-func TestClient_SendP2PResponse_NilTransport(t *testing.T) {
+func TestClient_SendP2PResponse_NilTransport(_ *testing.T) {
 	cfg := DefaultConfig()
 	c := NewClient(cfg)
 
@@ -1738,7 +1738,7 @@ func TestClient_ForwardP2PDataToLocal_Success(t *testing.T) {
 }
 
 // TestClient_ForwardP2PDataToLocal_LocalDown verifies graceful handling when local is down.
-func TestClient_ForwardP2PDataToLocal_LocalDown(t *testing.T) {
+func TestClient_ForwardP2PDataToLocal_LocalDown(_ *testing.T) {
 	cfg := DefaultConfig()
 	cfg.LocalHost = "127.0.0.1"
 	cfg.LocalPort = 19992 // Nothing listening.
@@ -1786,7 +1786,7 @@ func TestClient_ForwardP2PRequestToLocal_Success(t *testing.T) {
 
 // TestClient_ForwardP2PRequestToLocal_LocalDown verifies that when local is down,
 // a failure P2P response is sent.
-func TestClient_ForwardP2PRequestToLocal_LocalDown(t *testing.T) {
+func TestClient_ForwardP2PRequestToLocal_LocalDown(_ *testing.T) {
 	cfg := DefaultConfig()
 	cfg.LocalHost = "127.0.0.1"
 	cfg.LocalPort = 19991
