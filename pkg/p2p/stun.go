@@ -137,14 +137,14 @@ func (s *STUNClient) DiscoverEndpoint(ctx context.Context) (*Endpoint, error) {
 // bindingRequest sends a STUN binding request and returns the mapped address.
 func (s *STUNClient) bindingRequest(ctx context.Context, server string) (*Endpoint, *Endpoint, error) {
 	// Resolve STUN server address.
-	serverAddr, err := net.ResolveUDPAddr("udp4", server)
+	serverAddr, err := net.ResolveUDPAddr("udp", server)
 	if err != nil {
 		return nil, nil, fmt.Errorf("resolve %s: %w", server, err)
 	}
 
 	// Create UDP connection.
 	lc := net.ListenConfig{}
-	conn, err := lc.ListenPacket(ctx, "udp4", ":0")
+	conn, err := lc.ListenPacket(ctx, "udp", ":0")
 	if err != nil {
 		return nil, nil, fmt.Errorf("listen udp: %w", err)
 	}
@@ -163,14 +163,14 @@ func (s *STUNClient) bindingRequest(ctx context.Context, server string) (*Endpoi
 
 // bindingRequestFromPort sends a STUN binding request from a specific local port.
 func (s *STUNClient) bindingRequestFromPort(ctx context.Context, server string, localPort int) (*Endpoint, *Endpoint, error) {
-	serverAddr, err := net.ResolveUDPAddr("udp4", server)
+	serverAddr, err := net.ResolveUDPAddr("udp", server)
 	if err != nil {
 		return nil, nil, fmt.Errorf("resolve %s: %w", server, err)
 	}
 
 	listenAddr := net.JoinHostPort("", fmt.Sprintf("%d", localPort))
 	lc := net.ListenConfig{}
-	conn, err := lc.ListenPacket(ctx, "udp4", listenAddr)
+	conn, err := lc.ListenPacket(ctx, "udp", listenAddr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("listen udp on port %d: %w", localPort, err)
 	}
@@ -253,32 +253,55 @@ func classifyNAT(local, mapped1, mapped2 *Endpoint) NATType {
 }
 
 // isPublicIP returns true if the IP is a public (non-private) address.
+// Supports both IPv4 and IPv6.
 func isPublicIP(ipStr string) bool {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return false
 	}
-	// Check private ranges.
-	privateRanges := []struct {
-		start net.IP
-		end   net.IP
-	}{
-		{net.ParseIP("10.0.0.0"), net.ParseIP("10.255.255.255")},
-		{net.ParseIP("172.16.0.0"), net.ParseIP("172.31.255.255")},
-		{net.ParseIP("192.168.0.0"), net.ParseIP("192.168.255.255")},
-		{net.ParseIP("127.0.0.0"), net.ParseIP("127.255.255.255")},
+
+	// Check IPv4.
+	if ip4 := ip.To4(); ip4 != nil {
+		privateRanges := []struct {
+			start net.IP
+			end   net.IP
+		}{
+			{net.ParseIP("10.0.0.0"), net.ParseIP("10.255.255.255")},
+			{net.ParseIP("172.16.0.0"), net.ParseIP("172.31.255.255")},
+			{net.ParseIP("192.168.0.0"), net.ParseIP("192.168.255.255")},
+			{net.ParseIP("127.0.0.0"), net.ParseIP("127.255.255.255")},
+		}
+
+		for _, r := range privateRanges {
+			if bytesInRange(ip4, r.start.To4(), r.end.To4()) {
+				return false
+			}
+		}
+		return true
 	}
 
-	ip = ip.To4()
-	if ip == nil {
+	// IPv6 private/reserved checks.
+	// Loopback (::1).
+	if ip.Equal(net.IPv6loopback) {
+		return false
+	}
+	// Link-local (fe80::/10).
+	if ip[0] == 0xfe && (ip[1]&0xc0) == 0x80 {
+		return false
+	}
+	// Unique local (fc00::/7).
+	if (ip[0] & 0xfe) == 0xfc {
+		return false
+	}
+	// Multicast (ff00::/8).
+	if ip[0] == 0xff {
+		return false
+	}
+	// Unspecified (::).
+	if ip.Equal(net.IPv6zero) {
 		return false
 	}
 
-	for _, r := range privateRanges {
-		if bytesInRange(ip, r.start.To4(), r.end.To4()) {
-			return false
-		}
-	}
 	return true
 }
 
@@ -355,12 +378,13 @@ func parseBindingResponse(data []byte, expectedTxID [12]byte) (*Endpoint, error)
 		return nil, fmt.Errorf("truncated message: declared %d, have %d", msgLen, len(attrs))
 	}
 
-	return extractMappedAddress(attrs[:msgLen])
+	return extractMappedAddress(attrs[:msgLen], txID)
 }
 
 // extractMappedAddress iterates STUN attributes and returns the first mapped address found.
 // It prefers XOR-MAPPED-ADDRESS over MAPPED-ADDRESS.
-func extractMappedAddress(attrs []byte) (*Endpoint, error) {
+// The txID is needed for XOR-MAPPED-ADDRESS IPv6 decoding.
+func extractMappedAddress(attrs []byte, txID [12]byte) (*Endpoint, error) {
 	var mapped *Endpoint
 	for len(attrs) >= 4 {
 		attrType := binary.BigEndian.Uint16(attrs[0:2])
@@ -374,7 +398,7 @@ func extractMappedAddress(attrs []byte) (*Endpoint, error) {
 
 		switch attrType {
 		case stunAttrXORMappedAddress:
-			ep, err := parseXORMappedAddress(attrValue)
+			ep, err := parseXORMappedAddress(attrValue, txID)
 			if err == nil {
 				return ep, nil // Preferred.
 			}
@@ -404,8 +428,9 @@ func extractMappedAddress(attrs []byte) (*Endpoint, error) {
 }
 
 // parseXORMappedAddress decodes an XOR-MAPPED-ADDRESS attribute.
-func parseXORMappedAddress(data []byte) (*Endpoint, error) {
-	if len(data) < 8 {
+// The txID is required for IPv6 address decoding (RFC 5389 §15.2).
+func parseXORMappedAddress(data []byte, txID [12]byte) (*Endpoint, error) {
+	if len(data) < 4 {
 		return nil, fmt.Errorf("XOR-MAPPED-ADDRESS too short")
 	}
 
@@ -427,7 +452,23 @@ func parseXORMappedAddress(data []byte) (*Endpoint, error) {
 			Port: int(port),
 		}, nil
 	case stunIPv6:
-		return nil, fmt.Errorf("IPv6 not yet supported")
+		if len(data) < 20 {
+			return nil, fmt.Errorf("IPv6 address too short")
+		}
+		// XOR the 16-byte address with magic cookie (4 bytes) + transaction ID (12 bytes).
+		xorKey := make([]byte, 16)
+		binary.BigEndian.PutUint32(xorKey[0:4], stunMagicCookie)
+		copy(xorKey[4:16], txID[:])
+
+		ipBytes := make([]byte, 16)
+		addrData := data[4:20]
+		for i := 0; i < 16; i++ {
+			ipBytes[i] = addrData[i] ^ xorKey[i]
+		}
+		return &Endpoint{
+			IP:   net.IP(ipBytes).String(),
+			Port: int(port),
+		}, nil
 	default:
 		return nil, fmt.Errorf("unknown address family: %d", family)
 	}
@@ -435,7 +476,7 @@ func parseXORMappedAddress(data []byte) (*Endpoint, error) {
 
 // parseMappedAddress decodes a MAPPED-ADDRESS attribute.
 func parseMappedAddress(data []byte) (*Endpoint, error) {
-	if len(data) < 8 {
+	if len(data) < 4 {
 		return nil, fmt.Errorf("MAPPED-ADDRESS too short")
 	}
 
@@ -444,13 +485,23 @@ func parseMappedAddress(data []byte) (*Endpoint, error) {
 
 	switch family {
 	case stunIPv4:
+		if len(data) < 8 {
+			return nil, fmt.Errorf("IPv4 address too short")
+		}
 		ip := net.IP(data[4:8])
 		return &Endpoint{
 			IP:   ip.String(),
 			Port: int(port),
 		}, nil
 	case stunIPv6:
-		return nil, fmt.Errorf("IPv6 not yet supported")
+		if len(data) < 20 {
+			return nil, fmt.Errorf("IPv6 address too short")
+		}
+		ip := net.IP(data[4:20])
+		return &Endpoint{
+			IP:   ip.String(),
+			Port: int(port),
+		}, nil
 	default:
 		return nil, fmt.Errorf("unknown address family: %d", family)
 	}

@@ -69,9 +69,10 @@ func NewSQLiteStore(config SQLiteStoreConfig) (*SQLiteStore, error) {
 func (s *SQLiteStore) initSchema() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS teams (
-		name       TEXT PRIMARY KEY,
-		created_at INTEGER NOT NULL,
-		tokens     INTEGER DEFAULT 0
+		name            TEXT PRIMARY KEY,
+		created_at      INTEGER NOT NULL,
+		tokens          INTEGER DEFAULT 0,
+		revoked_version INTEGER DEFAULT 0
 	);
 
 	CREATE TABLE IF NOT EXISTS revoked_tokens (
@@ -85,17 +86,61 @@ func (s *SQLiteStore) initSchema() error {
 
 	ctx := context.Background()
 	_, err := s.db.ExecContext(ctx, schema)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Migration: add revoked_version column if it doesn't exist (for existing DBs).
+	return s.migrateAddRevokedVersion()
+}
+
+// migrateAddRevokedVersion adds the revoked_version column to teams if missing.
+func (s *SQLiteStore) migrateAddRevokedVersion() error {
+	ctx := context.Background()
+
+	// Check if column exists by querying table info.
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(teams)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	hasColumn := false
+	for rows.Next() {
+		var cid int
+		var name, typeName string
+		var notNull, pk int
+		var dfltValue *string
+		if scanErr := rows.Scan(&cid, &name, &typeName, &notNull, &dfltValue, &pk); scanErr != nil {
+			return scanErr
+		}
+		if name == "revoked_version" {
+			hasColumn = true
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if !hasColumn {
+		_, err := s.db.ExecContext(ctx,
+			`ALTER TABLE teams ADD COLUMN revoked_version INTEGER DEFAULT 0`)
+		return err
+	}
+	return nil
 }
 
 // SaveTeam saves a team to SQLite.
 func (s *SQLiteStore) SaveTeam(team *TeamInfo) error {
 	ctx := context.Background()
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO teams (name, created_at, tokens) 
-		VALUES (?, ?, ?)
-		ON CONFLICT(name) DO UPDATE SET tokens = excluded.tokens
-	`, team.Name, team.CreatedAt.Unix(), team.Tokens)
+		INSERT INTO teams (name, created_at, tokens, revoked_version) 
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(name) DO UPDATE SET 
+			tokens = excluded.tokens,
+			revoked_version = excluded.revoked_version
+	`, team.Name, team.CreatedAt.Unix(), team.Tokens, team.RevokedVersion)
 	return err
 }
 
@@ -106,8 +151,8 @@ func (s *SQLiteStore) GetTeam(name string) (*TeamInfo, error) {
 
 	ctx := context.Background()
 	err := s.db.QueryRowContext(ctx, `
-		SELECT name, created_at, tokens FROM teams WHERE name = ?
-	`, name).Scan(&team.Name, &createdAt, &team.Tokens)
+		SELECT name, created_at, tokens, revoked_version FROM teams WHERE name = ?
+	`, name).Scan(&team.Name, &createdAt, &team.Tokens, &team.RevokedVersion)
 
 	if err == sql.ErrNoRows {
 		return nil, ErrTeamNotFound
@@ -123,7 +168,7 @@ func (s *SQLiteStore) GetTeam(name string) (*TeamInfo, error) {
 // ListTeams returns all teams from SQLite.
 func (s *SQLiteStore) ListTeams() ([]TeamInfo, error) {
 	ctx := context.Background()
-	rows, err := s.db.QueryContext(ctx, `SELECT name, created_at, tokens FROM teams`)
+	rows, err := s.db.QueryContext(ctx, `SELECT name, created_at, tokens, revoked_version FROM teams`)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +178,7 @@ func (s *SQLiteStore) ListTeams() ([]TeamInfo, error) {
 	for rows.Next() {
 		var team TeamInfo
 		var createdAt int64
-		if err := rows.Scan(&team.Name, &createdAt, &team.Tokens); err != nil {
+		if err := rows.Scan(&team.Name, &createdAt, &team.Tokens, &team.RevokedVersion); err != nil {
 			return nil, err
 		}
 		team.CreatedAt = time.Unix(createdAt, 0)

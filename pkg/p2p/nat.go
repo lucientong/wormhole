@@ -5,7 +5,10 @@
 // when P2P fails.
 package p2p
 
-import "fmt"
+import (
+	"net"
+	"strconv"
+)
 
 // NATType represents the type of NAT detected.
 type NATType int
@@ -59,9 +62,9 @@ type Endpoint struct {
 	Port int    `json:"port"`
 }
 
-// String returns the endpoint as host:port.
+// String returns the endpoint as host:port (IPv6-safe).
 func (e Endpoint) String() string {
-	return fmt.Sprintf("%s:%d", e.IP, e.Port)
+	return net.JoinHostPort(e.IP, strconv.Itoa(e.Port))
 }
 
 // NATInfo contains the results of NAT discovery.

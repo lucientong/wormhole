@@ -97,14 +97,16 @@ type tokenPayload struct {
 	Role      Role   `json:"role"`
 	IssuedAt  int64  `json:"iat"`
 	ExpiresAt int64  `json:"exp,omitempty"`
+	Version   int64  `json:"ver,omitempty"`
 	Nonce     string `json:"nonce"`
 }
 
 // TeamInfo stores metadata about a team.
 type TeamInfo struct {
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
-	Tokens    int       `json:"tokens"` // Number of active tokens.
+	Name           string    `json:"name"`
+	CreatedAt      time.Time `json:"created_at"`
+	Tokens         int       `json:"tokens"`          // Number of active tokens.
+	RevokedVersion int64     `json:"revoked_version"` // Minimum valid token version.
 }
 
 // Auth provides token-based authentication and authorization.
@@ -172,11 +174,23 @@ func (a *Auth) GenerateTeamToken(teamName string, role Role) (string, error) {
 	}
 
 	now := time.Now()
+
+	// Determine the token version from the current team revoked version.
+	a.mu.RLock()
+	var tokenVersion int64
+	if info, teamErr := a.store.GetTeam(teamName); teamErr == nil {
+		tokenVersion = info.RevokedVersion + 1
+	} else {
+		tokenVersion = 1
+	}
+	a.mu.RUnlock()
+
 	payload := tokenPayload{
 		TokenID:  tokenID,
 		TeamName: teamName,
 		Role:     role,
 		IssuedAt: now.Unix(),
+		Version:  tokenVersion,
 		Nonce:    nonce,
 	}
 	if a.config.TokenExpiry > 0 {
@@ -294,18 +308,27 @@ func (a *Auth) validateHMACToken(token string) (*Claims, error) {
 	return a.payloadToClaims(&payload), nil
 }
 
-// validatePayload checks expiration and revocation status.
+// validatePayload checks expiration, revocation status, and team version.
 func (a *Auth) validatePayload(payload *tokenPayload) error {
 	// Check expiration.
 	if payload.ExpiresAt > 0 && time.Now().Unix() > payload.ExpiresAt {
 		return ErrTokenExpired
 	}
 
-	// Check if token is revoked.
+	// Check if token is individually revoked.
 	if payload.TokenID != "" {
 		revoked, err := a.store.IsTokenRevoked(payload.TokenID)
 		if err == nil && revoked {
 			return ErrTokenRevoked
+		}
+	}
+
+	// Check team-level revocation version.
+	if payload.TeamName != "" && payload.Version > 0 {
+		if info, err := a.store.GetTeam(payload.TeamName); err == nil {
+			if payload.Version <= info.RevokedVersion {
+				return ErrTokenRevoked
+			}
 		}
 	}
 
@@ -455,15 +478,28 @@ func (a *Auth) RevokedTokenCount() int {
 	return count
 }
 
-// RevokeAllTeamTokens marks a team as fully revoked by incrementing a version.
-// This is a placeholder for a more sophisticated team-level revocation.
-// For now, it's not implemented as it would require version tracking in tokens.
-// Use RevokeToken for individual token revocation.
-func (a *Auth) RevokeAllTeamTokens(_ string) error {
-	// TODO: Implement team-level revocation with version numbers.
-	// This would require adding a "version" field to tokens and tracking
-	// the minimum valid version per team.
-	return errors.New("team-level revocation not implemented; use individual token revocation")
+// RevokeAllTeamTokens invalidates all existing tokens for a team by incrementing
+// the team's revoked version. Any token whose version is less than or equal to
+// the new revoked version will be rejected during validation.
+// Returns ErrTeamNotFound if the team does not exist.
+func (a *Auth) RevokeAllTeamTokens(teamName string) error {
+	if teamName == "" {
+		return ErrInvalidTeamName
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	info, err := a.store.GetTeam(teamName)
+	if err != nil {
+		return err
+	}
+
+	// Increment the revoked version. All tokens with version <= this value
+	// will be considered revoked.
+	info.RevokedVersion++
+
+	return a.store.SaveTeam(info)
 }
 
 // RefreshToken generates a new token with the same claims as the original,

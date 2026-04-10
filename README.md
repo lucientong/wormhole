@@ -109,7 +109,7 @@ That's it! Your local service is now accessible from the internet.
 - **Multiplexed Tunnel**: A single TCP connection carries multiple logical streams (control, HTTP requests, heartbeats) via a custom binary frame protocol
 - **Host-based Routing**: Server routes incoming HTTP requests to the correct client based on `Host` header and subdomain
 - **Inspector**: Client-side HTTP traffic capture with a real-time web UI (WebSocket push + REST API)
-- **P2P**: STUN-based NAT discovery + UDP hole punching for direct connections, with automatic relay fallback
+- **P2P**: STUN-based NAT discovery (IPv4/IPv6 dual-stack) + UDP hole punching for direct connections, with automatic relay fallback
 - **Auth**: HMAC-SHA256 token signing with role-based access control (admin/member/viewer), pre-shared token mode for quick setup
 
 ### Components
@@ -318,7 +318,7 @@ Wormhole is designed with security in mind, but as a tunneling tool that exposes
 | **HMAC-SHA256 Tokens** | Signed team tokens with expiration and revocation support |
 | **RBAC** | Role-based access control (admin / member / viewer) |
 | **Rate Limiting** | Automatic IP blocking after repeated authentication failures |
-| **Token Revocation** | Blacklist compromised tokens with persistent storage |
+| **Token Revocation** | Individual token blacklist + team-level bulk revocation (version-based) with persistent storage |
 | **Constant-time Auth** | Admin token comparison uses `crypto/subtle` to prevent timing attacks |
 | **Request Limits** | MaxHeaderBytes and request body size limits to mitigate DoS |
 

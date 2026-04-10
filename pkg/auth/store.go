@@ -41,7 +41,9 @@ func NewMemoryStore() *MemoryStore {
 
 // SaveTeam saves a team to memory.
 func (s *MemoryStore) SaveTeam(team *TeamInfo) error {
-	s.teams[team.Name] = team
+	// Copy to prevent external modification.
+	teamCopy := *team
+	s.teams[team.Name] = &teamCopy
 	return nil
 }
 

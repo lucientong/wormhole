@@ -1194,6 +1194,128 @@ func TestAdminAPI_RefreshToken_InvalidDuration(t *testing.T) {
 	assert.Equal(t, "invalid extend_by duration", resp.Error)
 }
 
+func TestAdminAPI_RevokeTeamTokens(t *testing.T) {
+	server := newTestServerWithAuth(t)
+
+	// Register team and generate tokens.
+	err := server.authenticator.RegisterTeam("revoke-team")
+	require.NoError(t, err)
+
+	token1, err := server.authenticator.GenerateTeamToken("revoke-team", auth.RoleMember)
+	require.NoError(t, err)
+	token2, err := server.authenticator.GenerateTeamToken("revoke-team", auth.RoleAdmin)
+	require.NoError(t, err)
+
+	// Verify tokens are valid.
+	_, err = server.authenticator.ValidateToken(token1)
+	require.NoError(t, err)
+	_, err = server.authenticator.ValidateToken(token2)
+	require.NoError(t, err)
+
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	body := bytes.NewBufferString(`{"team":"revoke-team"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tokens/revoke-team", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var result map[string]string
+	err = json.Unmarshal(rec.Body.Bytes(), &result)
+	require.NoError(t, err)
+	assert.Equal(t, "all team tokens revoked successfully", result["message"])
+	assert.Equal(t, "revoke-team", result["team"])
+
+	// Both old tokens should be revoked.
+	_, err = server.authenticator.ValidateToken(token1)
+	assert.ErrorIs(t, err, auth.ErrTokenRevoked)
+	_, err = server.authenticator.ValidateToken(token2)
+	assert.ErrorIs(t, err, auth.ErrTokenRevoked)
+
+	// New tokens should still work.
+	token3, err := server.authenticator.GenerateTeamToken("revoke-team", auth.RoleMember)
+	require.NoError(t, err)
+	_, err = server.authenticator.ValidateToken(token3)
+	require.NoError(t, err)
+}
+
+func TestAdminAPI_RevokeTeamTokens_TeamNotFound(t *testing.T) {
+	server := newTestServerWithAuth(t)
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	body := bytes.NewBufferString(`{"team":"nonexistent"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tokens/revoke-team", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestAdminAPI_RevokeTeamTokens_MissingTeam(t *testing.T) {
+	server := newTestServerWithAuth(t)
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	body := bytes.NewBufferString(`{}`)
+	req := httptest.NewRequest(http.MethodPost, "/tokens/revoke-team", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestAdminAPI_RevokeTeamTokens_MethodNotAllowed(t *testing.T) {
+	server := newTestServerWithAuth(t)
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	req := httptest.NewRequest(http.MethodGet, "/tokens/revoke-team", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+}
+
+func TestAdminAPI_RevokeTeamTokens_InvalidBody(t *testing.T) {
+	server := newTestServerWithAuth(t)
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	body := bytes.NewBufferString(`invalid json`)
+	req := httptest.NewRequest(http.MethodPost, "/tokens/revoke-team", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestAdminAPI_RevokeTeamTokens_NoAuth(t *testing.T) {
+	server := newTestServer()
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	body := bytes.NewBufferString(`{"team":"team1"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tokens/revoke-team", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
 func TestAdminAPI_NoAuthenticator(t *testing.T) {
 	server := newTestServer()
 	// server.authenticator is nil.
@@ -1210,6 +1332,7 @@ func TestAdminAPI_NoAuthenticator(t *testing.T) {
 		{http.MethodGet, "/teams/team", ""},
 		{http.MethodPost, "/tokens/generate", `{"team":"t"}`},
 		{http.MethodPost, "/tokens/revoke", `{"token":"t"}`},
+		{http.MethodPost, "/tokens/revoke-team", `{"team":"t"}`},
 		{http.MethodPost, "/tokens/refresh", `{"token":"t"}`},
 	}
 

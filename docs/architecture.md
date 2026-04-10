@@ -112,7 +112,7 @@ Wormhole is a Client-Server architecture tunneling tool. The core idea is:
 | `tunnel` | `pkg/tunnel/` | Multiplexer, frame codec, stream management, connection pool |
 | `proto` | `pkg/proto/` | Control protocol message definitions (JSON encoding) |
 | `auth` | `pkg/auth/` | Authentication & authorization (HMAC tokens, roles, permissions, rate limiting, audit logging, SQLite persistence) |
-| `p2p` | `pkg/p2p/` | STUN client, NAT discovery, UDP hole punching, port prediction, reliable UDP transport |
+| `p2p` | `pkg/p2p/` | STUN client (IPv4/IPv6), NAT discovery, UDP hole punching, port prediction, reliable UDP transport, E2E encryption (X25519 + AES-256-GCM) |
 | `version` | `pkg/version/` | Build version information |
 
 ---
@@ -793,9 +793,9 @@ Storage backends (`store.go`, `store_sqlite.go`):
 | **SQLite** | Production, persistent team data | `--persistence sqlite` |
 
 SQLite stores:
-- Team information (name, creation time)
+- Team information (name, creation time, revoked version)
 - Revoked token blacklist
-- Token metadata (expiry, revocation status)
+- Token metadata (expiry, revocation status, version)
 
 ### Authentication Handshake Flow
 

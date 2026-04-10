@@ -366,7 +366,7 @@ func TestEndpoint(t *testing.T) {
 	assert.Equal(t, "192.168.1.1:8080", ep.String())
 
 	ep2 := Endpoint{IP: "::1", Port: 443}
-	assert.Equal(t, "::1:443", ep2.String())
+	assert.Equal(t, "[::1]:443", ep2.String())
 }
 
 // TestManagerConfig_Defaults tests default manager configuration.

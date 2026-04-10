@@ -465,12 +465,115 @@ func TestTokenID_InClaims(t *testing.T) {
 	assert.NotEqual(t, claims.TokenID, claims2.TokenID)
 }
 
-func TestRevokeAllTeamTokens_NotImplemented(t *testing.T) {
+func TestRevokeAllTeamTokens(t *testing.T) {
 	a := newTestAuth(t)
 
-	err := a.RevokeAllTeamTokens("team1")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "not implemented")
+	// Register a team and generate tokens.
+	err := a.RegisterTeam("team1")
+	require.NoError(t, err)
+
+	token1, err := a.GenerateTeamToken("team1", RoleMember)
+	require.NoError(t, err)
+	token2, err := a.GenerateTeamToken("team1", RoleAdmin)
+	require.NoError(t, err)
+
+	// Both tokens should be valid.
+	_, err = a.ValidateToken(token1)
+	require.NoError(t, err)
+	_, err = a.ValidateToken(token2)
+	require.NoError(t, err)
+
+	// Revoke all team tokens.
+	err = a.RevokeAllTeamTokens("team1")
+	require.NoError(t, err)
+
+	// Both old tokens should now be revoked.
+	_, err = a.ValidateToken(token1)
+	assert.ErrorIs(t, err, ErrTokenRevoked)
+	_, err = a.ValidateToken(token2)
+	assert.ErrorIs(t, err, ErrTokenRevoked)
+
+	// New tokens should still work.
+	token3, err := a.GenerateTeamToken("team1", RoleMember)
+	require.NoError(t, err)
+	_, err = a.ValidateToken(token3)
+	require.NoError(t, err)
+}
+
+func TestRevokeAllTeamTokens_TeamNotFound(t *testing.T) {
+	a := newTestAuth(t)
+
+	err := a.RevokeAllTeamTokens("nonexistent")
+	assert.ErrorIs(t, err, ErrTeamNotFound)
+}
+
+func TestRevokeAllTeamTokens_EmptyName(t *testing.T) {
+	a := newTestAuth(t)
+
+	err := a.RevokeAllTeamTokens("")
+	assert.ErrorIs(t, err, ErrInvalidTeamName)
+}
+
+func TestRevokeAllTeamTokens_MultipleRevocations(t *testing.T) {
+	a := newTestAuth(t)
+
+	err := a.RegisterTeam("team1")
+	require.NoError(t, err)
+
+	// Generate and revoke multiple rounds.
+	token1, err := a.GenerateTeamToken("team1", RoleMember)
+	require.NoError(t, err)
+
+	err = a.RevokeAllTeamTokens("team1")
+	require.NoError(t, err)
+
+	// token1 should be revoked.
+	_, err = a.ValidateToken(token1)
+	assert.ErrorIs(t, err, ErrTokenRevoked)
+
+	// Generate new token after first revocation.
+	token2, err := a.GenerateTeamToken("team1", RoleMember)
+	require.NoError(t, err)
+	_, err = a.ValidateToken(token2)
+	require.NoError(t, err)
+
+	// Second revocation.
+	err = a.RevokeAllTeamTokens("team1")
+	require.NoError(t, err)
+
+	// token2 should now also be revoked.
+	_, err = a.ValidateToken(token2)
+	assert.ErrorIs(t, err, ErrTokenRevoked)
+
+	// New token after second revocation should work.
+	token3, err := a.GenerateTeamToken("team1", RoleMember)
+	require.NoError(t, err)
+	_, err = a.ValidateToken(token3)
+	require.NoError(t, err)
+}
+
+func TestRevokeAllTeamTokens_DoesNotAffectOtherTeams(t *testing.T) {
+	a := newTestAuth(t)
+
+	err := a.RegisterTeam("team1")
+	require.NoError(t, err)
+	err = a.RegisterTeam("team2")
+	require.NoError(t, err)
+
+	token1, err := a.GenerateTeamToken("team1", RoleMember)
+	require.NoError(t, err)
+	token2, err := a.GenerateTeamToken("team2", RoleMember)
+	require.NoError(t, err)
+
+	// Revoke team1 only.
+	err = a.RevokeAllTeamTokens("team1")
+	require.NoError(t, err)
+
+	// team1 token revoked, team2 token still valid.
+	_, err = a.ValidateToken(token1)
+	assert.ErrorIs(t, err, ErrTokenRevoked)
+	_, err = a.ValidateToken(token2)
+	require.NoError(t, err)
 }
 
 func TestRefreshToken(t *testing.T) {

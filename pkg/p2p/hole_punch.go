@@ -54,7 +54,7 @@ var punchMagic = []byte{0x57, 0x48, 0x50, 0x50} // "WHPP" = WormHole Punch Proto
 // It sends probe packets to the peer's public endpoint while simultaneously
 // listening for incoming probes. Returns the established connection if successful.
 func (h *HolePuncher) Punch(ctx context.Context, localConn net.PacketConn, peerEndpoint Endpoint) (*net.UDPAddr, error) {
-	peerAddr, err := net.ResolveUDPAddr("udp4", peerEndpoint.String())
+	peerAddr, err := net.ResolveUDPAddr("udp", peerEndpoint.String())
 	if err != nil {
 		return nil, fmt.Errorf("resolve peer address: %w", err)
 	}

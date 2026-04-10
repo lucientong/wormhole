@@ -149,7 +149,7 @@ func (m *Manager) AttemptP2P(ctx context.Context, peerEndpoint Endpoint, cipher 
 
 	// Create local UDP socket.
 	lc := net.ListenConfig{}
-	conn, err := lc.ListenPacket(ctx, "udp4", ":0")
+	conn, err := lc.ListenPacket(ctx, "udp", ":0")
 	if err != nil {
 		return nil, nil, fmt.Errorf("listen udp: %w", err)
 	}

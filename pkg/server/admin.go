@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -36,6 +37,7 @@ func (a *AdminAPI) Handler() http.Handler {
 	mux.HandleFunc("/teams/", a.requireAdminAuth(a.handleTeamByName))
 	mux.HandleFunc("/tokens/generate", a.requireAdminAuth(a.handleGenerateToken))
 	mux.HandleFunc("/tokens/revoke", a.requireAdminAuth(a.handleRevokeToken))
+	mux.HandleFunc("/tokens/revoke-team", a.requireAdminAuth(a.handleRevokeTeamTokens))
 	mux.HandleFunc("/tokens/refresh", a.requireAdminAuth(a.handleRefreshToken))
 
 	// Wrap with request body size limiter to mitigate DoS via large payloads.
@@ -329,9 +331,10 @@ func (a *AdminAPI) handleUnblockIP(w http.ResponseWriter, r *http.Request) {
 
 // TeamResponse is the response for team endpoints.
 type TeamResponse struct {
-	Name      string `json:"name"`
-	CreatedAt string `json:"created_at"`
-	Tokens    int    `json:"tokens"`
+	Name           string `json:"name"`
+	CreatedAt      string `json:"created_at"`
+	Tokens         int    `json:"tokens"`
+	RevokedVersion int64  `json:"revoked_version"`
 }
 
 // CreateTeamRequest is the request body for creating a team.
@@ -352,9 +355,10 @@ func (a *AdminAPI) handleTeams(w http.ResponseWriter, r *http.Request) {
 		response := make([]TeamResponse, 0, len(teams))
 		for _, t := range teams {
 			response = append(response, TeamResponse{
-				Name:      t.Name,
-				CreatedAt: t.CreatedAt.Format(time.RFC3339),
-				Tokens:    t.Tokens,
+				Name:           t.Name,
+				CreatedAt:      t.CreatedAt.Format(time.RFC3339),
+				Tokens:         t.Tokens,
+				RevokedVersion: t.RevokedVersion,
 			})
 		}
 		writeJSON(w, http.StatusOK, response)
@@ -413,9 +417,10 @@ func (a *AdminAPI) handleTeamByName(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, TeamResponse{
-		Name:      team.Name,
-		CreatedAt: team.CreatedAt.Format(time.RFC3339),
-		Tokens:    team.Tokens,
+		Name:           team.Name,
+		CreatedAt:      team.CreatedAt.Format(time.RFC3339),
+		Tokens:         team.Tokens,
+		RevokedVersion: team.RevokedVersion,
 	})
 }
 
@@ -554,7 +559,51 @@ func (a *AdminAPI) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// RefreshTokenRequest is the request body for token refresh.
+// RevokeTeamTokensRequest is the request body for team-level token revocation.
+type RevokeTeamTokensRequest struct {
+	Team string `json:"team"`
+}
+
+// handleRevokeTeamTokens handles POST /tokens/revoke-team.
+func (a *AdminAPI) handleRevokeTeamTokens(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		return
+	}
+
+	if a.server.authenticator == nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "authentication is not enabled"})
+		return
+	}
+
+	var req RevokeTeamTokensRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+		return
+	}
+
+	if req.Team == "" {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "team is required"})
+		return
+	}
+
+	if err := a.server.authenticator.RevokeAllTeamTokens(req.Team); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, auth.ErrTeamNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, ErrorResponse{Error: err.Error()})
+		return
+	}
+
+	log.Info().Str("team", req.Team).Msg("All team tokens revoked via admin API")
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"message": "all team tokens revoked successfully",
+		"team":    req.Team,
+	})
+}
+
 type RefreshTokenRequest struct {
 	Token     string `json:"token"`
 	RevokeOld bool   `json:"revoke_old"`
