@@ -51,7 +51,7 @@ type Client struct {
 	p2pCipher    *p2p.SessionCipher // Derived session cipher for E2E encryption
 
 	// Statistics
-	stats ClientStats
+	stats Stats
 
 	// Shutdown
 	closed  uint32
@@ -60,8 +60,8 @@ type Client struct {
 	mu      sync.Mutex
 }
 
-// ClientStats contains client statistics.
-type ClientStats struct {
+// Stats contains client statistics.
+type Stats struct {
 	BytesIn        uint64
 	BytesOut       uint64
 	Requests       uint64
@@ -1194,7 +1194,7 @@ func (c *Client) GetP2PManager() *p2p.Manager {
 }
 
 // Close closes the client.
-func (c *Client) Close() error { //nolint:unparam // satisfies io.Closer interface
+func (c *Client) Close() error {
 	if !atomic.CompareAndSwapUint32(&c.closed, 0, 1) {
 		return nil
 	}
@@ -1245,8 +1245,8 @@ func (c *Client) IsConnected() bool {
 }
 
 // GetStats returns client statistics.
-func (c *Client) GetStats() ClientStats {
-	return ClientStats{
+func (c *Client) GetStats() Stats {
+	return Stats{
 		BytesIn:        atomic.LoadUint64(&c.stats.BytesIn),
 		BytesOut:       atomic.LoadUint64(&c.stats.BytesOut),
 		Requests:       atomic.LoadUint64(&c.stats.Requests),
@@ -1256,7 +1256,7 @@ func (c *Client) GetStats() ClientStats {
 }
 
 // StartInspector starts the inspector UI server.
-func (c *Client) StartInspector(port int) error { //nolint:unparam // error return reserved for future use
+func (c *Client) StartInspector(port int) error {
 	if port == 0 {
 		return nil
 	}

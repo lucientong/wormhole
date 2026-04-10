@@ -42,7 +42,7 @@ type Server struct {
 	clientLock sync.RWMutex
 
 	// Stats.
-	stats ServerStats
+	stats Stats
 
 	// Shutdown.
 	closed  uint32
@@ -84,8 +84,8 @@ type TunnelInfo struct {
 	CreatedAt time.Time
 }
 
-// ServerStats contains server statistics.
-type ServerStats struct {
+// Stats contains server statistics.
+type Stats struct {
 	ActiveClients uint64
 	TotalClients  uint64
 	ActiveTunnels uint64
@@ -101,7 +101,7 @@ func NewServer(config Config) *Server {
 		config:  config,
 		clients: make(map[string]*ClientSession),
 		closeCh: make(chan struct{}),
-		stats: ServerStats{
+		stats: Stats{
 			StartTime: time.Now(),
 		},
 	}
@@ -925,8 +925,8 @@ func (s *Server) removeClient(client *ClientSession) {
 }
 
 // getStats returns server statistics.
-func (s *Server) getStats() ServerStats {
-	return ServerStats{
+func (s *Server) getStats() Stats {
+	return Stats{
 		ActiveClients: atomic.LoadUint64(&s.stats.ActiveClients),
 		TotalClients:  atomic.LoadUint64(&s.stats.TotalClients),
 		ActiveTunnels: atomic.LoadUint64(&s.stats.ActiveTunnels),

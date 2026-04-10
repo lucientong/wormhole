@@ -21,7 +21,7 @@ func newTestServer() *Server {
 		config:  config,
 		clients: make(map[string]*ClientSession),
 		closeCh: make(chan struct{}),
-		stats: ServerStats{
+		stats: Stats{
 			StartTime: time.Now().Add(-1 * time.Hour), // 1 hour ago
 		},
 	}
@@ -563,7 +563,7 @@ func newTestServerWithAuth(t *testing.T) *Server {
 		clients:       make(map[string]*ClientSession),
 		closeCh:       make(chan struct{}),
 		authenticator: authenticator,
-		stats: ServerStats{
+		stats: Stats{
 			StartTime: time.Now().Add(-1 * time.Hour),
 		},
 	}

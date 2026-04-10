@@ -288,7 +288,7 @@ func TestServer_PortAllocator(t *testing.T) {
 	assert.Equal(t, 0, s.portAllocator.AllocatedPorts())
 }
 
-func TestServerStats_StartTime(t *testing.T) {
+func TestStats_StartTime(t *testing.T) {
 	before := time.Now()
 	cfg := DefaultConfig()
 	s := NewServer(cfg)
