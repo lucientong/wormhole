@@ -1,4 +1,4 @@
-// Package main provides the client entry point.
+// Package main provides the standalone client entry point.
 package main
 
 import (
@@ -8,12 +8,13 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/lucientong/wormhole/pkg/client"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
 func main() {
-	// Parse flags
+	// Parse flags.
 	serverAddr := flag.String("server", "localhost:7000", "Server address")
 	localPort := flag.Int("local", 8080, "Local port to expose")
 	localHost := flag.String("local-host", "127.0.0.1", "Local host to forward to")
@@ -25,7 +26,7 @@ func main() {
 	clearToken := flag.Bool("clear-token", false, "Clear saved token and exit")
 	flag.Parse()
 
-	// Configure logging
+	// Configure logging.
 	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: "15:04:05"}).
 		With().
 		Timestamp().
@@ -33,7 +34,7 @@ func main() {
 
 	// Handle clear-token command.
 	if *clearToken {
-		if err := ClearToken(); err != nil {
+		if err := client.ClearToken(); err != nil {
 			log.Fatal().Err(err).Msg("Failed to clear token")
 		}
 		log.Info().Msg("Saved token cleared")
@@ -41,14 +42,14 @@ func main() {
 	}
 
 	// Load persistent configuration.
-	persistent, err := LoadPersistentConfig()
+	persistent, err := client.LoadPersistentConfig()
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to load persistent config, using defaults")
-		persistent = &PersistentConfig{}
+		persistent = &client.PersistentConfig{}
 	}
 
 	// Track which flags were explicitly set.
-	flags := &FlagValues{}
+	flags := &client.FlagValues{}
 	flag.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "server":
@@ -65,7 +66,7 @@ func main() {
 	})
 
 	// Create client config from defaults.
-	config := DefaultConfig()
+	config := client.DefaultConfig()
 	config.ServerAddr = *serverAddr
 	config.LocalPort = *localPort
 	config.LocalHost = *localHost
@@ -75,17 +76,17 @@ func main() {
 	config.P2PEnabled = *p2pEnabled
 
 	// Apply persistent config (only for fields not explicitly set via flags).
-	ApplyPersistentConfig(&config, persistent, flags)
+	client.ApplyPersistentConfig(&config, persistent, flags)
 
-	// Create client
-	client := NewClient(config)
+	// Create client.
+	c := client.NewClient(config)
 
 	// Start inspector if enabled.
-	if err := client.StartInspector(config.InspectorPort); err != nil {
+	if err := c.StartInspector(config.InspectorPort); err != nil {
 		log.Fatal().Err(err).Msg("Failed to start inspector")
 	}
 
-	// Handle shutdown signals
+	// Handle shutdown signals.
 	ctx, cancel := context.WithCancel(context.Background())
 
 	sigCh := make(chan os.Signal, 1)
@@ -97,15 +98,15 @@ func main() {
 		cancel()
 	}()
 
-	// Start client
-	if err := client.Start(ctx); err != nil {
+	// Start client.
+	if err := c.Start(ctx); err != nil {
 		cancel()
 		log.Fatal().Err(err).Msg("Client failed")
 	}
 
 	// Save config on successful connection if requested.
 	if *saveConfig {
-		if err := UpdatePersistentConfig(&config, true); err != nil {
+		if err := client.UpdatePersistentConfig(&config, true); err != nil {
 			log.Warn().Err(err).Msg("Failed to save config")
 		} else {
 			log.Info().Msg("Configuration saved to ~/.wormhole/config.yaml")

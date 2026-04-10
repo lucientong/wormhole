@@ -87,18 +87,18 @@ Wormhole is a Client-Server architecture tunneling tool. The core idea is:
 
 | Component | Location | Responsibility |
 |-----------|----------|----------------|
-| `Server` | `cmd/server/server.go` | Core controller; manages client sessions, coordinates components |
-| `HTTPHandler` | `cmd/server/handler.go` | HTTP reverse proxy; forwards requests through tunnel to Client |
-| `Router` | `cmd/server/router.go` | Host/Path routing table; supports subdomain, custom domains, path prefixes |
-| `TLSManager` | `cmd/server/tls.go` | TLS termination; Let's Encrypt auto-certs and manual certificates |
-| `AdminAPI` | `cmd/server/admin.go` | RESTful admin API |
-| `TCPPortAllocator` | `cmd/server/handler.go` | Allocates ports for TCP tunnels |
+| `Server` | `pkg/server/server.go` | Core controller; manages client sessions, coordinates components |
+| `HTTPHandler` | `pkg/server/handler.go` | HTTP reverse proxy; forwards requests through tunnel to Client |
+| `Router` | `pkg/server/router.go` | Host/Path routing table; supports subdomain, custom domains, path prefixes |
+| `TLSManager` | `pkg/server/tls.go` | TLS termination; Let's Encrypt auto-certs and manual certificates |
+| `AdminAPI` | `pkg/server/admin.go` | RESTful admin API |
+| `TCPPortAllocator` | `pkg/server/handler.go` | Allocates ports for TCP tunnels |
 
 ### Client-Side Components
 
 | Component | Location | Responsibility |
 |-----------|----------|----------------|
-| `Client` | `cmd/client/client.go` | Core controller; manages connection, forwarding, reconnection |
+| `Client` | `pkg/client/client.go` | Core controller; manages connection, forwarding, reconnection |
 | `Inspector` | `pkg/inspector/inspector.go` | HTTP traffic capture and recording |
 | `Handler` | `pkg/inspector/handler.go` | Inspector HTTP API + WebSocket push |
 | `Storage` | `pkg/inspector/storage.go` | Request record ring-buffer storage |
@@ -535,8 +535,8 @@ Phase 4 provides the foundational P2P primitives, and Phase 4.5 completes end-to
 | **P2P Manager** | `pkg/p2p/manager.go` | ✅ Complete — Coordinates STUN + hole punch + relay fallback |
 | **Reliable UDP Transport** | `pkg/p2p/transport.go` | ✅ Complete — ARQ protocol with seq/ack, retransmission, FIN |
 | **Signaling Messages** | `pkg/proto/messages.go` | ✅ Complete — P2POfferRequest/Response, Candidates, Result |
-| **Client Integration** | `cmd/client/client.go` | ✅ Complete — NAT discovery, P2P offer, hot switch, fallback |
-| **Server Signaling** | `cmd/server/server.go` | ✅ Complete — Peer matching, NAT compatibility check |
+| **Client Integration** | `pkg/client/client.go` | ✅ Complete — NAT discovery, P2P offer, hot switch, fallback |
+| **Server Signaling** | `pkg/server/server.go` | ✅ Complete — Peer matching, NAT compatibility check |
 | **Integration Tests** | `pkg/p2p/integration_test.go` | ✅ Complete — 15+ test cases |
 
 ### Reliable UDP Transport Layer

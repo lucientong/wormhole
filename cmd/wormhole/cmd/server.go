@@ -1,6 +1,14 @@
 package cmd
 
 import (
+	"context"
+	"net"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
+
+	"github.com/lucientong/wormhole/pkg/server"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 )
@@ -12,6 +20,7 @@ var (
 	serverTLSEnabled      bool
 	serverTLSCert         string
 	serverTLSKey          string
+	serverHTTPPort        int
 	serverAdminPort       int
 	serverRequireAuth     bool
 	serverAuthTokens      []string
@@ -64,10 +73,11 @@ Examples:
 func init() {
 	serverCmd.Flags().IntVarP(&serverPort, "port", "p", 7000, "Port to listen on for client connections")
 	serverCmd.Flags().StringVar(&serverHost, "host", "0.0.0.0", "Host to bind to")
-	serverCmd.Flags().StringVarP(&serverDomain, "domain", "d", "", "Domain for generating tunnel URLs")
+	serverCmd.Flags().StringVarP(&serverDomain, "domain", "d", "", "Domain for generating tunnel URLs (env: WORMHOLE_DOMAIN)")
 	serverCmd.Flags().BoolVar(&serverTLSEnabled, "tls", false, "Enable TLS (auto-cert with Let's Encrypt if domain is set)")
 	serverCmd.Flags().StringVar(&serverTLSCert, "cert", "", "Path to TLS certificate file")
 	serverCmd.Flags().StringVar(&serverTLSKey, "key", "", "Path to TLS private key file")
+	serverCmd.Flags().IntVar(&serverHTTPPort, "http-port", 80, "Port for HTTP traffic")
 	serverCmd.Flags().IntVar(&serverAdminPort, "admin-port", 7001, "Port for admin API")
 	serverCmd.Flags().BoolVar(&serverRequireAuth, "require-auth", false, "Require authentication for client connections")
 	serverCmd.Flags().StringSliceVar(&serverAuthTokens, "auth-tokens", nil, "Comma-separated list of valid authentication tokens")
@@ -78,14 +88,59 @@ func init() {
 }
 
 func runServer(_ *cobra.Command, _ []string) {
-	log.Info().
-		Str("host", serverHost).
-		Int("port", serverPort).
-		Str("domain", serverDomain).
-		Bool("tls", serverTLSEnabled).
-		Bool("require_auth", serverRequireAuth).
-		Msg("Starting Wormhole server")
+	// Support WORMHOLE_DOMAIN environment variable as default for --domain.
+	if serverDomain == "" {
+		if envDomain := os.Getenv("WORMHOLE_DOMAIN"); envDomain != "" {
+			serverDomain = envDomain
+		} else {
+			serverDomain = "localhost"
+		}
+	}
 
-	// TODO: Implement server startup after server package is ready
-	log.Warn().Msg("Server implementation pending")
+	config := server.DefaultConfig()
+	config.ListenAddr = net.JoinHostPort(serverHost, strconv.Itoa(serverPort))
+	config.HTTPAddr = net.JoinHostPort(serverHost, strconv.Itoa(serverHTTPPort))
+	config.AdminAddr = net.JoinHostPort(serverHost, strconv.Itoa(serverAdminPort))
+	config.Domain = serverDomain
+	config.TLSEnabled = serverTLSEnabled
+	config.TLSCertFile = serverTLSCert
+	config.TLSKeyFile = serverTLSKey
+	config.RequireAuth = serverRequireAuth
+	config.AuthTokens = serverAuthTokens
+	config.AuthSecret = serverAuthSecret
+	config.AdminToken = serverAdminToken
+	config.PersistencePath = serverPersistencePath
+
+	// Enable auto-TLS when TLS is enabled, a real domain is set, and no manual cert/key provided.
+	if config.TLSEnabled && config.Domain != "" && config.Domain != "localhost" &&
+		config.TLSCertFile == "" && config.TLSKeyFile == "" {
+		config.AutoTLS = true
+	}
+
+	switch serverPersistence {
+	case "sqlite":
+		config.Persistence = server.PersistenceSQLite
+	default:
+		config.Persistence = server.PersistenceMemory
+	}
+
+	srv := server.NewServer(config)
+
+	// Handle shutdown signals.
+	ctx, cancel := context.WithCancel(context.Background())
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigCh
+		log.Info().Str("signal", sig.String()).Msg("Received shutdown signal")
+		cancel()
+	}()
+
+	if err := srv.Start(ctx); err != nil {
+		cancel()
+		log.Fatal().Err(err).Msg("Server failed")
+	}
+	cancel()
 }

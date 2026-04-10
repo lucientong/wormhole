@@ -2,7 +2,9 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/lucientong/wormhole/pkg/version"
 	"github.com/rs/zerolog"
@@ -36,16 +38,28 @@ Examples:
 		// Configure logging
 		configureLogging()
 	},
-	// Quick mode: wormhole <port> is equivalent to wormhole client --local <port>
+	// Quick mode: wormhole <port> is equivalent to wormhole client --local <port>.
+	Args: func(_ *cobra.Command, args []string) error {
+		if len(args) == 0 {
+			return nil // show help
+		}
+		if len(args) > 1 {
+			return fmt.Errorf("accepts at most 1 arg(s), received %d", len(args))
+		}
+		port, err := strconv.Atoi(args[0])
+		if err != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("invalid port number: %s (must be 1-65535)", args[0])
+		}
+		return nil
+	},
 	Run: func(cmd *cobra.Command, args []string) {
 		if len(args) == 1 {
-			// Quick mode: wormhole <port>
-			// TODO: Implement quick mode after client is ready
-			log.Info().Str("port", args[0]).Msg("Quick mode - exposing local port")
-			log.Warn().Msg("Quick mode not yet implemented")
+			port, _ := strconv.Atoi(args[0])
+			log.Info().Int("port", port).Msg("Quick mode - exposing local port")
+			startClient(port, "localhost:7000", "127.0.0.1", "", "", 0, true)
 			return
 		}
-		// No args, show help
+		// No args, show help.
 		_ = cmd.Help()
 	},
 }

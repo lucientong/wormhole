@@ -19,6 +19,7 @@ GOLINT := golangci-lint
 
 # Directories
 CMD_DIR := ./cmd/wormhole
+CMD_TEST_DIR := ./cmd/...
 PKG_DIR := ./pkg/...
 INTERNAL_DIR := ./internal/...
 WEB_DIR := ./web
@@ -85,12 +86,12 @@ clean:
 ## Run tests
 test:
 	@echo "$(GREEN)Running tests...$(NC)"
-	$(GOTEST) -v -race $(PKG_DIR) $(INTERNAL_DIR)
+	$(GOTEST) -v -race $(PKG_DIR) $(INTERNAL_DIR) $(CMD_TEST_DIR)
 
 ## Run tests with coverage
 test-coverage:
 	@echo "$(GREEN)Running tests with coverage...$(NC)"
-	$(GOTEST) -v -race -coverprofile=coverage.out -covermode=atomic $(PKG_DIR) $(INTERNAL_DIR)
+	$(GOTEST) -v -race -coverprofile=coverage.out -covermode=atomic $(PKG_DIR) $(INTERNAL_DIR) $(CMD_TEST_DIR)
 	@$(GOCMD) tool cover -func=coverage.out
 	@$(GOCMD) tool cover -html=coverage.out -o coverage.html
 	@echo "$(GREEN)Coverage report generated: coverage.html$(NC)"

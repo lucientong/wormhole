@@ -180,11 +180,13 @@ wormhole server \
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--port` | Tunnel listen port | `7000` |
+| `--host` | Host to bind to | `0.0.0.0` |
 | `--http-port` | HTTP traffic port | `80` |
 | `--admin-port` | Admin API port | `7001` |
-| `--domain` | Base domain | `localhost` |
-| `--tls` | Enable TLS | false |
-| `--tls-email` | Let's Encrypt email | None |
+| `--domain` | Domain for tunnel URLs (env: `WORMHOLE_DOMAIN`) | `localhost` |
+| `--tls` | Enable TLS (auto-cert if domain is set) | false |
+| `--cert` | Path to TLS certificate file | None |
+| `--key` | Path to TLS private key file | None |
 | `--require-auth` | Require authentication for connections | false |
 | `--auth-tokens` | Comma-separated pre-shared tokens | None |
 | `--auth-secret` | HMAC secret for signed tokens (min 16 chars) | None |
@@ -284,10 +286,12 @@ golangci-lint run ./...
 ```
 wormhole/
 ├── cmd/
-│   ├── wormhole/     # CLI entry point
-│   ├── server/       # Server implementation
-│   └── client/       # Client implementation
+│   ├── wormhole/     # CLI entry point (Cobra)
+│   ├── server/       # Standalone server entry (thin wrapper)
+│   └── client/       # Standalone client entry (thin wrapper)
 ├── pkg/
+│   ├── client/       # Client core (config, connection, persistence)
+│   ├── server/       # Server core (config, routing, handler, TLS, admin)
 │   ├── tunnel/       # Core tunneling (mux, frame, stream, pool)
 │   ├── inspector/    # Traffic inspection (capture, storage, websocket)
 │   ├── p2p/          # P2P direct connection (STUN, hole punch, predictor)
@@ -326,7 +330,6 @@ Wormhole is designed with security in mind, but as a tunneling tool that exposes
 wormhole server \
   --domain tunnel.example.com \
   --tls \
-  --tls-email admin@example.com \
   --require-auth \
   --auth-secret "$(openssl rand -base64 32)" \
   --admin-token "$(openssl rand -hex 16)" \

@@ -1,6 +1,12 @@
 package cmd
 
 import (
+	"context"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/lucientong/wormhole/pkg/client"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 )
@@ -55,15 +61,44 @@ func init() {
 }
 
 func runClient(_ *cobra.Command, _ []string) {
-	log.Info().
-		Str("server", clientServer).
-		Int("local_port", clientLocalPort).
-		Str("local_host", clientLocalHost).
-		Str("subdomain", clientSubdomain).
-		Int("inspector_port", clientInspectorPort).
-		Bool("p2p", clientP2PEnabled).
-		Msg("Starting Wormhole client")
+	startClient(clientLocalPort, clientServer, clientLocalHost, clientSubdomain,
+		clientToken, clientInspectorPort, clientP2PEnabled)
+}
 
-	// TODO: Implement client startup after client package is ready
-	log.Warn().Msg("Client implementation pending")
+// startClient creates and starts a Wormhole client with the given parameters.
+// It is shared by both the client subcommand and the root quick-mode handler.
+func startClient(localPort int, serverAddr, localHost, subdomain, token string, inspectorPort int, p2pEnabled bool) {
+	config := client.DefaultConfig()
+	config.ServerAddr = serverAddr
+	config.LocalPort = localPort
+	config.LocalHost = localHost
+	config.Subdomain = subdomain
+	config.Token = token
+	config.InspectorPort = inspectorPort
+	config.P2PEnabled = p2pEnabled
+
+	c := client.NewClient(config)
+
+	// Start inspector if enabled.
+	if err := c.StartInspector(config.InspectorPort); err != nil {
+		log.Fatal().Err(err).Msg("Failed to start inspector")
+	}
+
+	// Handle shutdown signals.
+	ctx, cancel := context.WithCancel(context.Background())
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigCh
+		log.Info().Str("signal", sig.String()).Msg("Received shutdown signal")
+		cancel()
+	}()
+
+	if err := c.Start(ctx); err != nil {
+		cancel()
+		log.Fatal().Err(err).Msg("Client failed")
+	}
+	cancel()
 }
