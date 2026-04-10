@@ -1,4 +1,22 @@
-# Build stage
+# Frontend build stage
+FROM node:20-alpine AS frontend
+
+WORKDIR /web
+
+# Copy frontend dependency files
+COPY web/package.json web/package-lock.json ./
+
+# Install frontend dependencies
+RUN npm ci
+
+# Copy frontend source
+COPY web/ .
+
+# Build frontend (outputs to ../pkg/web/dist via vite config,
+# but we override outDir here since the Go source tree isn't mounted)
+RUN npx vite build --outDir /frontend-dist --emptyOutDir
+
+# Go build stage
 FROM golang:1.25-alpine AS builder
 
 # Install build dependencies
@@ -15,6 +33,9 @@ RUN go mod download
 
 # Copy source code
 COPY . .
+
+# Copy built frontend assets into the embed directory
+COPY --from=frontend /frontend-dist ./pkg/web/dist
 
 # Build arguments for version info
 ARG VERSION=dev
