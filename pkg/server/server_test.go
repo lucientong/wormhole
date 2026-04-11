@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -2084,4 +2085,489 @@ func TestDefaultConfig_QuotaDefaults(t *testing.T) {
 	cfg := DefaultConfig()
 	assert.Equal(t, 1000, cfg.MaxClients)
 	assert.Equal(t, 0, cfg.MaxTunnelsPerClient)
+}
+
+// --- P1-2: Control Protocol Closure Tests ---
+
+func TestServer_HandleStats(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MuxConfig.KeepAliveInterval = 0
+	s := NewServer(cfg)
+
+	clientMux, serverMux := newMuxPair(t)
+
+	client := &ClientSession{
+		ID:        "stats-client",
+		Subdomain: "statsapp",
+		Mux:       serverMux,
+		CreatedAt: time.Now().Add(-10 * time.Second), // 10 seconds ago.
+		LastSeen:  time.Now(),
+		BytesIn:   1024,
+		BytesOut:  2048,
+		Tunnels: []*TunnelInfo{
+			{ID: "t1", LocalPort: 8080, Protocol: proto.ProtocolHTTP, CreatedAt: time.Now()},
+			{ID: "t2", LocalPort: 9090, Protocol: proto.ProtocolTCP, CreatedAt: time.Now()},
+		},
+	}
+	s.clientLock.Lock()
+	s.clients[client.ID] = client
+	s.clientLock.Unlock()
+
+	// Client sends a StatsRequest.
+	errCh := make(chan error, 1)
+	go func() {
+		stream, openErr := clientMux.OpenStream()
+		if openErr != nil {
+			errCh <- openErr
+			return
+		}
+		defer stream.Close()
+
+		req := proto.NewStatsRequest("stats-client")
+		data, encErr := req.Encode()
+		if encErr != nil {
+			errCh <- encErr
+			return
+		}
+		if _, writeErr := stream.Write(data); writeErr != nil {
+			errCh <- writeErr
+			return
+		}
+
+		buf := make([]byte, 4096)
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			errCh <- readErr
+			return
+		}
+
+		msg, decErr := proto.DecodeControlMessage(buf[:n])
+		if decErr != nil {
+			errCh <- decErr
+			return
+		}
+		if msg.StatsResponse == nil {
+			errCh <- errors.New("expected stats response")
+			return
+		}
+		if msg.StatsResponse.ActiveTunnels != 2 {
+			errCh <- fmt.Errorf("expected 2 active tunnels, got %d", msg.StatsResponse.ActiveTunnels)
+			return
+		}
+		if msg.StatsResponse.BytesReceived != 1024 {
+			errCh <- fmt.Errorf("expected 1024 bytes received, got %d", msg.StatsResponse.BytesReceived)
+			return
+		}
+		if msg.StatsResponse.BytesSent != 2048 {
+			errCh <- fmt.Errorf("expected 2048 bytes sent, got %d", msg.StatsResponse.BytesSent)
+			return
+		}
+		if msg.StatsResponse.UptimeSeconds < 10 {
+			errCh <- fmt.Errorf("expected uptime >= 10s, got %d", msg.StatsResponse.UptimeSeconds)
+			return
+		}
+		errCh <- nil
+	}()
+
+	stream, err := serverMux.AcceptStream()
+	require.NoError(t, err)
+	defer stream.Close()
+
+	buf := make([]byte, 4096)
+	n, err := stream.Read(buf)
+	require.NoError(t, err)
+
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	require.NoError(t, err)
+	require.NotNil(t, msg.StatsRequest)
+
+	s.handleStats(client, stream, msg.StatsRequest)
+	require.NoError(t, <-errCh)
+}
+
+func TestServer_HandleClose_Success(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MuxConfig.KeepAliveInterval = 0
+	s := NewServer(cfg)
+
+	clientMux, serverMux := newMuxPair(t)
+
+	client := &ClientSession{
+		ID:        "close-client",
+		Subdomain: "closeapp",
+		Mux:       serverMux,
+		CreatedAt: time.Now(),
+		LastSeen:  time.Now(),
+		Tunnels: []*TunnelInfo{
+			{ID: "tunnel-to-close", LocalPort: 8080, Protocol: proto.ProtocolHTTP, PublicURL: "http://closeapp.example.com", CreatedAt: time.Now()},
+			{ID: "tunnel-to-keep", LocalPort: 9090, Protocol: proto.ProtocolHTTP, PublicURL: "http://closeapp2.example.com", CreatedAt: time.Now()},
+		},
+	}
+	s.clientLock.Lock()
+	s.clients[client.ID] = client
+	s.clientLock.Unlock()
+
+	// Set initial tunnel count.
+	atomic.StoreUint64(&s.stats.ActiveTunnels, 2)
+
+	// Client sends a CloseRequest.
+	errCh := make(chan error, 1)
+	go func() {
+		stream, openErr := clientMux.OpenStream()
+		if openErr != nil {
+			errCh <- openErr
+			return
+		}
+		defer stream.Close()
+
+		req := proto.NewCloseRequest("tunnel-to-close", "user requested")
+		data, encErr := req.Encode()
+		if encErr != nil {
+			errCh <- encErr
+			return
+		}
+		if _, writeErr := stream.Write(data); writeErr != nil {
+			errCh <- writeErr
+			return
+		}
+
+		buf := make([]byte, 4096)
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			errCh <- readErr
+			return
+		}
+
+		msg, decErr := proto.DecodeControlMessage(buf[:n])
+		if decErr != nil {
+			errCh <- decErr
+			return
+		}
+		if msg.CloseResponse == nil {
+			errCh <- errors.New("expected close response")
+			return
+		}
+		if !msg.CloseResponse.Success {
+			errCh <- errors.New("expected close to succeed")
+			return
+		}
+		errCh <- nil
+	}()
+
+	stream, err := serverMux.AcceptStream()
+	require.NoError(t, err)
+	defer stream.Close()
+
+	buf := make([]byte, 4096)
+	n, err := stream.Read(buf)
+	require.NoError(t, err)
+
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	require.NoError(t, err)
+	require.NotNil(t, msg.CloseRequest)
+
+	s.handleClose(client, stream, msg.CloseRequest)
+	require.NoError(t, <-errCh)
+
+	// Verify the tunnel was removed.
+	client.mu.Lock()
+	assert.Len(t, client.Tunnels, 1)
+	assert.Equal(t, "tunnel-to-keep", client.Tunnels[0].ID)
+	client.mu.Unlock()
+
+	// Verify active tunnel counter decremented.
+	assert.Equal(t, uint64(1), atomic.LoadUint64(&s.stats.ActiveTunnels))
+}
+
+func TestServer_HandleClose_TunnelNotFound(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MuxConfig.KeepAliveInterval = 0
+	s := NewServer(cfg)
+
+	clientMux, serverMux := newMuxPair(t)
+
+	client := &ClientSession{
+		ID:        "close-notfound-client",
+		Subdomain: "notfound",
+		Mux:       serverMux,
+		CreatedAt: time.Now(),
+		LastSeen:  time.Now(),
+		Tunnels: []*TunnelInfo{
+			{ID: "existing-tunnel", LocalPort: 8080, Protocol: proto.ProtocolHTTP, CreatedAt: time.Now()},
+		},
+	}
+	s.clientLock.Lock()
+	s.clients[client.ID] = client
+	s.clientLock.Unlock()
+
+	// Client sends a CloseRequest for a non-existent tunnel.
+	errCh := make(chan error, 1)
+	go func() {
+		stream, openErr := clientMux.OpenStream()
+		if openErr != nil {
+			errCh <- openErr
+			return
+		}
+		defer stream.Close()
+
+		req := proto.NewCloseRequest("non-existent-tunnel", "test")
+		data, encErr := req.Encode()
+		if encErr != nil {
+			errCh <- encErr
+			return
+		}
+		if _, writeErr := stream.Write(data); writeErr != nil {
+			errCh <- writeErr
+			return
+		}
+
+		buf := make([]byte, 4096)
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			errCh <- readErr
+			return
+		}
+
+		msg, decErr := proto.DecodeControlMessage(buf[:n])
+		if decErr != nil {
+			errCh <- decErr
+			return
+		}
+		if msg.CloseResponse == nil {
+			errCh <- errors.New("expected close response")
+			return
+		}
+		if msg.CloseResponse.Success {
+			errCh <- errors.New("expected close to fail for non-existent tunnel")
+			return
+		}
+		errCh <- nil
+	}()
+
+	stream, err := serverMux.AcceptStream()
+	require.NoError(t, err)
+	defer stream.Close()
+
+	buf := make([]byte, 4096)
+	n, err := stream.Read(buf)
+	require.NoError(t, err)
+
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	require.NoError(t, err)
+	require.NotNil(t, msg.CloseRequest)
+
+	s.handleClose(client, stream, msg.CloseRequest)
+	require.NoError(t, <-errCh)
+
+	// Original tunnel should still be there.
+	client.mu.Lock()
+	assert.Len(t, client.Tunnels, 1)
+	client.mu.Unlock()
+}
+
+func TestServer_HandleClose_EmptyTunnelID(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MuxConfig.KeepAliveInterval = 0
+	s := NewServer(cfg)
+
+	clientMux, serverMux := newMuxPair(t)
+
+	client := &ClientSession{
+		ID:        "close-empty-client",
+		Subdomain: "emptyclose",
+		Mux:       serverMux,
+		CreatedAt: time.Now(),
+		LastSeen:  time.Now(),
+	}
+
+	// Client sends a CloseRequest with empty tunnel ID.
+	errCh := make(chan error, 1)
+	go func() {
+		stream, openErr := clientMux.OpenStream()
+		if openErr != nil {
+			errCh <- openErr
+			return
+		}
+		defer stream.Close()
+
+		req := proto.NewCloseRequest("", "")
+		data, encErr := req.Encode()
+		if encErr != nil {
+			errCh <- encErr
+			return
+		}
+		if _, writeErr := stream.Write(data); writeErr != nil {
+			errCh <- writeErr
+			return
+		}
+
+		buf := make([]byte, 4096)
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			errCh <- readErr
+			return
+		}
+
+		msg, decErr := proto.DecodeControlMessage(buf[:n])
+		if decErr != nil {
+			errCh <- decErr
+			return
+		}
+		if msg.CloseResponse == nil {
+			errCh <- errors.New("expected close response")
+			return
+		}
+		if msg.CloseResponse.Success {
+			errCh <- errors.New("expected close to fail for empty tunnel ID")
+			return
+		}
+		errCh <- nil
+	}()
+
+	stream, err := serverMux.AcceptStream()
+	require.NoError(t, err)
+	defer stream.Close()
+
+	buf := make([]byte, 4096)
+	n, err := stream.Read(buf)
+	require.NoError(t, err)
+
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	require.NoError(t, err)
+	require.NotNil(t, msg.CloseRequest)
+
+	s.handleClose(client, stream, msg.CloseRequest)
+	require.NoError(t, <-errCh)
+}
+
+func TestServer_HandleClientStream_StatsAndClose(t *testing.T) {
+	// Test that handleClientStream correctly routes to handleStats and handleClose
+	// through the full message dispatch path.
+	cfg := DefaultConfig()
+	cfg.MuxConfig.KeepAliveInterval = 0
+	s := NewServer(cfg)
+
+	clientMux, serverMux := newMuxPair(t)
+
+	client := &ClientSession{
+		ID:        "dispatch-client",
+		Subdomain: "dispatch",
+		Mux:       serverMux,
+		CreatedAt: time.Now().Add(-5 * time.Second),
+		LastSeen:  time.Now(),
+		Tunnels: []*TunnelInfo{
+			{ID: "disp-t1", LocalPort: 8080, Protocol: proto.ProtocolHTTP, CreatedAt: time.Now()},
+		},
+	}
+	s.clientLock.Lock()
+	s.clients[client.ID] = client
+	s.clientLock.Unlock()
+
+	atomic.StoreUint64(&s.stats.ActiveTunnels, 1)
+
+	// Test 1: Stats via handleClientStream.
+	statsCh := make(chan error, 1)
+	go func() {
+		stream, openErr := clientMux.OpenStream()
+		if openErr != nil {
+			statsCh <- openErr
+			return
+		}
+		defer stream.Close()
+
+		req := proto.NewStatsRequest("dispatch-client")
+		data, _ := req.Encode()
+		if _, writeErr := stream.Write(data); writeErr != nil {
+			statsCh <- writeErr
+			return
+		}
+
+		buf := make([]byte, 4096)
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			statsCh <- readErr
+			return
+		}
+		msg, _ := proto.DecodeControlMessage(buf[:n])
+		if msg.StatsResponse == nil {
+			statsCh <- errors.New("expected stats response via dispatch")
+			return
+		}
+		if msg.StatsResponse.ActiveTunnels != 1 {
+			statsCh <- fmt.Errorf("expected 1 tunnel, got %d", msg.StatsResponse.ActiveTunnels)
+			return
+		}
+		statsCh <- nil
+	}()
+
+	statsStream, err := serverMux.AcceptStream()
+	require.NoError(t, err)
+	s.handleClientStream(client, statsStream)
+	require.NoError(t, <-statsCh)
+
+	// Test 2: Close via handleClientStream.
+	closeCh := make(chan error, 1)
+	go func() {
+		stream, openErr := clientMux.OpenStream()
+		if openErr != nil {
+			closeCh <- openErr
+			return
+		}
+		defer stream.Close()
+
+		req := proto.NewCloseRequest("disp-t1", "testing dispatch")
+		data, _ := req.Encode()
+		if _, writeErr := stream.Write(data); writeErr != nil {
+			closeCh <- writeErr
+			return
+		}
+
+		buf := make([]byte, 4096)
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			closeCh <- readErr
+			return
+		}
+		msg, _ := proto.DecodeControlMessage(buf[:n])
+		if msg.CloseResponse == nil {
+			closeCh <- errors.New("expected close response via dispatch")
+			return
+		}
+		if !msg.CloseResponse.Success {
+			closeCh <- errors.New("expected close to succeed via dispatch")
+			return
+		}
+		closeCh <- nil
+	}()
+
+	closeStream, err := serverMux.AcceptStream()
+	require.NoError(t, err)
+	s.handleClientStream(client, closeStream)
+	require.NoError(t, <-closeCh)
+
+	// Verify tunnel removed.
+	client.mu.Lock()
+	assert.Len(t, client.Tunnels, 0)
+	client.mu.Unlock()
+
+	assert.Equal(t, uint64(0), atomic.LoadUint64(&s.stats.ActiveTunnels))
+}
+
+func TestProto_NewStatsRequest(t *testing.T) {
+	msg := proto.NewStatsRequest("test-session")
+	assert.Equal(t, proto.MessageTypeStatsRequest, msg.Type)
+	require.NotNil(t, msg.StatsRequest)
+	assert.Equal(t, "test-session", msg.StatsRequest.SessionID)
+}
+
+func TestProto_NewStatsResponse(t *testing.T) {
+	msg := proto.NewStatsResponse(5, 10, 1024, 2048, 100, 3600)
+	assert.Equal(t, proto.MessageTypeStatsResponse, msg.Type)
+	require.NotNil(t, msg.StatsResponse)
+	assert.Equal(t, uint32(5), msg.StatsResponse.ActiveTunnels)
+	assert.Equal(t, uint32(10), msg.StatsResponse.ActiveConnections)
+	assert.Equal(t, uint64(1024), msg.StatsResponse.BytesSent)
+	assert.Equal(t, uint64(2048), msg.StatsResponse.BytesReceived)
+	assert.Equal(t, uint64(100), msg.StatsResponse.RequestsHandled)
+	assert.Equal(t, uint64(3600), msg.StatsResponse.UptimeSeconds)
 }

@@ -354,6 +354,31 @@ func NewStreamResponse(requestID string, accepted bool, err string) *ControlMess
 	}
 }
 
+// NewStatsRequest creates a new stats request message.
+func NewStatsRequest(sessionID string) *ControlMessage {
+	return &ControlMessage{
+		Type: MessageTypeStatsRequest,
+		StatsRequest: &StatsRequest{
+			SessionID: sessionID,
+		},
+	}
+}
+
+// NewStatsResponse creates a new stats response message.
+func NewStatsResponse(activeTunnels, activeConnections uint32, bytesSent, bytesReceived, requestsHandled, uptimeSeconds uint64) *ControlMessage {
+	return &ControlMessage{
+		Type: MessageTypeStatsResponse,
+		StatsResponse: &StatsResponse{
+			ActiveTunnels:     activeTunnels,
+			ActiveConnections: activeConnections,
+			BytesSent:         bytesSent,
+			BytesReceived:     bytesReceived,
+			RequestsHandled:   requestsHandled,
+			UptimeSeconds:     uptimeSeconds,
+		},
+	}
+}
+
 // NewCloseRequest creates a new close request message.
 func NewCloseRequest(tunnelID, reason string) *ControlMessage {
 	return &ControlMessage{

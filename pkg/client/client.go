@@ -37,6 +37,7 @@ type Client struct {
 	connected uint32
 	publicURL string
 	tunnelID  string
+	sessionID string // Server-assigned session ID (for reconnect awareness).
 
 	// Inspector
 	inspector        *inspector.Inspector
@@ -152,7 +153,9 @@ func (c *Client) connectWithRetry(ctx context.Context) error {
 		c.handleConnection(ctx)
 
 		// Connection lost, will reconnect
-		log.Warn().Msg("Connection lost, reconnecting...")
+		log.Warn().
+			Str("tunnel_id", c.tunnelID).
+			Msg("Connection lost, reconnecting (tunnel will be re-registered)...")
 	}
 }
 
@@ -311,6 +314,13 @@ func (c *Client) authenticate(ctx context.Context) error {
 	if resp.Subdomain != "" {
 		c.mu.Lock()
 		c.config.Subdomain = resp.Subdomain
+		c.mu.Unlock()
+	}
+
+	// Save session ID for reconnect awareness.
+	if resp.SessionID != "" {
+		c.mu.Lock()
+		c.sessionID = resp.SessionID
 		c.mu.Unlock()
 	}
 
@@ -1247,9 +1257,26 @@ func (c *Client) GetP2PManager() *p2p.Manager {
 }
 
 // Close closes the client.
+// It performs graceful shutdown by sending a CloseRequest to the server
+// before tearing down the connection.
 func (c *Client) Close() error {
 	if !atomic.CompareAndSwapUint32(&c.closed, 0, 1) {
 		return nil
+	}
+
+	// Graceful shutdown: send CloseRequest to server before closing.
+	c.mu.Lock()
+	mux := c.mux
+	tunnelID := c.tunnelID
+	c.mu.Unlock()
+
+	if mux != nil && !mux.IsClosed() && tunnelID != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		closeErr := c.CloseTunnel(ctx, tunnelID, "client shutting down")
+		cancel()
+		if closeErr != nil {
+			log.Debug().Err(closeErr).Msg("Graceful tunnel close failed (proceeding with shutdown)")
+		}
 	}
 
 	close(c.closeCh)
@@ -1306,6 +1333,120 @@ func (c *Client) GetStats() Stats {
 		Reconnects:     atomic.LoadUint64(&c.stats.Reconnects),
 		ConnectionTime: c.stats.ConnectionTime,
 	}
+}
+
+// RequestStats sends a StatsRequest to the server and returns the session statistics.
+func (c *Client) RequestStats(ctx context.Context) (*proto.StatsResponse, error) {
+	c.mu.Lock()
+	mux := c.mux
+	sessionID := c.sessionID
+	c.mu.Unlock()
+
+	if mux == nil || mux.IsClosed() {
+		return nil, fmt.Errorf("not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	stream, err := mux.OpenStreamContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("open stream: %w", err)
+	}
+	defer stream.Close()
+
+	if deadlineErr := stream.SetDeadline(time.Now().Add(10 * time.Second)); deadlineErr != nil {
+		return nil, fmt.Errorf("set deadline: %w", deadlineErr)
+	}
+
+	req := proto.NewStatsRequest(sessionID)
+	data, err := req.Encode()
+	if err != nil {
+		return nil, fmt.Errorf("encode stats request: %w", err)
+	}
+
+	if _, writeErr := stream.Write(data); writeErr != nil {
+		return nil, fmt.Errorf("write stats request: %w", writeErr)
+	}
+
+	// Read response.
+	buf := make([]byte, 4096)
+	n, err := stream.Read(buf)
+	if err != nil {
+		return nil, fmt.Errorf("read stats response: %w", err)
+	}
+
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	if err != nil {
+		return nil, fmt.Errorf("decode stats response: %w", err)
+	}
+
+	if msg.StatsResponse == nil {
+		return nil, fmt.Errorf("unexpected response type (expected stats response)")
+	}
+
+	return msg.StatsResponse, nil
+}
+
+// CloseTunnel sends a CloseRequest to the server to gracefully close a tunnel.
+func (c *Client) CloseTunnel(ctx context.Context, tunnelID, reason string) error {
+	c.mu.Lock()
+	mux := c.mux
+	c.mu.Unlock()
+
+	if mux == nil || mux.IsClosed() {
+		return fmt.Errorf("not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	stream, err := mux.OpenStreamContext(ctx)
+	if err != nil {
+		return fmt.Errorf("open stream: %w", err)
+	}
+	defer stream.Close()
+
+	if deadlineErr := stream.SetDeadline(time.Now().Add(10 * time.Second)); deadlineErr != nil {
+		return fmt.Errorf("set deadline: %w", deadlineErr)
+	}
+
+	req := proto.NewCloseRequest(tunnelID, reason)
+	data, err := req.Encode()
+	if err != nil {
+		return fmt.Errorf("encode close request: %w", err)
+	}
+
+	if _, writeErr := stream.Write(data); writeErr != nil {
+		return fmt.Errorf("write close request: %w", writeErr)
+	}
+
+	// Read response.
+	buf := make([]byte, 4096)
+	n, err := stream.Read(buf)
+	if err != nil {
+		return fmt.Errorf("read close response: %w", err)
+	}
+
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	if err != nil {
+		return fmt.Errorf("decode close response: %w", err)
+	}
+
+	if msg.CloseResponse == nil {
+		return fmt.Errorf("unexpected response type (expected close response)")
+	}
+
+	if !msg.CloseResponse.Success {
+		return fmt.Errorf("server rejected close request")
+	}
+
+	log.Info().
+		Str("tunnel_id", tunnelID).
+		Str("reason", reason).
+		Msg("Tunnel closed successfully")
+
+	return nil
 }
 
 // StartInspector starts the inspector UI server.

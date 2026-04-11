@@ -550,12 +550,19 @@ func (s *Server) handleClientStream(client *ClientSession, stream *tunnel.Stream
 		s.handleRegister(client, stream, msg.RegisterRequest)
 	case proto.MessageTypePingRequest:
 		s.handlePing(client, stream, msg.PingRequest)
+	case proto.MessageTypeStatsRequest:
+		s.handleStats(client, stream, msg.StatsRequest)
+	case proto.MessageTypeCloseRequest:
+		s.handleClose(client, stream, msg.CloseRequest)
 	case proto.MessageTypeP2POfferRequest:
 		s.handleP2POffer(client, stream, msg.P2POfferRequest)
 	case proto.MessageTypeP2PResult:
 		s.handleP2PResult(client, msg.P2PResult)
 	default:
-		log.Warn().Int("type", int(msg.Type)).Msg("Unknown message type")
+		log.Warn().
+			Int("type", int(msg.Type)).
+			Str("client", client.ID).
+			Msg("Unknown control message type")
 	}
 }
 
@@ -668,6 +675,112 @@ func (s *Server) handlePing(client *ClientSession, stream *tunnel.Stream, req *p
 	}
 	if _, err := stream.Write(data); err != nil {
 		log.Error().Err(err).Msg("Failed to write ping response")
+	}
+}
+
+// handleStats handles a stats request from a client.
+// It returns the client's session statistics including active tunnels,
+// byte counters, and uptime.
+func (s *Server) handleStats(client *ClientSession, stream *tunnel.Stream, _ *proto.StatsRequest) {
+	client.mu.Lock()
+	tunnelCount := uint32(len(client.Tunnels))
+	bytesIn := client.BytesIn
+	bytesOut := client.BytesOut
+	createdAt := client.CreatedAt
+	client.mu.Unlock()
+
+	uptimeSeconds := uint64(time.Since(createdAt).Seconds())
+
+	resp := proto.NewStatsResponse(
+		tunnelCount,
+		0, // ActiveConnections — not tracked per-client yet.
+		bytesOut,
+		bytesIn,
+		0, // RequestsHandled — not tracked per-client yet.
+		uptimeSeconds,
+	)
+	data, err := resp.Encode()
+	if err != nil {
+		log.Error().Err(err).Str("client", client.ID).Msg("Failed to encode stats response")
+		return
+	}
+	if _, err := stream.Write(data); err != nil {
+		log.Error().Err(err).Str("client", client.ID).Msg("Failed to write stats response")
+	}
+}
+
+// handleClose handles a close request from a client.
+// It finds the specified tunnel, cleans up its routes and TCP port,
+// removes it from the client session, and returns a CloseResponse.
+func (s *Server) handleClose(client *ClientSession, stream *tunnel.Stream, req *proto.CloseRequest) {
+	if req == nil || req.TunnelID == "" {
+		log.Warn().Str("client", client.ID).Msg("Close request with empty tunnel ID")
+		resp := proto.NewCloseResponse(false)
+		data, err := resp.Encode()
+		if err != nil {
+			return
+		}
+		_, _ = stream.Write(data)
+		return
+	}
+
+	log.Info().
+		Str("client", client.ID).
+		Str("tunnel_id", req.TunnelID).
+		Str("reason", req.Reason).
+		Msg("Close request received")
+
+	// Find and remove the tunnel from the client session.
+	client.mu.Lock()
+	var removed *TunnelInfo
+	for i, t := range client.Tunnels {
+		if t.ID == req.TunnelID {
+			removed = t
+			// Remove from slice by swapping with last element.
+			client.Tunnels[i] = client.Tunnels[len(client.Tunnels)-1]
+			client.Tunnels = client.Tunnels[:len(client.Tunnels)-1]
+			break
+		}
+	}
+	client.mu.Unlock()
+
+	if removed == nil {
+		log.Warn().
+			Str("client", client.ID).
+			Str("tunnel_id", req.TunnelID).
+			Msg("Tunnel not found for close request")
+		resp := proto.NewCloseResponse(false)
+		data, err := resp.Encode()
+		if err != nil {
+			return
+		}
+		_, _ = stream.Write(data)
+		return
+	}
+
+	// Release allocated TCP port if any.
+	if removed.TCPPort > 0 {
+		s.portAllocator.Release(int(removed.TCPPort))
+	}
+
+	// Decrement active tunnel counter.
+	atomic.AddUint64(&s.stats.ActiveTunnels, ^uint64(0))
+
+	log.Info().
+		Str("client", client.ID).
+		Str("tunnel_id", req.TunnelID).
+		Str("public_url", removed.PublicURL).
+		Msg("Tunnel closed successfully")
+
+	// Send success response.
+	resp := proto.NewCloseResponse(true)
+	data, err := resp.Encode()
+	if err != nil {
+		log.Error().Err(err).Str("client", client.ID).Msg("Failed to encode close response")
+		return
+	}
+	if _, err := stream.Write(data); err != nil {
+		log.Error().Err(err).Str("client", client.ID).Msg("Failed to write close response")
 	}
 }
 
