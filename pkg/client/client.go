@@ -1316,7 +1316,7 @@ func (c *Client) StartInspector(port int) error {
 
 	host := c.config.InspectorHost
 	if host == "" {
-		host = "127.0.0.1" //nolint:goconst // well-known literal used in distinct contexts across packages
+		host = "127.0.0.1"
 	}
 	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	log.Info().Str("addr", addr).Msg("Starting inspector UI")
