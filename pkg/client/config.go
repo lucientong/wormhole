@@ -82,7 +82,7 @@ func DefaultConfig() Config {
 	return Config{
 		ServerAddr:           "localhost:7000",
 		LocalPort:            8080,
-		LocalHost:            "127.0.0.1",
+		LocalHost:            defaultLocalHost,
 		MuxConfig:            tunnel.DefaultMuxConfig(),
 		ReconnectInterval:    1 * time.Second,
 		MaxReconnectInterval: 60 * time.Second,

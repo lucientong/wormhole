@@ -27,6 +27,9 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// defaultLocalHost is the default host for local service binding and inspector UI.
+const defaultLocalHost = "127.0.0.1"
+
 // Client is the wormhole client.
 type Client struct {
 	config Config
@@ -1457,7 +1460,7 @@ func (c *Client) StartInspector(port int) error {
 
 	host := c.config.InspectorHost
 	if host == "" {
-		host = "127.0.0.1"
+		host = defaultLocalHost
 	}
 	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	log.Info().Str("addr", addr).Msg("Starting inspector UI")
