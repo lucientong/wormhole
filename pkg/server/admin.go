@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -220,12 +221,19 @@ type ErrorResponse struct {
 }
 
 // requireAdminAuth wraps a handler with admin token authentication.
-// If AdminToken is not configured, it passes through without checking.
+// When AdminToken is configured, it requires Bearer token in the Authorization header.
+// When AdminToken is empty, it only allows requests from loopback addresses (127.0.0.1 / ::1).
 func (a *AdminAPI) requireAdminAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		adminToken := a.server.config.AdminToken
 		if adminToken == "" {
-			// No admin token configured — allow unrestricted access.
+			// No admin token — only allow loopback access for safety.
+			if !isLoopbackRequest(r) {
+				writeJSON(w, http.StatusForbidden, ErrorResponse{
+					Error: "admin API requires authentication when accessed from non-loopback address; set --admin-token or access from localhost",
+				})
+				return
+			}
 			next(w, r)
 			return
 		}
@@ -251,6 +259,20 @@ func (a *AdminAPI) requireAdminAuth(next http.HandlerFunc) http.HandlerFunc {
 
 		next(w, r)
 	}
+}
+
+// isLoopbackRequest checks whether the request originates from a loopback address.
+func isLoopbackRequest(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		// Cannot parse, be conservative.
+		return false
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback()
 }
 
 // RateLimitResponse is the response for the rate limit status endpoint.

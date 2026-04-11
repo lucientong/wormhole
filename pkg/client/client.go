@@ -5,12 +5,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -155,12 +158,27 @@ func (c *Client) connectWithRetry(ctx context.Context) error {
 
 // connect establishes a connection to the server.
 func (c *Client) connect(ctx context.Context) error {
-	// Dial server
+	// Dial server (plain TCP or TLS).
 	dialer := &net.Dialer{
 		Timeout: 10 * time.Second,
 	}
 
-	conn, err := dialer.DialContext(ctx, "tcp", c.config.ServerAddr)
+	var conn net.Conn
+	var err error
+
+	if c.config.TLSEnabled {
+		tlsConfig, tlsErr := c.buildTLSConfig()
+		if tlsErr != nil {
+			return fmt.Errorf("build TLS config: %w", tlsErr)
+		}
+		tlsDialer := &tls.Dialer{
+			NetDialer: dialer,
+			Config:    tlsConfig,
+		}
+		conn, err = tlsDialer.DialContext(ctx, "tcp", c.config.ServerAddr)
+	} else {
+		conn, err = dialer.DialContext(ctx, "tcp", c.config.ServerAddr)
+	}
 	if err != nil {
 		return fmt.Errorf("dial server: %w", err)
 	}
@@ -199,6 +217,40 @@ func (c *Client) connect(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// buildTLSConfig builds a *tls.Config from the client configuration.
+func (c *Client) buildTLSConfig() (*tls.Config, error) {
+	tlsConfig := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
+
+	if c.config.TLSInsecure {
+		tlsConfig.InsecureSkipVerify = true // #nosec G402 -- user explicitly opted in via --tls-insecure
+	}
+
+	// Load custom CA certificate if specified.
+	if c.config.TLSCACert != "" {
+		caCert, err := os.ReadFile(c.config.TLSCACert) // #nosec G304 -- path from CLI flag, not untrusted input
+		if err != nil {
+			return nil, fmt.Errorf("read CA certificate: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caCert) {
+			return nil, fmt.Errorf("failed to parse CA certificate from %s", c.config.TLSCACert)
+		}
+		tlsConfig.RootCAs = pool
+	}
+
+	// Extract hostname from server address for SNI.
+	host, _, err := net.SplitHostPort(c.config.ServerAddr)
+	if err != nil {
+		// If no port in address, use as-is.
+		host = c.config.ServerAddr
+	}
+	tlsConfig.ServerName = host
+
+	return tlsConfig, nil
 }
 
 // authenticate sends an AuthRequest to the server and validates the response.
@@ -291,7 +343,8 @@ func (c *Client) registerTunnel(ctx context.Context) error {
 	if c.config.LocalPort < 0 || c.config.LocalPort > 65535 {
 		return fmt.Errorf("invalid local port: %d", c.config.LocalPort)
 	}
-	req := proto.NewRegisterRequest(uint32(c.config.LocalPort), proto.ProtocolHTTP, c.config.Subdomain) // #nosec G115
+	p := parseProtocol(c.config.Protocol)
+	req := proto.NewRegisterRequest(uint32(c.config.LocalPort), p, c.config.Subdomain, c.config.Hostname, c.config.PathPrefix) // #nosec G115
 	data, err := req.Encode()
 	if err != nil {
 		return fmt.Errorf("encode request: %w", err)
@@ -1261,7 +1314,11 @@ func (c *Client) StartInspector(port int) error {
 		return nil
 	}
 
-	addr := net.JoinHostPort("", fmt.Sprintf("%d", port))
+	host := c.config.InspectorHost
+	if host == "" {
+		host = "127.0.0.1" //nolint:goconst // well-known literal used in distinct contexts across packages
+	}
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	log.Info().Str("addr", addr).Msg("Starting inspector UI")
 
 	// Create inspector handler.
@@ -1294,4 +1351,25 @@ func (c *Client) StartInspector(port int) error {
 // GetInspector returns the inspector instance.
 func (c *Client) GetInspector() *inspector.Inspector {
 	return c.inspector
+}
+
+// parseProtocol converts a protocol string to a proto.Protocol value.
+// Returns proto.ProtocolHTTP if the input is empty or unrecognized.
+func parseProtocol(s string) proto.Protocol {
+	switch strings.ToLower(s) {
+	case "http", "":
+		return proto.ProtocolHTTP
+	case "https":
+		return proto.ProtocolHTTPS
+	case "tcp":
+		return proto.ProtocolTCP
+	case "udp":
+		return proto.ProtocolUDP
+	case "ws", "websocket":
+		return proto.ProtocolWebSocket
+	case "grpc":
+		return proto.ProtocolGRPC
+	default:
+		return proto.ProtocolHTTP
+	}
 }

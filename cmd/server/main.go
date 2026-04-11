@@ -23,9 +23,11 @@ func main() {
 	domain := flag.String("domain", "localhost", "Base domain for tunnel URLs")
 	httpPort := flag.Int("http-port", 80, "HTTP listener port")
 	adminPort := flag.Int("admin-port", 7001, "Admin API listener port")
+	adminHost := flag.String("admin-host", "127.0.0.1", "Host for admin API (default: 127.0.0.1 for safety)")
 
 	// TLS flags.
 	tlsEnabled := flag.Bool("tls", false, "Enable TLS")
+	tunnelTLS := flag.Bool("tunnel-tls", false, "Enable TLS for the tunnel control listener (default: same as --tls)")
 	certFile := flag.String("cert", "", "TLS certificate file path")
 	keyFile := flag.String("key", "", "TLS private key file path")
 
@@ -51,7 +53,7 @@ func main() {
 	config := server.DefaultConfig()
 	config.ListenAddr = net.JoinHostPort(*host, strconv.Itoa(*port))
 	config.HTTPAddr = net.JoinHostPort(*host, strconv.Itoa(*httpPort))
-	config.AdminAddr = net.JoinHostPort(*host, strconv.Itoa(*adminPort))
+	config.AdminAddr = net.JoinHostPort(*adminHost, strconv.Itoa(*adminPort))
 	config.Domain = *domain
 	config.TLSEnabled = *tlsEnabled
 	config.TLSCertFile = *certFile
@@ -70,6 +72,27 @@ func main() {
 		config.Persistence = server.PersistenceMemory
 	}
 	config.PersistencePath = *persistencePath
+
+	// Tunnel TLS defaults to the global TLS setting unless explicitly overridden.
+	tunnelTLSExplicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "tunnel-tls" {
+			tunnelTLSExplicit = true
+		}
+	})
+	if tunnelTLSExplicit {
+		config.TunnelTLSEnabled = *tunnelTLS
+	} else {
+		config.TunnelTLSEnabled = *tlsEnabled
+	}
+
+	// Warn if admin API is exposed on non-loopback without a token.
+	if config.AdminToken == "" && *adminHost != "127.0.0.1" && *adminHost != "::1" && *adminHost != "localhost" {
+		log.Warn().
+			Str("admin_addr", config.AdminAddr).
+			Msg("WARNING: Admin API is bound to a non-loopback address without --admin-token; " +
+				"unauthenticated access will be restricted to loopback clients only")
+	}
 
 	srv := server.NewServer(config)
 

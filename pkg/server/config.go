@@ -45,6 +45,11 @@ type Config struct {
 	// AutoTLSEmail is the email for Let's Encrypt registration.
 	AutoTLSEmail string
 
+	// TunnelTLSEnabled enables TLS for the tunnel control listener.
+	// When true, the tunnel listener is also wrapped with TLS.
+	// Defaults to the value of TLSEnabled if not explicitly set.
+	TunnelTLSEnabled bool
+
 	// TCPPortRange is the range of ports for TCP tunnels.
 	TCPPortRangeStart int
 	TCPPortRangeEnd   int

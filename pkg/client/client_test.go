@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -2033,4 +2035,178 @@ func (f *fakePacketConn) SetReadDeadline(t time.Time) error {
 
 func (f *fakePacketConn) SetWriteDeadline(t time.Time) error {
 	return f.conn.SetWriteDeadline(t)
+}
+
+// ============================================================================
+// P0-2 Multi-Protocol: parseProtocol Tests
+// ============================================================================
+
+// TestParseProtocol verifies parseProtocol maps protocol strings correctly.
+func TestParseProtocol(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected proto.Protocol
+	}{
+		{"http", proto.ProtocolHTTP},
+		{"HTTP", proto.ProtocolHTTP},
+		{"Http", proto.ProtocolHTTP},
+		{"", proto.ProtocolHTTP},
+		{"https", proto.ProtocolHTTPS},
+		{"HTTPS", proto.ProtocolHTTPS},
+		{"tcp", proto.ProtocolTCP},
+		{"TCP", proto.ProtocolTCP},
+		{"udp", proto.ProtocolUDP},
+		{"UDP", proto.ProtocolUDP},
+		{"ws", proto.ProtocolWebSocket},
+		{"websocket", proto.ProtocolWebSocket},
+		{"WebSocket", proto.ProtocolWebSocket},
+		{"grpc", proto.ProtocolGRPC},
+		{"gRPC", proto.ProtocolGRPC},
+		{"unknown", proto.ProtocolHTTP},
+		{"ftp", proto.ProtocolHTTP},
+	}
+
+	for _, tt := range tests {
+		t.Run("protocol_"+tt.input, func(t *testing.T) {
+			result := parseProtocol(tt.input)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+// ============================================================================
+// P0-1 TLS: buildTLSConfig Tests
+// ============================================================================
+
+// TestBuildTLSConfig_Defaults verifies TLS config defaults.
+func TestBuildTLSConfig_Defaults(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ServerAddr = "example.com:7000"
+	cfg.TLSEnabled = true
+
+	c := NewClient(cfg)
+	tlsCfg, err := c.buildTLSConfig()
+	require.NoError(t, err)
+
+	assert.Equal(t, uint16(tls.VersionTLS12), tlsCfg.MinVersion)
+	assert.False(t, tlsCfg.InsecureSkipVerify)
+	assert.Equal(t, "example.com", tlsCfg.ServerName)
+	assert.Nil(t, tlsCfg.RootCAs) // No custom CA.
+}
+
+// TestBuildTLSConfig_Insecure verifies InsecureSkipVerify when TLSInsecure is set.
+func TestBuildTLSConfig_Insecure(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ServerAddr = "example.com:7000"
+	cfg.TLSEnabled = true
+	cfg.TLSInsecure = true
+
+	c := NewClient(cfg)
+	tlsCfg, err := c.buildTLSConfig()
+	require.NoError(t, err)
+
+	assert.True(t, tlsCfg.InsecureSkipVerify)
+	assert.Equal(t, "example.com", tlsCfg.ServerName)
+}
+
+// TestBuildTLSConfig_ServerNameFromAddr verifies SNI extraction.
+func TestBuildTLSConfig_ServerNameFromAddr(t *testing.T) {
+	tests := []struct {
+		name       string
+		serverAddr string
+		expectSNI  string
+	}{
+		{"host:port", "myserver.io:7000", "myserver.io"},
+		{"IP:port", "10.0.0.1:7000", "10.0.0.1"},
+		{"no port", "myserver.io", "myserver.io"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.ServerAddr = tt.serverAddr
+			cfg.TLSEnabled = true
+
+			c := NewClient(cfg)
+			tlsCfg, err := c.buildTLSConfig()
+			require.NoError(t, err)
+			assert.Equal(t, tt.expectSNI, tlsCfg.ServerName)
+		})
+	}
+}
+
+// TestBuildTLSConfig_InvalidCAFile verifies error on missing CA file.
+func TestBuildTLSConfig_InvalidCAFile(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ServerAddr = "example.com:7000"
+	cfg.TLSEnabled = true
+	cfg.TLSCACert = "/nonexistent/ca-cert.pem"
+
+	c := NewClient(cfg)
+	_, err := c.buildTLSConfig()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "read CA certificate")
+}
+
+// TestBuildTLSConfig_InvalidCACert verifies error on invalid PEM content.
+func TestBuildTLSConfig_InvalidCACert(t *testing.T) {
+	// Create a temp file with invalid PEM content.
+	tmpFile, err := os.CreateTemp(t.TempDir(), "invalid-ca-*.pem")
+	require.NoError(t, err)
+
+	_, err = tmpFile.WriteString("this is not a valid PEM certificate")
+	require.NoError(t, err)
+	require.NoError(t, tmpFile.Close())
+
+	cfg := DefaultConfig()
+	cfg.ServerAddr = "example.com:7000"
+	cfg.TLSEnabled = true
+	cfg.TLSCACert = tmpFile.Name()
+
+	c := NewClient(cfg)
+	_, err = c.buildTLSConfig()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to parse CA certificate")
+}
+
+// ============================================================================
+// P0 Config: New Fields Tests
+// ============================================================================
+
+// TestDefaultConfig_NewP0Fields verifies that new P0 config fields have correct defaults.
+func TestDefaultConfig_NewP0Fields(t *testing.T) {
+	cfg := DefaultConfig()
+
+	// P0-3: InspectorHost not set in DefaultConfig (empty string → caller uses "127.0.0.1").
+	assert.Empty(t, cfg.InspectorHost)
+
+	// P0-1: TLS defaults to disabled.
+	assert.False(t, cfg.TLSEnabled)
+	assert.False(t, cfg.TLSInsecure)
+	assert.Empty(t, cfg.TLSCACert)
+
+	// P0-2: Protocol defaults to empty (interpreted as "http").
+	assert.Empty(t, cfg.Protocol)
+	assert.Empty(t, cfg.Hostname)
+	assert.Empty(t, cfg.PathPrefix)
+}
+
+// TestConfigFields_CanBeSet verifies P0 config fields can be set.
+func TestConfigFields_CanBeSet(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.InspectorHost = "0.0.0.0"
+	cfg.TLSEnabled = true
+	cfg.TLSInsecure = true
+	cfg.TLSCACert = "/path/to/ca.pem"
+	cfg.Protocol = "tcp"
+	cfg.Hostname = "custom.example.com"
+	cfg.PathPrefix = "/api/v1"
+
+	assert.Equal(t, "0.0.0.0", cfg.InspectorHost)
+	assert.True(t, cfg.TLSEnabled)
+	assert.True(t, cfg.TLSInsecure)
+	assert.Equal(t, "/path/to/ca.pem", cfg.TLSCACert)
+	assert.Equal(t, "tcp", cfg.Protocol)
+	assert.Equal(t, "custom.example.com", cfg.Hostname)
+	assert.Equal(t, "/api/v1", cfg.PathPrefix)
 }

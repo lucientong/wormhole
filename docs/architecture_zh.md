@@ -441,10 +441,12 @@ TCP 隧道不经过 Inspector，因为没有 HTTP 语义可解析。
                     │  └────────────────┘      │
                     │                          │
                     │  HTTP API:               │
-                    │  GET /api/requests       │ ◄── 历史记录查询
-                    │  GET /api/requests/:id   │ ◄── 详情
-                    │  WS  /api/ws             │ ◄── 实时流
-                    │  DELETE /api/requests     │ ◄── 清空
+                    │  GET  /api/inspector/records    │ ◄── 历史记录查询
+                    │  GET  /api/inspector/records/:id│ ◄── 详情
+                    │  GET  /api/inspector/stats      │ ◄── 统计
+                    │  POST /api/inspector/clear      │ ◄── 清空
+                    │  POST /api/inspector/toggle     │ ◄── 切换捕获
+                    │  WS   /api/inspector/ws         │ ◄── 实时流
                     └──────────────────────────┘
 ```
 
@@ -833,6 +835,8 @@ SQLite 存储：
 - `/stats`、`/clients`、`/tunnels`、`/teams` 受 `--admin-token` 保护
 - 使用 `Authorization: Bearer <token>` 头
 - Token 比较使用 `crypto/subtle.ConstantTimeCompare` 防止时序攻击
+- 未设置 `--admin-token` 时，仅允许回环地址请求（`127.0.0.1` / `::1`）；非回环请求返回 403 Forbidden
+- Admin API 默认绑定 `127.0.0.1`（通过 `--admin-host` 标志覆盖）
 
 ### 团队管理 API
 
@@ -853,6 +857,7 @@ server_addr: "tunnel.example.com:7000"
 token: "eyJ0ZWFtIjoiYWxwaGEiLCJyb2xlIjoibWVtYmVyIi4uLn0.xxx"
 subdomain: "myapp"
 tls_enabled: true
+tls_insecure: false
 p2p_enabled: true
 ```
 
@@ -867,7 +872,8 @@ p2p_enabled: true
 ### 传输加密
 
 - Server 支持 TLS 终止（Let's Encrypt 自动证书 或 手动证书）
-- Client-Server 隧道连接可选 TLS 加密
+- Client-Server 隧道控制链路支持 TLS 加密（客户端 `--tls` / `--tls-insecure` / `--tls-ca` 标志）
+- Server 隧道监听器可通过 `--tunnel-tls` 标志独立开启 TLS
 
 ### P2P 端到端加密
 

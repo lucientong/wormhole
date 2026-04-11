@@ -191,6 +191,11 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	s.tunnelListener = tunnelLn
 
+	// Wrap tunnel listener with TLS if configured.
+	if s.config.TunnelTLSEnabled {
+		s.tunnelListener = s.tlsManager.WrapListener(tunnelLn)
+	}
+
 	// Start HTTP listener (with optional TLS).
 	httpLn, err := lc.Listen(ctx, "tcp", s.config.HTTPAddr)
 	if err != nil {
@@ -581,6 +586,11 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 	if req.Hostname != "" {
 		if regErr := s.router.RegisterHostname(req.Hostname, client); regErr != nil {
 			log.Warn().Err(regErr).Str("hostname", req.Hostname).Msg("Failed to register custom hostname")
+		}
+	}
+	if req.PathPrefix != "" {
+		if regErr := s.router.RegisterPath(req.PathPrefix, client); regErr != nil {
+			log.Warn().Err(regErr).Str("path_prefix", req.PathPrefix).Msg("Failed to register path prefix")
 		}
 	}
 

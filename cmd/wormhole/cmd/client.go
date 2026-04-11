@@ -18,7 +18,14 @@ var (
 	clientSubdomain     string
 	clientToken         string
 	clientInspectorPort int
+	clientInspectorHost string
 	clientP2PEnabled    bool
+	clientTLS           bool
+	clientTLSInsecure   bool
+	clientTLSCA         string
+	clientProtocol      string
+	clientHostname      string
+	clientPathPrefix    string
 )
 
 // clientCmd represents the client command.
@@ -55,19 +62,27 @@ func init() {
 	clientCmd.Flags().StringVar(&clientSubdomain, "subdomain", "", "Request a specific subdomain")
 	clientCmd.Flags().StringVarP(&clientToken, "token", "t", "", "Team token for authentication")
 	clientCmd.Flags().IntVar(&clientInspectorPort, "inspector", 0, "Port for traffic inspector UI (0 to disable)")
+	clientCmd.Flags().StringVar(&clientInspectorHost, "inspector-host", "127.0.0.1", "Host for inspector UI (default: 127.0.0.1)")
 	clientCmd.Flags().BoolVar(&clientP2PEnabled, "p2p", true, "Enable P2P direct connection when possible")
+	clientCmd.Flags().BoolVar(&clientTLS, "tls", false, "Enable TLS for server connection")
+	clientCmd.Flags().BoolVar(&clientTLSInsecure, "tls-insecure", false, "Skip TLS certificate verification (dev only)")
+	clientCmd.Flags().StringVar(&clientTLSCA, "tls-ca", "", "Path to custom CA certificate for TLS verification")
+	clientCmd.Flags().StringVarP(&clientProtocol, "protocol", "P", "http", "Tunnel protocol: http, https, tcp, udp, ws, grpc")
+	clientCmd.Flags().StringVar(&clientHostname, "hostname", "", "Custom hostname for routing")
+	clientCmd.Flags().StringVar(&clientPathPrefix, "path-prefix", "", "Path-based routing prefix")
 
 	_ = clientCmd.MarkFlagRequired("local")
 }
 
 func runClient(_ *cobra.Command, _ []string) {
 	startClient(clientLocalPort, clientServer, clientLocalHost, clientSubdomain,
-		clientToken, clientInspectorPort, clientP2PEnabled)
+		clientToken, clientInspectorPort, clientInspectorHost, clientP2PEnabled, clientTLS, clientTLSInsecure, clientTLSCA,
+		clientProtocol, clientHostname, clientPathPrefix)
 }
 
 // startClient creates and starts a Wormhole client with the given parameters.
 // It is shared by both the client subcommand and the root quick-mode handler.
-func startClient(localPort int, serverAddr, localHost, subdomain, token string, inspectorPort int, p2pEnabled bool) {
+func startClient(localPort int, serverAddr, localHost, subdomain, token string, inspectorPort int, inspectorHost string, p2pEnabled, tlsEnabled, tlsInsecure bool, tlsCA, protocol, hostname, pathPrefix string) {
 	config := client.DefaultConfig()
 	config.ServerAddr = serverAddr
 	config.LocalPort = localPort
@@ -75,7 +90,14 @@ func startClient(localPort int, serverAddr, localHost, subdomain, token string, 
 	config.Subdomain = subdomain
 	config.Token = token
 	config.InspectorPort = inspectorPort
+	config.InspectorHost = inspectorHost
 	config.P2PEnabled = p2pEnabled
+	config.TLSEnabled = tlsEnabled
+	config.TLSInsecure = tlsInsecure
+	config.TLSCACert = tlsCA
+	config.Protocol = protocol
+	config.Hostname = hostname
+	config.PathPrefix = pathPrefix
 
 	c := client.NewClient(config)
 

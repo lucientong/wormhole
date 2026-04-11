@@ -13,6 +13,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// defaultDomain is the fallback domain when none is specified.
+const defaultDomain = "localhost"
+
 var (
 	serverPort            int
 	serverHost            string
@@ -28,6 +31,8 @@ var (
 	serverAdminToken      string
 	serverPersistence     string
 	serverPersistencePath string
+	serverTunnelTLS       bool
+	serverAdminHost       string
 )
 
 // serverCmd represents the server command.
@@ -85,22 +90,24 @@ func init() {
 	serverCmd.Flags().StringVar(&serverAdminToken, "admin-token", "", "Token for admin API authentication")
 	serverCmd.Flags().StringVar(&serverPersistence, "persistence", "memory", "Storage backend: memory (default) or sqlite")
 	serverCmd.Flags().StringVar(&serverPersistencePath, "persistence-path", "", "Path to SQLite database (default: ~/.wormhole/wormhole.db)")
+	serverCmd.Flags().BoolVar(&serverTunnelTLS, "tunnel-tls", false, "Enable TLS for the tunnel control listener (default: same as --tls)")
+	serverCmd.Flags().StringVar(&serverAdminHost, "admin-host", "127.0.0.1", "Host for admin API (default: 127.0.0.1 for safety)")
 }
 
-func runServer(_ *cobra.Command, _ []string) {
+func runServer(cmd *cobra.Command, _ []string) {
 	// Support WORMHOLE_DOMAIN environment variable as default for --domain.
 	if serverDomain == "" {
 		if envDomain := os.Getenv("WORMHOLE_DOMAIN"); envDomain != "" {
 			serverDomain = envDomain
 		} else {
-			serverDomain = "localhost"
+			serverDomain = defaultDomain
 		}
 	}
 
 	config := server.DefaultConfig()
 	config.ListenAddr = net.JoinHostPort(serverHost, strconv.Itoa(serverPort))
 	config.HTTPAddr = net.JoinHostPort(serverHost, strconv.Itoa(serverHTTPPort))
-	config.AdminAddr = net.JoinHostPort(serverHost, strconv.Itoa(serverAdminPort))
+	config.AdminAddr = net.JoinHostPort(serverAdminHost, strconv.Itoa(serverAdminPort))
 	config.Domain = serverDomain
 	config.TLSEnabled = serverTLSEnabled
 	config.TLSCertFile = serverTLSCert
@@ -111,8 +118,14 @@ func runServer(_ *cobra.Command, _ []string) {
 	config.AdminToken = serverAdminToken
 	config.PersistencePath = serverPersistencePath
 
+	// Tunnel TLS defaults to the global TLS setting unless explicitly overridden.
+	config.TunnelTLSEnabled = serverTunnelTLS
+	if !cmd.Flags().Changed("tunnel-tls") {
+		config.TunnelTLSEnabled = config.TLSEnabled
+	}
+
 	// Enable auto-TLS when TLS is enabled, a real domain is set, and no manual cert/key provided.
-	if config.TLSEnabled && config.Domain != "" && config.Domain != "localhost" &&
+	if config.TLSEnabled && config.Domain != "" && config.Domain != defaultDomain &&
 		config.TLSCertFile == "" && config.TLSKeyFile == "" {
 		config.AutoTLS = true
 	}
@@ -122,6 +135,14 @@ func runServer(_ *cobra.Command, _ []string) {
 		config.Persistence = server.PersistenceSQLite
 	default:
 		config.Persistence = server.PersistenceMemory
+	}
+
+	// Warn if admin API is exposed on non-loopback without a token.
+	if config.AdminToken == "" && serverAdminHost != "127.0.0.1" && serverAdminHost != "::1" && serverAdminHost != "localhost" {
+		log.Warn().
+			Str("admin_addr", config.AdminAddr).
+			Msg("WARNING: Admin API is bound to a non-loopback address without --admin-token; " +
+				"unauthenticated access will be restricted to loopback clients only")
 	}
 
 	srv := server.NewServer(config)

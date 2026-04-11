@@ -174,13 +174,95 @@ func TestHandler_CORS(t *testing.T) {
 	h := NewHandler(i)
 	defer h.Close()
 
-	// OPTIONS request.
+	// OPTIONS request without Origin header — no CORS header is set.
+	req := httptest.NewRequest("OPTIONS", "/api/inspector/records", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	// Default behavior (no corsOrigin, no Origin header) → empty CORS header.
+	assert.Empty(t, rr.Header().Get("Access-Control-Allow-Origin"))
+}
+
+func TestHandler_CORS_WithExplicitWildcard(t *testing.T) {
+	i := New(DefaultConfig())
+	h := NewHandler(i)
+	defer h.Close()
+
+	// Explicitly set corsOrigin to "*".
+	h.SetCORSOrigin("*")
+
 	req := httptest.NewRequest("OPTIONS", "/api/inspector/records", nil)
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 
 	assert.Equal(t, http.StatusOK, rr.Code)
 	assert.Equal(t, "*", rr.Header().Get("Access-Control-Allow-Origin"))
+}
+
+// ============================================================================
+// P0-3 Security Hardening: CORS Origin Restriction Tests
+// ============================================================================
+
+// TestAllowedCORSOrigin_Defaults verifies default CORS behavior restricts
+// to localhost-only origins.
+func TestAllowedCORSOrigin_Defaults(t *testing.T) {
+	i := New(DefaultConfig())
+	h := NewHandler(i)
+	defer h.Close()
+
+	tests := []struct {
+		name          string
+		origin        string
+		expectAllowed bool
+	}{
+		{"localhost HTTP", "http://localhost:4040", true},
+		{"localhost HTTPS", "https://localhost:4040", true},
+		{"127.0.0.1 HTTP", "http://127.0.0.1:4040", true},
+		{"127.0.0.1 HTTPS", "https://127.0.0.1:4040", true},
+		{"IPv6 loopback", "http://[::1]:4040", true},
+		{"localhost no port", "http://localhost", true},
+		{"external origin", "http://evil.example.com", false},
+		{"external HTTPS", "https://attacker.com:4040", false},
+		{"empty origin", "", false},
+		{"invalid URL", "not-a-url", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/api/inspector/records", nil)
+			if tt.origin != "" {
+				req.Header.Set("Origin", tt.origin)
+			}
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+
+			corsHeader := rr.Header().Get("Access-Control-Allow-Origin")
+			if tt.expectAllowed {
+				assert.Equal(t, tt.origin, corsHeader, "should echo back allowed origin")
+			} else {
+				assert.Empty(t, corsHeader, "should not set CORS header for disallowed origin")
+			}
+		})
+	}
+}
+
+// TestAllowedCORSOrigin_ExplicitOverride verifies SetCORSOrigin overrides default.
+func TestAllowedCORSOrigin_ExplicitOverride(t *testing.T) {
+	i := New(DefaultConfig())
+	h := NewHandler(i)
+	defer h.Close()
+
+	// Set explicit allowed origin.
+	h.SetCORSOrigin("https://myapp.example.com")
+
+	req := httptest.NewRequest("GET", "/api/inspector/records", nil)
+	req.Header.Set("Origin", "https://evil.example.com")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	// Explicit override returns the configured origin, regardless of request origin.
+	assert.Equal(t, "https://myapp.example.com", rr.Header().Get("Access-Control-Allow-Origin"))
 }
 
 func TestHandler_MethodNotAllowed(t *testing.T) {

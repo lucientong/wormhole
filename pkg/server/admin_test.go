@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -28,6 +29,15 @@ func newTestServer() *Server {
 	s.router = NewRouter(config.Domain)
 	s.portAllocator = NewTCPPortAllocator(10000, 10100)
 	return s
+}
+
+// loopbackRequest creates an httptest request with a loopback RemoteAddr
+// so it passes the P0-3 admin loopback protection when AdminToken is empty.
+// Signature matches httptest.NewRequest for easy drop-in replacement.
+func loopbackRequest(method, target string, body io.Reader) *http.Request {
+	req := httptest.NewRequest(method, target, body)
+	req.RemoteAddr = "127.0.0.1:65432"
+	return req
 }
 
 func TestAdminAPI_Health(t *testing.T) {
@@ -63,7 +73,7 @@ func TestAdminAPI_Stats(t *testing.T) {
 	api := NewAdminAPI(server)
 	handler := api.Handler()
 
-	req := httptest.NewRequest(http.MethodGet, "/stats", nil)
+	req := loopbackRequest(http.MethodGet, "/stats", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -88,7 +98,7 @@ func TestAdminAPI_Clients_Empty(t *testing.T) {
 	api := NewAdminAPI(server)
 	handler := api.Handler()
 
-	req := httptest.NewRequest(http.MethodGet, "/clients", nil)
+	req := loopbackRequest(http.MethodGet, "/clients", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -140,7 +150,7 @@ func TestAdminAPI_Clients_WithClients(t *testing.T) {
 	api := NewAdminAPI(server)
 	handler := api.Handler()
 
-	req := httptest.NewRequest(http.MethodGet, "/clients", nil)
+	req := loopbackRequest(http.MethodGet, "/clients", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -177,7 +187,7 @@ func TestAdminAPI_Tunnels_Empty(t *testing.T) {
 	api := NewAdminAPI(server)
 	handler := api.Handler()
 
-	req := httptest.NewRequest(http.MethodGet, "/tunnels", nil)
+	req := loopbackRequest(http.MethodGet, "/tunnels", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -221,7 +231,7 @@ func TestAdminAPI_Tunnels_WithTunnels(t *testing.T) {
 	api := NewAdminAPI(server)
 	handler := api.Handler()
 
-	req := httptest.NewRequest(http.MethodGet, "/tunnels", nil)
+	req := loopbackRequest(http.MethodGet, "/tunnels", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -276,7 +286,7 @@ func TestAdminAPI_RateLimit_Disabled(t *testing.T) {
 	api := NewAdminAPI(server)
 	handler := api.Handler()
 
-	req := httptest.NewRequest(http.MethodGet, "/ratelimit", nil)
+	req := loopbackRequest(http.MethodGet, "/ratelimit", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -310,7 +320,7 @@ func TestAdminAPI_RateLimit_Enabled(t *testing.T) {
 	api := NewAdminAPI(server)
 	handler := api.Handler()
 
-	req := httptest.NewRequest(http.MethodGet, "/ratelimit", nil)
+	req := loopbackRequest(http.MethodGet, "/ratelimit", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -331,7 +341,7 @@ func TestAdminAPI_RateLimit_MethodNotAllowed(t *testing.T) {
 	api := NewAdminAPI(server)
 	handler := api.Handler()
 
-	req := httptest.NewRequest(http.MethodPost, "/ratelimit", nil)
+	req := loopbackRequest(http.MethodPost, "/ratelimit", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -359,7 +369,7 @@ func TestAdminAPI_UnblockIP_Success(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{"ip":"10.0.0.1"}`)
-	req := httptest.NewRequest(http.MethodPost, "/ratelimit/unblock", body)
+	req := loopbackRequest(http.MethodPost, "/ratelimit/unblock", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -384,7 +394,7 @@ func TestAdminAPI_UnblockIP_RateLimitDisabled(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{"ip":"10.0.0.1"}`)
-	req := httptest.NewRequest(http.MethodPost, "/ratelimit/unblock", body)
+	req := loopbackRequest(http.MethodPost, "/ratelimit/unblock", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -412,7 +422,7 @@ func TestAdminAPI_UnblockIP_InvalidBody(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`invalid json`)
-	req := httptest.NewRequest(http.MethodPost, "/ratelimit/unblock", body)
+	req := loopbackRequest(http.MethodPost, "/ratelimit/unblock", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -440,7 +450,7 @@ func TestAdminAPI_UnblockIP_MissingIP(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{}`)
-	req := httptest.NewRequest(http.MethodPost, "/ratelimit/unblock", body)
+	req := loopbackRequest(http.MethodPost, "/ratelimit/unblock", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -467,7 +477,7 @@ func TestAdminAPI_UnblockIP_MethodNotAllowed(t *testing.T) {
 	api := NewAdminAPI(server)
 	handler := api.Handler()
 
-	req := httptest.NewRequest(http.MethodGet, "/ratelimit/unblock", nil)
+	req := loopbackRequest(http.MethodGet, "/ratelimit/unblock", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -584,7 +594,7 @@ func TestAdminAPI_Teams_List(t *testing.T) {
 	api := NewAdminAPI(server)
 	handler := api.Handler()
 
-	req := httptest.NewRequest(http.MethodGet, "/teams", nil)
+	req := loopbackRequest(http.MethodGet, "/teams", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -604,7 +614,7 @@ func TestAdminAPI_Teams_Create(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{"name":"new-team"}`)
-	req := httptest.NewRequest(http.MethodPost, "/teams", body)
+	req := loopbackRequest(http.MethodPost, "/teams", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -633,7 +643,7 @@ func TestAdminAPI_Teams_Create_Duplicate(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{"name":"existing-team"}`)
-	req := httptest.NewRequest(http.MethodPost, "/teams", body)
+	req := loopbackRequest(http.MethodPost, "/teams", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -648,7 +658,7 @@ func TestAdminAPI_Teams_Create_MissingName(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{}`)
-	req := httptest.NewRequest(http.MethodPost, "/teams", body)
+	req := loopbackRequest(http.MethodPost, "/teams", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -666,7 +676,7 @@ func TestAdminAPI_TeamByName(t *testing.T) {
 	api := NewAdminAPI(server)
 	handler := api.Handler()
 
-	req := httptest.NewRequest(http.MethodGet, "/teams/test-team", nil)
+	req := loopbackRequest(http.MethodGet, "/teams/test-team", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -684,7 +694,7 @@ func TestAdminAPI_TeamByName_NotFound(t *testing.T) {
 	api := NewAdminAPI(server)
 	handler := api.Handler()
 
-	req := httptest.NewRequest(http.MethodGet, "/teams/nonexistent", nil)
+	req := loopbackRequest(http.MethodGet, "/teams/nonexistent", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -698,7 +708,7 @@ func TestAdminAPI_GenerateToken(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{"team":"dev-team","role":"member"}`)
-	req := httptest.NewRequest(http.MethodPost, "/tokens/generate", body)
+	req := loopbackRequest(http.MethodPost, "/tokens/generate", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -727,7 +737,7 @@ func TestAdminAPI_GenerateToken_DefaultRole(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{"team":"dev-team"}`)
-	req := httptest.NewRequest(http.MethodPost, "/tokens/generate", body)
+	req := loopbackRequest(http.MethodPost, "/tokens/generate", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -751,7 +761,7 @@ func TestAdminAPI_GenerateToken_InvalidRole(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{"team":"dev-team","role":"superuser"}`)
-	req := httptest.NewRequest(http.MethodPost, "/tokens/generate", body)
+	req := loopbackRequest(http.MethodPost, "/tokens/generate", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -766,7 +776,7 @@ func TestAdminAPI_GenerateToken_MissingTeam(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{"role":"admin"}`)
-	req := httptest.NewRequest(http.MethodPost, "/tokens/generate", body)
+	req := loopbackRequest(http.MethodPost, "/tokens/generate", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -786,7 +796,7 @@ func TestAdminAPI_RevokeToken(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{"token":"` + token + `"}`)
-	req := httptest.NewRequest(http.MethodPost, "/tokens/revoke", body)
+	req := loopbackRequest(http.MethodPost, "/tokens/revoke", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -813,7 +823,7 @@ func TestAdminAPI_RevokeToken_ByID(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{"token_id":"` + claims.TokenID + `"}`)
-	req := httptest.NewRequest(http.MethodPost, "/tokens/revoke", body)
+	req := loopbackRequest(http.MethodPost, "/tokens/revoke", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -832,7 +842,7 @@ func TestAdminAPI_RevokeToken_MissingTokenAndID(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{}`)
-	req := httptest.NewRequest(http.MethodPost, "/tokens/revoke", body)
+	req := loopbackRequest(http.MethodPost, "/tokens/revoke", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -852,7 +862,7 @@ func TestAdminAPI_RefreshToken(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{"token":"` + originalToken + `"}`)
-	req := httptest.NewRequest(http.MethodPost, "/tokens/refresh", body)
+	req := loopbackRequest(http.MethodPost, "/tokens/refresh", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -886,7 +896,7 @@ func TestAdminAPI_RefreshToken_RevokeOld(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{"token":"` + originalToken + `","revoke_old":true}`)
-	req := httptest.NewRequest(http.MethodPost, "/tokens/refresh", body)
+	req := loopbackRequest(http.MethodPost, "/tokens/refresh", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -921,7 +931,7 @@ func TestAdminAPI_RefreshToken_ExtendExpiry(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{"token":"` + originalToken + `","extend_by":"24h"}`)
-	req := httptest.NewRequest(http.MethodPost, "/tokens/refresh", body)
+	req := loopbackRequest(http.MethodPost, "/tokens/refresh", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -945,7 +955,7 @@ func TestAdminAPI_RefreshToken_MissingToken(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{}`)
-	req := httptest.NewRequest(http.MethodPost, "/tokens/refresh", body)
+	req := loopbackRequest(http.MethodPost, "/tokens/refresh", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -960,7 +970,7 @@ func TestAdminAPI_Teams_MethodNotAllowed(t *testing.T) {
 	handler := api.Handler()
 
 	// DELETE is not a valid method for /teams.
-	req := httptest.NewRequest(http.MethodDelete, "/teams", nil)
+	req := loopbackRequest(http.MethodDelete, "/teams", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -979,7 +989,7 @@ func TestAdminAPI_Teams_Create_InvalidBody(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`not valid json`)
-	req := httptest.NewRequest(http.MethodPost, "/teams", body)
+	req := loopbackRequest(http.MethodPost, "/teams", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -998,7 +1008,7 @@ func TestAdminAPI_TeamByName_MethodNotAllowed(t *testing.T) {
 	api := NewAdminAPI(server)
 	handler := api.Handler()
 
-	req := httptest.NewRequest(http.MethodPost, "/teams/someteam", nil)
+	req := loopbackRequest(http.MethodPost, "/teams/someteam", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -1017,7 +1027,7 @@ func TestAdminAPI_TeamByName_EmptyName(t *testing.T) {
 	handler := api.Handler()
 
 	// /teams/ with empty name after trimming prefix.
-	req := httptest.NewRequest(http.MethodGet, "/teams/", nil)
+	req := loopbackRequest(http.MethodGet, "/teams/", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -1035,7 +1045,7 @@ func TestAdminAPI_GenerateToken_MethodNotAllowed(t *testing.T) {
 	api := NewAdminAPI(server)
 	handler := api.Handler()
 
-	req := httptest.NewRequest(http.MethodGet, "/tokens/generate", nil)
+	req := loopbackRequest(http.MethodGet, "/tokens/generate", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -1054,7 +1064,7 @@ func TestAdminAPI_GenerateToken_InvalidBody(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`invalid json`)
-	req := httptest.NewRequest(http.MethodPost, "/tokens/generate", body)
+	req := loopbackRequest(http.MethodPost, "/tokens/generate", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -1084,7 +1094,7 @@ func TestAdminAPI_GenerateToken_AllRoles(t *testing.T) {
 	for _, tt := range roles {
 		t.Run(tt.role, func(t *testing.T) {
 			body := bytes.NewBufferString(`{"team":"role-team","role":"` + tt.role + `"}`)
-			req := httptest.NewRequest(http.MethodPost, "/tokens/generate", body)
+			req := loopbackRequest(http.MethodPost, "/tokens/generate", body)
 			req.Header.Set("Content-Type", "application/json")
 			rec := httptest.NewRecorder()
 
@@ -1108,7 +1118,7 @@ func TestAdminAPI_RevokeToken_MethodNotAllowed(t *testing.T) {
 	api := NewAdminAPI(server)
 	handler := api.Handler()
 
-	req := httptest.NewRequest(http.MethodGet, "/tokens/revoke", nil)
+	req := loopbackRequest(http.MethodGet, "/tokens/revoke", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -1122,7 +1132,7 @@ func TestAdminAPI_RevokeToken_InvalidBody(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`bad json`)
-	req := httptest.NewRequest(http.MethodPost, "/tokens/revoke", body)
+	req := loopbackRequest(http.MethodPost, "/tokens/revoke", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -1141,7 +1151,7 @@ func TestAdminAPI_RefreshToken_MethodNotAllowed(t *testing.T) {
 	api := NewAdminAPI(server)
 	handler := api.Handler()
 
-	req := httptest.NewRequest(http.MethodGet, "/tokens/refresh", nil)
+	req := loopbackRequest(http.MethodGet, "/tokens/refresh", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -1155,7 +1165,7 @@ func TestAdminAPI_RefreshToken_InvalidBody(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`bad json`)
-	req := httptest.NewRequest(http.MethodPost, "/tokens/refresh", body)
+	req := loopbackRequest(http.MethodPost, "/tokens/refresh", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -1180,7 +1190,7 @@ func TestAdminAPI_RefreshToken_InvalidDuration(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{"token":"` + token + `","extend_by":"not-a-duration"}`)
-	req := httptest.NewRequest(http.MethodPost, "/tokens/refresh", body)
+	req := loopbackRequest(http.MethodPost, "/tokens/refresh", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -1216,7 +1226,7 @@ func TestAdminAPI_RevokeTeamTokens(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{"team":"revoke-team"}`)
-	req := httptest.NewRequest(http.MethodPost, "/tokens/revoke-team", body)
+	req := loopbackRequest(http.MethodPost, "/tokens/revoke-team", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -1249,7 +1259,7 @@ func TestAdminAPI_RevokeTeamTokens_TeamNotFound(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{"team":"nonexistent"}`)
-	req := httptest.NewRequest(http.MethodPost, "/tokens/revoke-team", body)
+	req := loopbackRequest(http.MethodPost, "/tokens/revoke-team", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -1264,7 +1274,7 @@ func TestAdminAPI_RevokeTeamTokens_MissingTeam(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{}`)
-	req := httptest.NewRequest(http.MethodPost, "/tokens/revoke-team", body)
+	req := loopbackRequest(http.MethodPost, "/tokens/revoke-team", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -1278,7 +1288,7 @@ func TestAdminAPI_RevokeTeamTokens_MethodNotAllowed(t *testing.T) {
 	api := NewAdminAPI(server)
 	handler := api.Handler()
 
-	req := httptest.NewRequest(http.MethodGet, "/tokens/revoke-team", nil)
+	req := loopbackRequest(http.MethodGet, "/tokens/revoke-team", nil)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -1292,7 +1302,7 @@ func TestAdminAPI_RevokeTeamTokens_InvalidBody(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`invalid json`)
-	req := httptest.NewRequest(http.MethodPost, "/tokens/revoke-team", body)
+	req := loopbackRequest(http.MethodPost, "/tokens/revoke-team", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -1307,7 +1317,7 @@ func TestAdminAPI_RevokeTeamTokens_NoAuth(t *testing.T) {
 	handler := api.Handler()
 
 	body := bytes.NewBufferString(`{"team":"team1"}`)
-	req := httptest.NewRequest(http.MethodPost, "/tokens/revoke-team", body)
+	req := loopbackRequest(http.MethodPost, "/tokens/revoke-team", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -1344,7 +1354,7 @@ func TestAdminAPI_NoAuthenticator(t *testing.T) {
 			} else {
 				body = bytes.NewBuffer(nil)
 			}
-			req := httptest.NewRequest(tt.method, tt.path, body)
+			req := loopbackRequest(tt.method, tt.path, body)
 			req.Header.Set("Content-Type", "application/json")
 			rec := httptest.NewRecorder()
 
@@ -1356,6 +1366,151 @@ func TestAdminAPI_NoAuthenticator(t *testing.T) {
 			err := json.Unmarshal(rec.Body.Bytes(), &resp)
 			require.NoError(t, err)
 			assert.Equal(t, "authentication is not enabled", resp.Error)
+		})
+	}
+}
+
+// ============================================================================
+// P0-3 Security Hardening: Admin Loopback Protection Tests
+// ============================================================================
+
+// TestIsLoopbackRequest verifies the isLoopbackRequest helper recognizes
+// loopback and non-loopback addresses correctly.
+func TestIsLoopbackRequest(t *testing.T) {
+	tests := []struct {
+		name       string
+		remoteAddr string
+		expected   bool
+	}{
+		{"IPv4 loopback", "127.0.0.1:12345", true},
+		{"IPv6 loopback", "[::1]:12345", true},
+		{"IPv4 non-loopback", "192.168.1.100:12345", false},
+		{"IPv6 non-loopback", "[2001:db8::1]:12345", false},
+		{"IPv4 LAN", "10.0.0.1:8080", false},
+		{"invalid no port", "127.0.0.1", false},
+		{"empty", "", false},
+		{"invalid garbage", "not-an-address", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/stats", nil)
+			req.RemoteAddr = tt.remoteAddr
+			assert.Equal(t, tt.expected, isLoopbackRequest(req))
+		})
+	}
+}
+
+// TestAdminAPI_LoopbackProtection_NoToken verifies that when AdminToken is empty,
+// only loopback requests are allowed; non-loopback requests get 403.
+func TestAdminAPI_LoopbackProtection_NoToken(t *testing.T) {
+	server := newTestServer()
+	// AdminToken is empty by default — loopback protection kicks in.
+	assert.Empty(t, server.config.AdminToken)
+
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	tests := []struct {
+		name       string
+		remoteAddr string
+		wantStatus int
+	}{
+		{
+			name:       "loopback IPv4 allowed",
+			remoteAddr: "127.0.0.1:54321",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "loopback IPv6 allowed",
+			remoteAddr: "[::1]:54321",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "non-loopback rejected",
+			remoteAddr: "192.168.1.50:54321",
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:       "public IP rejected",
+			remoteAddr: "8.8.8.8:54321",
+			wantStatus: http.StatusForbidden,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/stats", nil)
+			req.RemoteAddr = tt.remoteAddr
+			rec := httptest.NewRecorder()
+
+			handler.ServeHTTP(rec, req)
+
+			assert.Equal(t, tt.wantStatus, rec.Code)
+
+			if tt.wantStatus == http.StatusForbidden {
+				var resp ErrorResponse
+				err := json.Unmarshal(rec.Body.Bytes(), &resp)
+				require.NoError(t, err)
+				assert.Contains(t, resp.Error, "non-loopback")
+			}
+		})
+	}
+}
+
+// TestAdminAPI_LoopbackProtection_WithToken verifies that when AdminToken is set,
+// token-based auth takes precedence over loopback check.
+func TestAdminAPI_LoopbackProtection_WithToken(t *testing.T) {
+	server := newTestServer()
+	server.config.AdminToken = "my-secret-token"
+
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	tests := []struct {
+		name       string
+		remoteAddr string
+		authHeader string
+		wantStatus int
+	}{
+		{
+			name:       "remote with valid token succeeds",
+			remoteAddr: "10.0.0.1:54321",
+			authHeader: "Bearer my-secret-token",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "remote without token rejected",
+			remoteAddr: "10.0.0.1:54321",
+			authHeader: "",
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "loopback with valid token succeeds",
+			remoteAddr: "127.0.0.1:54321",
+			authHeader: "Bearer my-secret-token",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "loopback without token rejected (token is set)",
+			remoteAddr: "127.0.0.1:54321",
+			authHeader: "",
+			wantStatus: http.StatusUnauthorized,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/stats", nil)
+			req.RemoteAddr = tt.remoteAddr
+			if tt.authHeader != "" {
+				req.Header.Set("Authorization", tt.authHeader)
+			}
+			rec := httptest.NewRecorder()
+
+			handler.ServeHTTP(rec, req)
+
+			assert.Equal(t, tt.wantStatus, rec.Code)
 		})
 	}
 }

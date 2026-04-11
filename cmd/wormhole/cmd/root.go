@@ -56,7 +56,7 @@ Examples:
 		if len(args) == 1 {
 			port, _ := strconv.Atoi(args[0])
 			log.Info().Int("port", port).Msg("Quick mode - exposing local port")
-			startClient(port, "localhost:7000", "127.0.0.1", "", "", 0, true)
+			startClient(port, "localhost:7000", "127.0.0.1", "", "", 0, "127.0.0.1", true, false, false, "", "http", "", "")
 			return
 		}
 		// No args, show help.

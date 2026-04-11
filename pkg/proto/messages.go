@@ -86,10 +86,11 @@ type AuthResponse struct {
 
 // RegisterRequest is sent by client to register a tunnel.
 type RegisterRequest struct {
-	LocalPort uint32   `json:"local_port"`
-	Protocol  Protocol `json:"protocol"`
-	Subdomain string   `json:"subdomain,omitempty"`
-	Hostname  string   `json:"hostname,omitempty"`
+	LocalPort  uint32   `json:"local_port"`
+	Protocol   Protocol `json:"protocol"`
+	Subdomain  string   `json:"subdomain,omitempty"`
+	Hostname   string   `json:"hostname,omitempty"`
+	PathPrefix string   `json:"path_prefix,omitempty"`
 }
 
 // RegisterResponse is sent by server after tunnel registration.
@@ -279,13 +280,15 @@ func NewAuthResponse(success bool, err string, subdomain, publicURL, sessionID s
 }
 
 // NewRegisterRequest creates a new register request message.
-func NewRegisterRequest(localPort uint32, protocol Protocol, subdomain string) *ControlMessage {
+func NewRegisterRequest(localPort uint32, protocol Protocol, subdomain, hostname, pathPrefix string) *ControlMessage {
 	return &ControlMessage{
 		Type: MessageTypeRegisterRequest,
 		RegisterRequest: &RegisterRequest{
-			LocalPort: localPort,
-			Protocol:  protocol,
-			Subdomain: subdomain,
+			LocalPort:  localPort,
+			Protocol:   protocol,
+			Subdomain:  subdomain,
+			Hostname:   hostname,
+			PathPrefix: pathPrefix,
 		},
 	}
 }

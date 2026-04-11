@@ -79,8 +79,17 @@ wormhole client --server tunnel.example.com:7000 --local 8080
 # Request a specific subdomain
 wormhole client --local 8080 --subdomain myapp
 
+# Connect with TLS
+wormhole client --tls --server tunnel.example.com:7000 --local 8080
+
 # Enable traffic inspector
 wormhole client --local 8080 --inspector 4040
+
+# Expose a TCP service (e.g. database)
+wormhole client --protocol tcp --local 3306
+
+# Use custom hostname routing
+wormhole client --protocol http --hostname api.example.com --local 8080
 
 # Disable P2P mode (use relay only)
 wormhole client --local 8080 --p2p=false
@@ -173,7 +182,14 @@ wormhole server \
 | `--subdomain` | Request specific subdomain | Auto-generated |
 | `--token` | Team token for auth | None |
 | `--inspector` | Inspector UI port | 0 (disabled) |
+| `--inspector-host` | Host for inspector UI | `127.0.0.1` |
 | `--p2p` | Enable P2P direct connection | true |
+| `--tls` | Enable TLS for server connection | false |
+| `--tls-insecure` | Skip TLS certificate verification (dev only) | false |
+| `--tls-ca` | Path to custom CA certificate for TLS verification | None |
+| `--protocol` / `-P` | Tunnel protocol: http, https, tcp, udp, ws, grpc | `http` |
+| `--hostname` | Custom hostname for routing | None |
+| `--path-prefix` | Path-based routing prefix | None |
 
 ### Server Options
 
@@ -183,8 +199,10 @@ wormhole server \
 | `--host` | Host to bind to | `0.0.0.0` |
 | `--http-port` | HTTP traffic port | `80` |
 | `--admin-port` | Admin API port | `7001` |
+| `--admin-host` | Host for admin API (security: loopback only by default) | `127.0.0.1` |
 | `--domain` | Domain for tunnel URLs (env: `WORMHOLE_DOMAIN`) | `localhost` |
 | `--tls` | Enable TLS (auto-cert if domain is set) | false |
+| `--tunnel-tls` | Enable TLS for tunnel control listener (defaults to `--tls`) | same as `--tls` |
 | `--cert` | Path to TLS certificate file | None |
 | `--key` | Path to TLS private key file | None |
 | `--require-auth` | Require authentication for connections | false |
@@ -246,17 +264,23 @@ Persistent storage saves:
 ### Inspector API (Client)
 
 ```bash
-# List captured requests
-curl http://localhost:4040/api/requests
+# List captured records
+curl http://localhost:4040/api/inspector/records
 
-# Get request details
-curl http://localhost:4040/api/requests/:id
+# Get record details
+curl http://localhost:4040/api/inspector/records/:id
+
+# Get inspector stats
+curl http://localhost:4040/api/inspector/stats
 
 # Clear all records
-curl -X DELETE http://localhost:4040/api/requests
+curl -X POST http://localhost:4040/api/inspector/clear
+
+# Toggle capture on/off
+curl -X POST http://localhost:4040/api/inspector/toggle
 
 # Real-time stream (WebSocket)
-wscat -c ws://localhost:4040/api/ws
+wscat -c ws://localhost:4040/api/inspector/ws
 ```
 
 ## Development
@@ -313,7 +337,7 @@ Wormhole is designed with security in mind, but as a tunneling tool that exposes
 
 | Feature | Description |
 |---------|-------------|
-| **TLS Encryption** | All HTTP traffic encrypted via TLS 1.2+ with Let's Encrypt auto-certificates |
+| **TLS Encryption** | HTTP listener and tunnel control channel encrypted via TLS 1.2+ with Let's Encrypt auto-certificates or manual certificates; client supports `--tls` / `--tls-insecure` / `--tls-ca` |
 | **P2P E2E Encryption** | X25519 ECDH key exchange + AES-256-GCM for direct P2P connections |
 | **HMAC-SHA256 Tokens** | Signed team tokens with expiration and revocation support |
 | **RBAC** | Role-based access control (admin / member / viewer) |
@@ -342,7 +366,7 @@ wormhole server \
 - [ ] **Set a strong auth secret** (`--auth-secret`): Use at least 32 random characters. This secret signs all team tokens.
 - [ ] **Protect the Admin API** (`--admin-token`): Without this, anyone with network access to the admin port can manage your server.
 - [ ] **Use persistent storage** (`--persistence sqlite`): Ensures token revocations survive server restarts.
-- [ ] **Restrict admin port access**: Bind the admin port to localhost or use firewall rules (e.g., `--admin-port 127.0.0.1:7001`).
+- [ ] **Restrict admin port access**: Admin binds to `127.0.0.1` by default. If remote access is needed, use `--admin-host 0.0.0.0 --admin-token <token>`.
 
 ### Security Considerations
 
@@ -367,14 +391,16 @@ wormhole client --local 8080 --p2p=false
 The traffic inspector captures and displays HTTP request/response data. In production:
 
 - **Do not enable the inspector** on public-facing deployments
-- The inspector API binds to localhost by default, but be cautious if your network allows local access
+- The inspector binds to **`127.0.0.1`** by default — use `--inspector-host 0.0.0.0` to allow external access (not recommended)
+- CORS is restricted to localhost origins by default
 
 #### Admin API Without Token
 
-If `--admin-token` is not configured, the Admin API is **completely open** with no authentication. This allows anyone with network access to:
-- View all connected clients and tunnels
-- Generate and revoke tokens
-- Manage teams
+If `--admin-token` is not configured, the Admin API **only allows requests from loopback addresses** (`127.0.0.1` / `::1`). Non-loopback requests are rejected with a 403 error. This means:
+- Local access (e.g. `curl http://localhost:7001/stats`) works without a token
+- Remote access requires `--admin-token` to be configured
+
+The admin API binds to `127.0.0.1` by default. If you need remote access, use `--admin-host 0.0.0.0 --admin-token <token>`.
 
 Always configure `--admin-token` in production.
 

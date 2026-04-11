@@ -441,10 +441,12 @@ TCP tunnels do not go through the Inspector since there is no HTTP semantics to 
                     │  └────────────────┘      │
                     │                          │
                     │  HTTP API:               │
-                    │  GET /api/requests       │ ◄── History query
-                    │  GET /api/requests/:id   │ ◄── Details
-                    │  WS  /api/ws             │ ◄── Live stream
-                    │  DELETE /api/requests     │ ◄── Clear all
+                    │  GET  /api/inspector/records    │ ◄── History query
+                    │  GET  /api/inspector/records/:id│ ◄── Details
+                    │  GET  /api/inspector/stats      │ ◄── Statistics
+                    │  POST /api/inspector/clear      │ ◄── Clear all
+                    │  POST /api/inspector/toggle     │ ◄── Toggle capture
+                    │  WS   /api/inspector/ws         │ ◄── Live stream
                     └──────────────────────────┘
 ```
 
@@ -834,6 +836,8 @@ SQLite stores:
 - `/stats`, `/clients`, `/tunnels`, `/teams` are protected by `--admin-token`
 - Uses `Authorization: Bearer <token>` header
 - Token comparison uses `crypto/subtle.ConstantTimeCompare` to prevent timing attacks
+- When `--admin-token` is not set, only loopback address requests (`127.0.0.1` / `::1`) are allowed; non-loopback requests return 403 Forbidden
+- Admin API binds to `127.0.0.1` by default (override with `--admin-host` flag)
 
 ### Team Management API
 
@@ -854,6 +858,7 @@ server_addr: "tunnel.example.com:7000"
 token: "eyJ0ZWFtIjoiYWxwaGEiLCJyb2xlIjoibWVtYmVyIi4uLn0.xxx"
 subdomain: "myapp"
 tls_enabled: true
+tls_insecure: false
 p2p_enabled: true
 ```
 
@@ -868,7 +873,8 @@ p2p_enabled: true
 ### Transport Encryption
 
 - Server supports TLS termination (Let's Encrypt auto-certs or manual certificates)
-- Client-Server tunnel connection optionally TLS encrypted
+- Client-Server tunnel connection supports TLS encryption (client `--tls` / `--tls-insecure` / `--tls-ca` flags)
+- Server tunnel listener can independently enable TLS via `--tunnel-tls` flag
 
 ### P2P End-to-End Encryption
 

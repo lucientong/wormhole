@@ -27,11 +27,27 @@ type Config struct {
 	// InspectorPort is the port for the inspector UI (0 to disable).
 	InspectorPort int
 
+	// InspectorHost is the host the inspector UI binds to (default: 127.0.0.1).
+	InspectorHost string
+
 	// TLSEnabled enables TLS for server connection.
 	TLSEnabled bool
 
 	// TLSInsecure skips TLS certificate verification.
 	TLSInsecure bool
+
+	// TLSCACert is the path to a custom CA certificate for verifying the server.
+	TLSCACert string
+
+	// Protocol is the tunnel protocol type (e.g. "http", "tcp", "udp", "ws", "grpc").
+	// Defaults to "http" if empty.
+	Protocol string
+
+	// Hostname is the custom hostname for routing (optional).
+	Hostname string
+
+	// PathPrefix is the path-based routing prefix (optional).
+	PathPrefix string
 
 	// MuxConfig is the multiplexer configuration.
 	MuxConfig tunnel.MuxConfig

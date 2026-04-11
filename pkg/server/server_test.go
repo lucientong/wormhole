@@ -481,7 +481,7 @@ func TestServer_HandleRegister_HTTP(t *testing.T) {
 		}
 		defer stream.Close()
 
-		req := proto.NewRegisterRequest(8080, proto.ProtocolHTTP, "myapp")
+		req := proto.NewRegisterRequest(8080, proto.ProtocolHTTP, "myapp", "", "")
 		data, encErr := req.Encode()
 		if encErr != nil {
 			errCh <- encErr
@@ -685,7 +685,7 @@ func TestServer_HandleClientStream_Register(t *testing.T) {
 		}
 		defer stream.Close()
 
-		req := proto.NewRegisterRequest(3000, proto.ProtocolHTTP, "testapp")
+		req := proto.NewRegisterRequest(3000, proto.ProtocolHTTP, "testapp", "", "")
 		data, _ := req.Encode()
 		_, _ = stream.Write(data)
 
@@ -1494,7 +1494,7 @@ func TestServer_HandleRegister_TCP(t *testing.T) {
 		}
 		defer stream.Close()
 
-		req := proto.NewRegisterRequest(3306, proto.ProtocolTCP, "tcpreg")
+		req := proto.NewRegisterRequest(3306, proto.ProtocolTCP, "tcpreg", "", "")
 		data, encErr := req.Encode()
 		if encErr != nil {
 			errCh <- encErr
@@ -1651,8 +1651,7 @@ func TestServer_HandleRegister_CustomHostname(t *testing.T) {
 		}
 		defer stream.Close()
 
-		req := proto.NewRegisterRequest(8080, proto.ProtocolHTTP, "hostapp")
-		req.RegisterRequest.Hostname = "custom.example.com"
+		req := proto.NewRegisterRequest(8080, proto.ProtocolHTTP, "hostapp", "custom.example.com", "")
 		data, _ := req.Encode()
 		if _, writeErr := stream.Write(data); writeErr != nil {
 			errCh <- writeErr

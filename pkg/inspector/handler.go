@@ -3,22 +3,31 @@ package inspector
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 )
 
 // Handler provides HTTP handlers for the inspector API.
 type Handler struct {
-	inspector *Inspector
-	hub       *WSHub
+	inspector  *Inspector
+	hub        *WSHub
+	corsOrigin string
 }
 
 // NewHandler creates a new handler for the inspector.
 func NewHandler(inspector *Inspector) *Handler {
 	return &Handler{
-		inspector: inspector,
-		hub:       NewWSHub(inspector),
+		inspector:  inspector,
+		hub:        NewWSHub(inspector),
+		corsOrigin: "", // Default: allow only localhost origins.
 	}
+}
+
+// SetCORSOrigin configures the allowed CORS origin.
+// An empty value restricts to localhost only; "*" allows all origins.
+func (h *Handler) SetCORSOrigin(origin string) {
+	h.corsOrigin = origin
 }
 
 // Close closes the handler and its WebSocket hub.
@@ -41,9 +50,12 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 // ServeHTTP implements http.Handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Set CORS headers.
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	origin := h.allowedCORSOrigin(r)
+	if origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	}
 
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -174,6 +186,30 @@ func parseIntParam(r *http.Request, name string, defaultVal int) int {
 		return defaultVal
 	}
 	return v
+}
+
+// allowedCORSOrigin determines the CORS origin to allow based on configuration.
+// If corsOrigin is explicitly set, it is returned as-is.
+// Otherwise, only localhost origins are allowed (e.g. http://localhost:4040).
+func (h *Handler) allowedCORSOrigin(r *http.Request) string {
+	if h.corsOrigin != "" {
+		return h.corsOrigin
+	}
+
+	// Default: only allow localhost-like origins.
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return ""
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return ""
+	}
+	host := u.Hostname()
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return origin
+	}
+	return ""
 }
 
 // writeJSON writes a JSON response with 200 OK status.

@@ -94,7 +94,7 @@ func TestNewAuthResponse_Error(t *testing.T) {
 }
 
 func TestNewRegisterRequest(t *testing.T) {
-	msg := NewRegisterRequest(8080, ProtocolHTTP, "myapp")
+	msg := NewRegisterRequest(8080, ProtocolHTTP, "myapp", "", "")
 	assert.Equal(t, MessageTypeRegisterRequest, msg.Type)
 	require.NotNil(t, msg.RegisterRequest)
 	assert.Equal(t, uint32(8080), msg.RegisterRequest.LocalPort)
@@ -264,7 +264,7 @@ func TestRoundTrip_AuthResponse(t *testing.T) {
 }
 
 func TestRoundTrip_RegisterRequest(t *testing.T) {
-	original := NewRegisterRequest(3000, ProtocolTCP, "tcp-tunnel")
+	original := NewRegisterRequest(3000, ProtocolTCP, "tcp-tunnel", "", "")
 	data, err := original.Encode()
 	require.NoError(t, err)
 

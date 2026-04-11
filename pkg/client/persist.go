@@ -173,6 +173,7 @@ type FlagValues struct {
 	SubdomainSet     bool
 	TLSSet           bool
 	TLSInsecureSet   bool
+	TLSCACertSet     bool
 	InspectorPortSet bool
 	P2PEnabledSet    bool
 }
