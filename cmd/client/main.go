@@ -127,6 +127,8 @@ func main() {
 	// Start client.
 	if err := c.Start(ctx); err != nil {
 		cancel()
+		// Graceful shutdown: send CloseRequest to server before exiting.
+		_ = c.Close()
 		log.Fatal().Err(err).Msg("Client failed")
 	}
 
@@ -140,4 +142,6 @@ func main() {
 	}
 
 	cancel()
+	// Graceful shutdown: send CloseRequest to server before exiting.
+	_ = c.Close()
 }

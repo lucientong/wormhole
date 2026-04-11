@@ -2210,3 +2210,314 @@ func TestConfigFields_CanBeSet(t *testing.T) {
 	assert.Equal(t, "custom.example.com", cfg.Hostname)
 	assert.Equal(t, "/api/v1", cfg.PathPrefix)
 }
+
+// ============================================================================
+// P1-2 Control Protocol: RequestStats / CloseTunnel Integration Tests
+// ============================================================================
+
+// TestClient_RequestStats_Success verifies that RequestStats sends a StatsRequest
+// and correctly parses the StatsResponse from the server.
+func TestClient_RequestStats_Success(t *testing.T) {
+	cfg := DefaultConfig()
+	c := NewClient(cfg)
+
+	clientMux, serverMux := newClientMuxPair(t)
+	c.mu.Lock()
+	c.mux = clientMux
+	c.sessionID = "session-abc"
+	c.mu.Unlock()
+
+	// Server goroutine: accept stream, read StatsRequest, send StatsResponse.
+	go func() {
+		stream, err := serverMux.AcceptStream()
+		if err != nil {
+			return
+		}
+		defer stream.Close()
+
+		buf := make([]byte, 4096)
+		n, err := stream.Read(buf)
+		if err != nil {
+			return
+		}
+
+		msg, err := proto.DecodeControlMessage(buf[:n])
+		if err != nil || msg.StatsRequest == nil {
+			return
+		}
+
+		// Validate session ID matches.
+		require.Equal(t, "session-abc", msg.StatsRequest.SessionID)
+
+		resp := proto.NewStatsResponse(2, 5, 1024, 2048, 100, 3600)
+		data, _ := resp.Encode()
+		_, _ = stream.Write(data)
+	}()
+
+	stats, err := c.RequestStats(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, stats)
+
+	assert.Equal(t, uint32(2), stats.ActiveTunnels)
+	assert.Equal(t, uint32(5), stats.ActiveConnections)
+	assert.Equal(t, uint64(1024), stats.BytesSent)
+	assert.Equal(t, uint64(2048), stats.BytesReceived)
+	assert.Equal(t, uint64(100), stats.RequestsHandled)
+	assert.Equal(t, uint64(3600), stats.UptimeSeconds)
+}
+
+// TestClient_RequestStats_NilMux verifies RequestStats returns an error when not connected.
+func TestClient_RequestStats_NilMux(t *testing.T) {
+	cfg := DefaultConfig()
+	c := NewClient(cfg)
+
+	// mux is nil.
+	stats, err := c.RequestStats(context.Background())
+	require.Error(t, err)
+	assert.Nil(t, stats)
+	assert.Contains(t, err.Error(), "not connected")
+}
+
+// TestClient_RequestStats_ClosedMux verifies RequestStats returns an error when mux is closed.
+func TestClient_RequestStats_ClosedMux(t *testing.T) {
+	cfg := DefaultConfig()
+	c := NewClient(cfg)
+
+	clientMux, _ := newClientMuxPair(t)
+	_ = clientMux.Close()
+
+	c.mu.Lock()
+	c.mux = clientMux
+	c.mu.Unlock()
+
+	stats, err := c.RequestStats(context.Background())
+	require.Error(t, err)
+	assert.Nil(t, stats)
+	assert.Contains(t, err.Error(), "not connected")
+}
+
+// TestClient_RequestStats_UnexpectedResponse verifies RequestStats handles
+// a response with no StatsResponse field.
+func TestClient_RequestStats_UnexpectedResponse(t *testing.T) {
+	cfg := DefaultConfig()
+	c := NewClient(cfg)
+
+	clientMux, serverMux := newClientMuxPair(t)
+	c.mu.Lock()
+	c.mux = clientMux
+	c.mu.Unlock()
+
+	go func() {
+		stream, err := serverMux.AcceptStream()
+		if err != nil {
+			return
+		}
+		defer stream.Close()
+
+		buf := make([]byte, 4096)
+		n, _ := stream.Read(buf)
+		if n == 0 {
+			return
+		}
+
+		// Send a PingResponse instead of StatsResponse.
+		resp := proto.NewPingResponse(1)
+		data, _ := resp.Encode()
+		_, _ = stream.Write(data)
+	}()
+
+	stats, err := c.RequestStats(context.Background())
+	require.Error(t, err)
+	assert.Nil(t, stats)
+	assert.Contains(t, err.Error(), "unexpected response type")
+}
+
+// TestClient_CloseTunnel_Success verifies that CloseTunnel sends a CloseRequest
+// and correctly handles a successful CloseResponse.
+func TestClient_CloseTunnel_Success(t *testing.T) {
+	cfg := DefaultConfig()
+	c := NewClient(cfg)
+
+	clientMux, serverMux := newClientMuxPair(t)
+	c.mu.Lock()
+	c.mux = clientMux
+	c.mu.Unlock()
+
+	// Server goroutine: accept stream, read CloseRequest, send success CloseResponse.
+	go func() {
+		stream, err := serverMux.AcceptStream()
+		if err != nil {
+			return
+		}
+		defer stream.Close()
+
+		buf := make([]byte, 4096)
+		n, err := stream.Read(buf)
+		if err != nil {
+			return
+		}
+
+		msg, err := proto.DecodeControlMessage(buf[:n])
+		if err != nil || msg.CloseRequest == nil {
+			return
+		}
+
+		// Validate tunnel ID and reason.
+		require.Equal(t, "tunnel-xyz", msg.CloseRequest.TunnelID)
+		require.Equal(t, "user requested", msg.CloseRequest.Reason)
+
+		resp := proto.NewCloseResponse(true)
+		data, _ := resp.Encode()
+		_, _ = stream.Write(data)
+	}()
+
+	err := c.CloseTunnel(context.Background(), "tunnel-xyz", "user requested")
+	require.NoError(t, err)
+}
+
+// TestClient_CloseTunnel_Rejected verifies CloseTunnel handles server rejection.
+func TestClient_CloseTunnel_Rejected(t *testing.T) {
+	cfg := DefaultConfig()
+	c := NewClient(cfg)
+
+	clientMux, serverMux := newClientMuxPair(t)
+	c.mu.Lock()
+	c.mux = clientMux
+	c.mu.Unlock()
+
+	go func() {
+		stream, err := serverMux.AcceptStream()
+		if err != nil {
+			return
+		}
+		defer stream.Close()
+
+		buf := make([]byte, 4096)
+		n, _ := stream.Read(buf)
+		if n == 0 {
+			return
+		}
+
+		resp := proto.NewCloseResponse(false)
+		data, _ := resp.Encode()
+		_, _ = stream.Write(data)
+	}()
+
+	err := c.CloseTunnel(context.Background(), "tunnel-404", "test")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "server rejected close request")
+}
+
+// TestClient_CloseTunnel_NilMux verifies CloseTunnel returns an error when not connected.
+func TestClient_CloseTunnel_NilMux(t *testing.T) {
+	cfg := DefaultConfig()
+	c := NewClient(cfg)
+
+	// mux is nil.
+	err := c.CloseTunnel(context.Background(), "tunnel-1", "test")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not connected")
+}
+
+// TestClient_CloseTunnel_ClosedMux verifies CloseTunnel returns an error when mux is closed.
+func TestClient_CloseTunnel_ClosedMux(t *testing.T) {
+	cfg := DefaultConfig()
+	c := NewClient(cfg)
+
+	clientMux, _ := newClientMuxPair(t)
+	_ = clientMux.Close()
+
+	c.mu.Lock()
+	c.mux = clientMux
+	c.mu.Unlock()
+
+	err := c.CloseTunnel(context.Background(), "tunnel-closed", "test")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not connected")
+}
+
+// TestClient_CloseTunnel_UnexpectedResponse verifies CloseTunnel handles
+// a response with no CloseResponse field.
+func TestClient_CloseTunnel_UnexpectedResponse(t *testing.T) {
+	cfg := DefaultConfig()
+	c := NewClient(cfg)
+
+	clientMux, serverMux := newClientMuxPair(t)
+	c.mu.Lock()
+	c.mux = clientMux
+	c.mu.Unlock()
+
+	go func() {
+		stream, err := serverMux.AcceptStream()
+		if err != nil {
+			return
+		}
+		defer stream.Close()
+
+		buf := make([]byte, 4096)
+		n, _ := stream.Read(buf)
+		if n == 0 {
+			return
+		}
+
+		// Send a PingResponse instead of CloseResponse.
+		resp := proto.NewPingResponse(1)
+		data, _ := resp.Encode()
+		_, _ = stream.Write(data)
+	}()
+
+	err := c.CloseTunnel(context.Background(), "tunnel-bad", "test")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unexpected response type")
+}
+
+// TestClient_Close_GracefulShutdown verifies that Close() sends a CloseRequest
+// to the server when mux is connected and tunnelID is set.
+func TestClient_Close_GracefulShutdown(t *testing.T) {
+	cfg := DefaultConfig()
+	c := NewClient(cfg)
+
+	clientMux, serverMux := newClientMuxPair(t)
+	c.mu.Lock()
+	c.mux = clientMux
+	c.tunnelID = "tunnel-graceful"
+	c.mu.Unlock()
+
+	// Server goroutine: accept the close stream and respond.
+	closeReceived := make(chan string, 1)
+	go func() {
+		stream, err := serverMux.AcceptStream()
+		if err != nil {
+			return
+		}
+		defer stream.Close()
+
+		buf := make([]byte, 4096)
+		n, err := stream.Read(buf)
+		if err != nil {
+			return
+		}
+
+		msg, err := proto.DecodeControlMessage(buf[:n])
+		if err != nil || msg.CloseRequest == nil {
+			return
+		}
+
+		closeReceived <- msg.CloseRequest.TunnelID
+
+		resp := proto.NewCloseResponse(true)
+		data, _ := resp.Encode()
+		_, _ = stream.Write(data)
+	}()
+
+	err := c.Close()
+	assert.NoError(t, err)
+
+	// Verify the server received the CloseRequest.
+	select {
+	case tunnelID := <-closeReceived:
+		assert.Equal(t, "tunnel-graceful", tunnelID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not receive CloseRequest during graceful shutdown")
+	}
+}
