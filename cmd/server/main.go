@@ -45,6 +45,9 @@ func main() {
 	persistence := flag.String("persistence", "memory", "Storage backend: memory or sqlite")
 	persistencePath := flag.String("persistence-path", "", "SQLite database path (defaults to ~/.wormhole/wormhole.db)")
 
+	// Metrics flags.
+	enableMetrics := flag.Bool("enable-metrics", true, "Enable Prometheus metrics on /metrics endpoint")
+
 	flag.Parse()
 
 	// Configure logging.
@@ -78,6 +81,7 @@ func main() {
 		config.Persistence = server.PersistenceMemory
 	}
 	config.PersistencePath = *persistencePath
+	config.EnableMetrics = *enableMetrics
 
 	// Tunnel TLS defaults to the global TLS setting unless explicitly overridden.
 	tunnelTLSExplicit := false

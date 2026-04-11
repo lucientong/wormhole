@@ -44,6 +44,9 @@ type Server struct {
 	// Stats.
 	stats Stats
 
+	// Prometheus metrics (nil when EnableMetrics is false).
+	metrics *Metrics
+
 	// Shutdown.
 	closed  uint32
 	closeCh chan struct{}
@@ -112,6 +115,12 @@ func NewServer(config Config) *Server {
 	s.tlsManager = NewTLSManager(config)
 	s.adminAPI = NewAdminAPI(s)
 	s.portAllocator = NewTCPPortAllocator(config.TCPPortRangeStart, config.TCPPortRangeEnd)
+
+	// Initialize Prometheus metrics.
+	if config.EnableMetrics {
+		s.metrics = NewMetrics()
+		log.Info().Msg("Prometheus metrics enabled")
+	}
 
 	// Initialize authentication.
 	if config.RequireAuth {
@@ -337,44 +346,14 @@ func (s *Server) handleClient(conn net.Conn) {
 		return
 	}
 
-	// Authentication handshake.
-	var teamName string
-	var role auth.Role
-	subdomain := ""
-
 	// Generate session ID early so auth response carries the same ID we register with.
 	sessionID := generateID()
 
-	if s.config.RequireAuth && s.authenticator != nil {
-		claims, authSubdomain, authErr := s.authenticateClient(mux, sessionID)
-		if authErr != nil {
-			log.Warn().Err(authErr).Str("remote", remoteAddr).Msg("Authentication failed")
-
-			// Record auth failure for rate limiting.
-			if s.rateLimiter != nil {
-				blocked := s.rateLimiter.RecordFailure(clientIP)
-				if blocked {
-					log.Warn().Str("ip", clientIP).Msg("IP blocked due to repeated auth failures")
-				}
-			}
-
-			_ = mux.Close()
-			return
-		}
-
-		// Auth successful — clear any failure history.
-		if s.rateLimiter != nil {
-			s.rateLimiter.RecordSuccess(clientIP)
-		}
-
-		teamName = claims.TeamName
-		role = claims.Role
-		subdomain = authSubdomain
-		log.Info().
-			Str("team", teamName).
-			Str("role", string(role)).
-			Str("remote", remoteAddr).
-			Msg("Client authenticated")
+	// Perform authentication handshake (if required).
+	teamName, role, subdomain, authOK := s.handleClientAuth(mux, sessionID, clientIP, remoteAddr)
+	if !authOK {
+		_ = mux.Close()
+		return
 	}
 
 	// Generate subdomain (if not set by auth).
@@ -405,6 +384,10 @@ func (s *Server) handleClient(conn net.Conn) {
 
 	atomic.AddUint64(&s.stats.ActiveClients, 1)
 	atomic.AddUint64(&s.stats.TotalClients, 1)
+	if s.metrics != nil {
+		s.metrics.ActiveClients.Inc()
+		s.metrics.ConnectionsTotal.Inc()
+	}
 
 	log.Info().
 		Str("session_id", sessionID).
@@ -421,6 +404,52 @@ func (s *Server) handleClient(conn net.Conn) {
 		Str("session_id", sessionID).
 		Str("subdomain", subdomain).
 		Msg("Client disconnected")
+}
+
+// handleClientAuth performs the authentication handshake for a new client.
+// Returns (teamName, role, subdomain, ok). If ok is false, the caller should close the mux.
+func (s *Server) handleClientAuth(mux *tunnel.Mux, sessionID, clientIP, remoteAddr string) (string, auth.Role, string, bool) {
+	if !s.config.RequireAuth || s.authenticator == nil {
+		return "", "", "", true
+	}
+
+	claims, subdomain, authErr := s.authenticateClient(mux, sessionID)
+	if authErr != nil {
+		log.Warn().Err(authErr).Str("remote", remoteAddr).Msg("Authentication failed")
+
+		// Record auth failure for rate limiting.
+		if s.rateLimiter != nil {
+			blocked := s.rateLimiter.RecordFailure(clientIP)
+			if blocked {
+				log.Warn().Str("ip", clientIP).Msg("IP blocked due to repeated auth failures")
+			}
+		}
+
+		// Record auth failure metric.
+		if s.metrics != nil {
+			s.metrics.AuthAttemptsTotal.WithLabelValues("failure").Inc()
+		}
+
+		return "", "", "", false
+	}
+
+	// Auth successful — clear any failure history.
+	if s.rateLimiter != nil {
+		s.rateLimiter.RecordSuccess(clientIP)
+	}
+
+	// Record auth success metric.
+	if s.metrics != nil {
+		s.metrics.AuthAttemptsTotal.WithLabelValues("success").Inc()
+	}
+
+	log.Info().
+		Str("team", claims.TeamName).
+		Str("role", string(claims.Role)).
+		Str("remote", remoteAddr).
+		Msg("Client authenticated")
+
+	return claims.TeamName, claims.Role, subdomain, true
 }
 
 // authenticateClient performs the authentication handshake with a client.
@@ -628,6 +657,9 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 	client.mu.Unlock()
 
 	atomic.AddUint64(&s.stats.ActiveTunnels, 1)
+	if s.metrics != nil {
+		s.metrics.ActiveTunnels.Inc()
+	}
 
 	// Also register custom hostname/path if requested.
 	if req.Hostname != "" {
@@ -765,6 +797,10 @@ func (s *Server) handleClose(client *ClientSession, stream *tunnel.Stream, req *
 
 	// Decrement active tunnel counter.
 	atomic.AddUint64(&s.stats.ActiveTunnels, ^uint64(0))
+	if s.metrics != nil {
+		s.metrics.ActiveTunnels.Dec()
+		s.metrics.TunnelDurationSeconds.Observe(time.Since(removed.CreatedAt).Seconds())
+	}
 
 	log.Info().
 		Str("client", client.ID).
@@ -919,11 +955,17 @@ func (s *Server) handleP2PResult(client *ClientSession, result *proto.P2PResult)
 			Str("client", client.ID).
 			Str("peer_addr", result.PeerAddr).
 			Msg("P2P connection established")
+		if s.metrics != nil {
+			s.metrics.P2PConnectionsTotal.WithLabelValues("success").Inc()
+		}
 	} else {
 		log.Info().
 			Str("client", client.ID).
 			Str("error", result.Error).
 			Msg("P2P connection failed, using relay")
+		if s.metrics != nil {
+			s.metrics.P2PConnectionsTotal.WithLabelValues("fallback").Inc()
+		}
 	}
 }
 
@@ -1083,6 +1125,13 @@ func (s *Server) removeClient(client *ClientSession) {
 	client.mu.Unlock()
 
 	atomic.AddUint64(&s.stats.ActiveClients, ^uint64(0)) // Decrement.
+	if s.metrics != nil {
+		s.metrics.ActiveClients.Dec()
+		// Record tunnel durations for all tunnels being removed.
+		for _, t := range client.Tunnels {
+			s.metrics.TunnelDurationSeconds.Observe(time.Since(t.CreatedAt).Seconds())
+		}
+	}
 
 	_ = client.Mux.Close()
 }

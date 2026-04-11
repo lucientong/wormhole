@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/lucientong/wormhole/pkg/auth"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog/log"
 )
 
@@ -40,6 +41,16 @@ func (a *AdminAPI) Handler() http.Handler {
 	mux.HandleFunc("/tokens/revoke", a.requireAdminAuth(a.handleRevokeToken))
 	mux.HandleFunc("/tokens/revoke-team", a.requireAdminAuth(a.handleRevokeTeamTokens))
 	mux.HandleFunc("/tokens/refresh", a.requireAdminAuth(a.handleRefreshToken))
+
+	// Expose Prometheus metrics endpoint (no auth required for scraping).
+	if a.server.metrics != nil {
+		mux.Handle("/metrics", promhttp.HandlerFor(
+			a.server.metrics.Registry(),
+			promhttp.HandlerOpts{
+				EnableOpenMetrics: true,
+			},
+		))
+	}
 
 	// Wrap with request body size limiter to mitigate DoS via large payloads.
 	return a.maxBodySize(mux, 1<<20) // 1 MB.

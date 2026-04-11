@@ -40,6 +40,11 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	client := h.router.Route(r.Host, r.URL.Path)
 	if client == nil {
 		h.notFound(w, r)
+		// Record metrics for unrouted requests.
+		if h.server.metrics != nil {
+			h.server.metrics.RequestsTotal.WithLabelValues("http", "not_found").Inc()
+			h.server.metrics.RequestDurationSeconds.Observe(time.Since(start).Seconds())
+		}
 		return
 	}
 
@@ -50,14 +55,25 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Forward HTTP request.
-	if err := h.forwardHTTP(client, w, r, start); err != nil {
+	fwdErr := h.forwardHTTP(client, w, r, start)
+	if fwdErr != nil {
 		log.Error().
-			Err(err).
+			Err(fwdErr).
 			Str("host", r.Host).
 			Str("path", r.URL.Path).
 			Str("method", r.Method).
 			Msg("Forward HTTP failed")
 		http.Error(w, "Tunnel error", http.StatusBadGateway)
+	}
+
+	// Record metrics.
+	if h.server.metrics != nil {
+		status := "success"
+		if fwdErr != nil {
+			status = "error"
+		}
+		h.server.metrics.RequestsTotal.WithLabelValues("http", status).Inc()
+		h.server.metrics.RequestDurationSeconds.Observe(time.Since(start).Seconds())
 	}
 
 	atomic.AddUint64(&h.server.stats.Requests, 1)
@@ -102,6 +118,9 @@ func (h *HTTPHandler) forwardHTTP(client *ClientSession, w http.ResponseWriter, 
 
 	// Update stats.
 	atomic.AddUint64(&client.BytesOut, uint64(written)) // #nosec G115 -- written from io.Copy is always non-negative
+	if h.server.metrics != nil {
+		h.server.metrics.BytesTransferredTotal.WithLabelValues("out").Add(float64(written))
+	}
 
 	return nil
 }

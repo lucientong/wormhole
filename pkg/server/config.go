@@ -111,6 +111,9 @@ type Config struct {
 	// Only used when Persistence is "sqlite".
 	// If empty, defaults to ~/.wormhole/wormhole.db
 	PersistencePath string
+
+	// EnableMetrics enables Prometheus metrics collection and the /metrics endpoint.
+	EnableMetrics bool
 }
 
 // DefaultConfig returns the default server configuration.
@@ -136,5 +139,6 @@ func DefaultConfig() Config {
 		RateLimitWindow:        5 * time.Minute,
 		RateLimitBlockDuration: 15 * time.Minute,
 		Persistence:            PersistenceMemory,
+		EnableMetrics:          true,
 	}
 }
