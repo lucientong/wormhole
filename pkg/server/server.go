@@ -313,6 +313,22 @@ func (s *Server) handleClient(conn net.Conn) {
 		return
 	}
 
+	// Check server capacity.
+	if s.config.MaxClients > 0 {
+		s.clientLock.RLock()
+		count := len(s.clients)
+		s.clientLock.RUnlock()
+		if count >= s.config.MaxClients {
+			log.Warn().
+				Str("ip", clientIP).
+				Int("max_clients", s.config.MaxClients).
+				Int("current", count).
+				Msg("Connection rejected: server at capacity")
+			_ = conn.Close()
+			return
+		}
+	}
+
 	// Create multiplexer.
 	mux, err := tunnel.Server(conn, s.config.MuxConfig)
 	if err != nil {
@@ -545,6 +561,30 @@ func (s *Server) handleClientStream(client *ClientSession, stream *tunnel.Stream
 
 // handleRegister handles a tunnel registration request.
 func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, req *proto.RegisterRequest) {
+	// Check per-client tunnel limit.
+	if s.config.MaxTunnelsPerClient > 0 {
+		client.mu.Lock()
+		tunnelCount := len(client.Tunnels)
+		client.mu.Unlock()
+		if tunnelCount >= s.config.MaxTunnelsPerClient {
+			log.Warn().
+				Str("client", client.ID).
+				Int("max_tunnels", s.config.MaxTunnelsPerClient).
+				Int("current", tunnelCount).
+				Msg("Tunnel registration rejected: per-client limit reached")
+			resp := proto.NewRegisterResponse(false, "per-client tunnel limit reached", "", "", 0)
+			data, err := resp.Encode()
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to encode register response")
+				return
+			}
+			if _, err := stream.Write(data); err != nil {
+				log.Error().Err(err).Msg("Failed to write register response")
+			}
+			return
+		}
+	}
+
 	tunnelID := generateID()
 
 	// Determine public URL based on TLS config.

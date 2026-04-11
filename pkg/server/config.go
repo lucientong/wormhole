@@ -67,7 +67,12 @@ type Config struct {
 	IdleTimeout time.Duration
 
 	// MaxClients is the maximum number of concurrent clients.
+	// 0 means unlimited.
 	MaxClients int
+
+	// MaxTunnelsPerClient is the maximum number of tunnels a single client can register.
+	// 0 means unlimited.
+	MaxTunnelsPerClient int
 
 	// RequireAuth requires authentication for connections.
 	RequireAuth bool
@@ -123,6 +128,7 @@ func DefaultConfig() Config {
 		WriteTimeout:           30 * time.Second,
 		IdleTimeout:            5 * time.Minute,
 		MaxClients:             1000,
+		MaxTunnelsPerClient:    0, // Unlimited by default.
 		RequireAuth:            false,
 		AuthTimeout:            10 * time.Second,
 		RateLimitEnabled:       true,

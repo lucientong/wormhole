@@ -64,15 +64,17 @@ type HealthResponse struct {
 
 // StatsResponse is the response for the stats endpoint.
 type StatsResponse struct {
-	ActiveClients  uint64 `json:"active_clients"`
-	TotalClients   uint64 `json:"total_clients"`
-	ActiveTunnels  uint64 `json:"active_tunnels"`
-	ActiveRoutes   int    `json:"active_routes"`
-	Requests       uint64 `json:"requests"`
-	BytesIn        uint64 `json:"bytes_in"`
-	BytesOut       uint64 `json:"bytes_out"`
-	UptimeSeconds  int64  `json:"uptime_seconds"`
-	AllocatedPorts int    `json:"allocated_ports"`
+	ActiveClients       uint64 `json:"active_clients"`
+	TotalClients        uint64 `json:"total_clients"`
+	ActiveTunnels       uint64 `json:"active_tunnels"`
+	ActiveRoutes        int    `json:"active_routes"`
+	Requests            uint64 `json:"requests"`
+	BytesIn             uint64 `json:"bytes_in"`
+	BytesOut            uint64 `json:"bytes_out"`
+	UptimeSeconds       int64  `json:"uptime_seconds"`
+	AllocatedPorts      int    `json:"allocated_ports"`
+	MaxClients          int    `json:"max_clients"`
+	MaxTunnelsPerClient int    `json:"max_tunnels_per_client"`
 }
 
 // ClientInfo is the per-client info returned by the API.
@@ -122,15 +124,17 @@ func (a *AdminAPI) handleStats(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	resp := StatsResponse{
-		ActiveClients:  stats.ActiveClients,
-		TotalClients:   stats.TotalClients,
-		ActiveTunnels:  stats.ActiveTunnels,
-		ActiveRoutes:   activeRoutes,
-		Requests:       stats.Requests,
-		BytesIn:        stats.BytesIn,
-		BytesOut:       stats.BytesOut,
-		UptimeSeconds:  int64(time.Since(stats.StartTime).Seconds()),
-		AllocatedPorts: allocatedPorts,
+		ActiveClients:       stats.ActiveClients,
+		TotalClients:        stats.TotalClients,
+		ActiveTunnels:       stats.ActiveTunnels,
+		ActiveRoutes:        activeRoutes,
+		Requests:            stats.Requests,
+		BytesIn:             stats.BytesIn,
+		BytesOut:            stats.BytesOut,
+		UptimeSeconds:       int64(time.Since(stats.StartTime).Seconds()),
+		AllocatedPorts:      allocatedPorts,
+		MaxClients:          a.server.config.MaxClients,
+		MaxTunnelsPerClient: a.server.config.MaxTunnelsPerClient,
 	}
 
 	writeJSON(w, http.StatusOK, resp)

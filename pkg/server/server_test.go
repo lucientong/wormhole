@@ -1696,3 +1696,392 @@ func TestServer_HandleRegister_CustomHostname(t *testing.T) {
 	resolved := s.router.Route("custom.example.com", "/")
 	assert.Equal(t, client, resolved)
 }
+
+// --- P1-3: Quota Enforcement Tests ---
+
+func TestServer_HandleClient_MaxClientsEnforced(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxClients = 1
+	cfg.RequireAuth = false
+	cfg.MuxConfig.KeepAliveInterval = 0
+	s := NewServer(cfg)
+
+	// First client should connect successfully.
+	clientConn1, serverConn1 := net.Pipe()
+	done1 := make(chan struct{})
+	go func() {
+		defer close(done1)
+		s.handleClient(serverConn1)
+	}()
+
+	clientMux1, err := tunnel.Client(clientConn1, cfg.MuxConfig)
+	require.NoError(t, err)
+
+	// Give server time to register client.
+	time.Sleep(100 * time.Millisecond)
+
+	s.clientLock.RLock()
+	count := len(s.clients)
+	s.clientLock.RUnlock()
+	assert.Equal(t, 1, count)
+
+	// Second client should be rejected — server at capacity.
+	clientConn2, serverConn2 := net.Pipe()
+	done2 := make(chan struct{})
+	go func() {
+		defer close(done2)
+		s.handleClient(serverConn2)
+	}()
+
+	// The server should close the connection immediately.
+	buf := make([]byte, 1)
+	_ = clientConn2.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	_, readErr := clientConn2.Read(buf)
+	assert.Error(t, readErr, "expected connection to be closed or deadline exceeded")
+	_ = clientConn2.Close()
+	<-done2
+
+	// First client still registered.
+	s.clientLock.RLock()
+	count = len(s.clients)
+	s.clientLock.RUnlock()
+	assert.Equal(t, 1, count)
+
+	// Disconnect first client and verify slot freed.
+	_ = clientMux1.Close()
+	<-done1
+
+	s.clientLock.RLock()
+	count = len(s.clients)
+	s.clientLock.RUnlock()
+	assert.Equal(t, 0, count)
+}
+
+func TestServer_HandleClient_MaxClientsZeroUnlimited(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxClients = 0 // Unlimited.
+	cfg.RequireAuth = false
+	cfg.MuxConfig.KeepAliveInterval = 0
+	s := NewServer(cfg)
+
+	// Multiple clients should connect successfully.
+	muxes := make([]*tunnel.Mux, 3)
+	dones := make([]chan struct{}, 3)
+
+	for i := 0; i < 3; i++ {
+		clientConn, serverConn := net.Pipe()
+		done := make(chan struct{})
+		dones[i] = done
+
+		go func() {
+			defer close(done)
+			s.handleClient(serverConn)
+		}()
+
+		clientMux, err := tunnel.Client(clientConn, cfg.MuxConfig)
+		require.NoError(t, err)
+		muxes[i] = clientMux
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	s.clientLock.RLock()
+	count := len(s.clients)
+	s.clientLock.RUnlock()
+	assert.Equal(t, 3, count)
+
+	// Clean up.
+	for i := 0; i < 3; i++ {
+		_ = muxes[i].Close()
+		<-dones[i]
+	}
+}
+
+func TestServer_HandleClient_DisconnectFreesSlot(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxClients = 1
+	cfg.RequireAuth = false
+	cfg.MuxConfig.KeepAliveInterval = 0
+	s := NewServer(cfg)
+
+	// First client connects.
+	clientConn1, serverConn1 := net.Pipe()
+	done1 := make(chan struct{})
+	go func() {
+		defer close(done1)
+		s.handleClient(serverConn1)
+	}()
+
+	clientMux1, err := tunnel.Client(clientConn1, cfg.MuxConfig)
+	require.NoError(t, err)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// First client disconnects.
+	_ = clientMux1.Close()
+	<-done1
+
+	s.clientLock.RLock()
+	count := len(s.clients)
+	s.clientLock.RUnlock()
+	assert.Equal(t, 0, count)
+
+	// Second client should now connect successfully.
+	clientConn2, serverConn2 := net.Pipe()
+	done2 := make(chan struct{})
+	go func() {
+		defer close(done2)
+		s.handleClient(serverConn2)
+	}()
+
+	clientMux2, err := tunnel.Client(clientConn2, cfg.MuxConfig)
+	require.NoError(t, err)
+
+	time.Sleep(100 * time.Millisecond)
+
+	s.clientLock.RLock()
+	count = len(s.clients)
+	s.clientLock.RUnlock()
+	assert.Equal(t, 1, count)
+
+	_ = clientMux2.Close()
+	<-done2
+}
+
+func TestServer_HandleRegister_MaxTunnelsPerClient(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxTunnelsPerClient = 1
+	cfg.MuxConfig.KeepAliveInterval = 0
+	s := NewServer(cfg)
+
+	clientMux, serverMux := newMuxPair(t)
+
+	client := &ClientSession{
+		ID:        "quota-client",
+		Subdomain: "quotaapp",
+		Mux:       serverMux,
+		CreatedAt: time.Now(),
+		LastSeen:  time.Now(),
+	}
+	s.clientLock.Lock()
+	s.clients[client.ID] = client
+	s.clientLock.Unlock()
+	_ = s.router.RegisterSubdomain("quotaapp", client)
+
+	// Register the first tunnel — should succeed.
+	errCh1 := make(chan error, 1)
+	go func() {
+		stream, openErr := clientMux.OpenStream()
+		if openErr != nil {
+			errCh1 <- openErr
+			return
+		}
+		defer stream.Close()
+
+		req := proto.NewRegisterRequest(8080, proto.ProtocolHTTP, "quotaapp", "", "")
+		data, encErr := req.Encode()
+		if encErr != nil {
+			errCh1 <- encErr
+			return
+		}
+		if _, writeErr := stream.Write(data); writeErr != nil {
+			errCh1 <- writeErr
+			return
+		}
+
+		buf := make([]byte, 4096)
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			errCh1 <- readErr
+			return
+		}
+
+		msg, decErr := proto.DecodeControlMessage(buf[:n])
+		if decErr != nil {
+			errCh1 <- decErr
+			return
+		}
+		if msg.RegisterResponse == nil || !msg.RegisterResponse.Success {
+			errCh1 <- errors.New("expected first tunnel to succeed")
+			return
+		}
+		errCh1 <- nil
+	}()
+
+	stream1, err := serverMux.AcceptStream()
+	require.NoError(t, err)
+	defer stream1.Close()
+
+	buf := make([]byte, 4096)
+	n, err := stream1.Read(buf)
+	require.NoError(t, err)
+
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	require.NoError(t, err)
+	require.NotNil(t, msg.RegisterRequest)
+
+	s.handleRegister(client, stream1, msg.RegisterRequest)
+	require.NoError(t, <-errCh1)
+
+	// Verify first tunnel registered.
+	client.mu.Lock()
+	assert.Len(t, client.Tunnels, 1)
+	client.mu.Unlock()
+
+	// Register a second tunnel — should be rejected.
+	errCh2 := make(chan error, 1)
+	go func() {
+		stream, openErr := clientMux.OpenStream()
+		if openErr != nil {
+			errCh2 <- openErr
+			return
+		}
+		defer stream.Close()
+
+		req := proto.NewRegisterRequest(9090, proto.ProtocolHTTP, "quotaapp", "", "")
+		data, encErr := req.Encode()
+		if encErr != nil {
+			errCh2 <- encErr
+			return
+		}
+		if _, writeErr := stream.Write(data); writeErr != nil {
+			errCh2 <- writeErr
+			return
+		}
+
+		respBuf := make([]byte, 4096)
+		rn, readErr := stream.Read(respBuf)
+		if readErr != nil {
+			errCh2 <- readErr
+			return
+		}
+
+		respMsg, decErr := proto.DecodeControlMessage(respBuf[:rn])
+		if decErr != nil {
+			errCh2 <- decErr
+			return
+		}
+		if respMsg.RegisterResponse == nil {
+			errCh2 <- errors.New("expected register response")
+			return
+		}
+		if respMsg.RegisterResponse.Success {
+			errCh2 <- errors.New("expected second tunnel to be rejected")
+			return
+		}
+		if respMsg.RegisterResponse.Error == "" {
+			errCh2 <- errors.New("expected error message in rejected response")
+			return
+		}
+		errCh2 <- nil
+	}()
+
+	stream2, err := serverMux.AcceptStream()
+	require.NoError(t, err)
+	defer stream2.Close()
+
+	buf2 := make([]byte, 4096)
+	n2, err := stream2.Read(buf2)
+	require.NoError(t, err)
+
+	msg2, err := proto.DecodeControlMessage(buf2[:n2])
+	require.NoError(t, err)
+	require.NotNil(t, msg2.RegisterRequest)
+
+	s.handleRegister(client, stream2, msg2.RegisterRequest)
+	require.NoError(t, <-errCh2)
+
+	// Tunnel count should still be 1.
+	client.mu.Lock()
+	assert.Len(t, client.Tunnels, 1)
+	client.mu.Unlock()
+}
+
+func TestServer_HandleRegister_MaxTunnelsZeroUnlimited(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxTunnelsPerClient = 0 // Unlimited.
+	cfg.MuxConfig.KeepAliveInterval = 0
+	s := NewServer(cfg)
+
+	clientMux, serverMux := newMuxPair(t)
+
+	client := &ClientSession{
+		ID:        "unlimited-client",
+		Subdomain: "unlimitedapp",
+		Mux:       serverMux,
+		CreatedAt: time.Now(),
+		LastSeen:  time.Now(),
+	}
+	s.clientLock.Lock()
+	s.clients[client.ID] = client
+	s.clientLock.Unlock()
+	_ = s.router.RegisterSubdomain("unlimitedapp", client)
+
+	// Register 3 tunnels — all should succeed.
+	for i := 0; i < 3; i++ {
+		errCh := make(chan error, 1)
+		port := uint32(8080 + i)
+		go func() {
+			stream, openErr := clientMux.OpenStream()
+			if openErr != nil {
+				errCh <- openErr
+				return
+			}
+			defer stream.Close()
+
+			req := proto.NewRegisterRequest(port, proto.ProtocolHTTP, "unlimitedapp", "", "")
+			data, encErr := req.Encode()
+			if encErr != nil {
+				errCh <- encErr
+				return
+			}
+			if _, writeErr := stream.Write(data); writeErr != nil {
+				errCh <- writeErr
+				return
+			}
+
+			buf := make([]byte, 4096)
+			rn, readErr := stream.Read(buf)
+			if readErr != nil {
+				errCh <- readErr
+				return
+			}
+
+			msg, decErr := proto.DecodeControlMessage(buf[:rn])
+			if decErr != nil {
+				errCh <- decErr
+				return
+			}
+			if msg.RegisterResponse == nil || !msg.RegisterResponse.Success {
+				errCh <- errors.New("expected successful registration")
+				return
+			}
+			errCh <- nil
+		}()
+
+		stream, sErr := serverMux.AcceptStream()
+		require.NoError(t, sErr)
+
+		buf := make([]byte, 4096)
+		n, rErr := stream.Read(buf)
+		require.NoError(t, rErr)
+
+		msg, dErr := proto.DecodeControlMessage(buf[:n])
+		require.NoError(t, dErr)
+		require.NotNil(t, msg.RegisterRequest)
+
+		s.handleRegister(client, stream, msg.RegisterRequest)
+		require.NoError(t, <-errCh)
+		stream.Close()
+	}
+
+	client.mu.Lock()
+	assert.Len(t, client.Tunnels, 3)
+	client.mu.Unlock()
+}
+
+func TestDefaultConfig_QuotaDefaults(t *testing.T) {
+	cfg := DefaultConfig()
+	assert.Equal(t, 1000, cfg.MaxClients)
+	assert.Equal(t, 0, cfg.MaxTunnelsPerClient)
+}

@@ -17,22 +17,24 @@ import (
 const defaultDomain = "localhost"
 
 var (
-	serverPort            int
-	serverHost            string
-	serverDomain          string
-	serverTLSEnabled      bool
-	serverTLSCert         string
-	serverTLSKey          string
-	serverHTTPPort        int
-	serverAdminPort       int
-	serverRequireAuth     bool
-	serverAuthTokens      []string
-	serverAuthSecret      string
-	serverAdminToken      string
-	serverPersistence     string
-	serverPersistencePath string
-	serverTunnelTLS       bool
-	serverAdminHost       string
+	serverPort             int
+	serverHost             string
+	serverDomain           string
+	serverTLSEnabled       bool
+	serverTLSCert          string
+	serverTLSKey           string
+	serverHTTPPort         int
+	serverAdminPort        int
+	serverRequireAuth      bool
+	serverAuthTokens       []string
+	serverAuthSecret       string
+	serverAdminToken       string
+	serverPersistence      string
+	serverPersistencePath  string
+	serverTunnelTLS        bool
+	serverAdminHost        string
+	serverMaxClients       int
+	serverMaxTunnelsPerCli int
 )
 
 // serverCmd represents the server command.
@@ -92,6 +94,8 @@ func init() {
 	serverCmd.Flags().StringVar(&serverPersistencePath, "persistence-path", "", "Path to SQLite database (default: ~/.wormhole/wormhole.db)")
 	serverCmd.Flags().BoolVar(&serverTunnelTLS, "tunnel-tls", false, "Enable TLS for the tunnel control listener (default: same as --tls)")
 	serverCmd.Flags().StringVar(&serverAdminHost, "admin-host", "127.0.0.1", "Host for admin API (default: 127.0.0.1 for safety)")
+	serverCmd.Flags().IntVar(&serverMaxClients, "max-clients", 1000, "Maximum concurrent clients (0 = unlimited)")
+	serverCmd.Flags().IntVar(&serverMaxTunnelsPerCli, "max-tunnels-per-client", 0, "Maximum tunnels per client (0 = unlimited)")
 }
 
 func runServer(cmd *cobra.Command, _ []string) {
@@ -117,6 +121,8 @@ func runServer(cmd *cobra.Command, _ []string) {
 	config.AuthSecret = serverAuthSecret
 	config.AdminToken = serverAdminToken
 	config.PersistencePath = serverPersistencePath
+	config.MaxClients = serverMaxClients
+	config.MaxTunnelsPerClient = serverMaxTunnelsPerCli
 
 	// Tunnel TLS defaults to the global TLS setting unless explicitly overridden.
 	config.TunnelTLSEnabled = serverTunnelTLS

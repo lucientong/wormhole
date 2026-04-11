@@ -37,6 +37,10 @@ func main() {
 	authSecret := flag.String("auth-secret", "", "HMAC secret for signed tokens (min 16 chars)")
 	adminToken := flag.String("admin-token", "", "Token for admin API authentication")
 
+	// Quota flags.
+	maxClients := flag.Int("max-clients", 1000, "Maximum concurrent clients (0 = unlimited)")
+	maxTunnelsPerClient := flag.Int("max-tunnels-per-client", 0, "Maximum tunnels per client (0 = unlimited)")
+
 	// Persistence flags.
 	persistence := flag.String("persistence", "memory", "Storage backend: memory or sqlite")
 	persistencePath := flag.String("persistence-path", "", "SQLite database path (defaults to ~/.wormhole/wormhole.db)")
@@ -64,6 +68,8 @@ func main() {
 	}
 	config.AuthSecret = *authSecret
 	config.AdminToken = *adminToken
+	config.MaxClients = *maxClients
+	config.MaxTunnelsPerClient = *maxTunnelsPerClient
 
 	switch *persistence {
 	case "sqlite":
