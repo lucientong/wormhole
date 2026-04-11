@@ -683,7 +683,7 @@ func (s *Server) handlePing(client *ClientSession, stream *tunnel.Stream, req *p
 // byte counters, and uptime.
 func (s *Server) handleStats(client *ClientSession, stream *tunnel.Stream, _ *proto.StatsRequest) {
 	client.mu.Lock()
-	tunnelCount := uint32(len(client.Tunnels))
+	tunnelCount := uint32(len(client.Tunnels)) // #nosec G115 -- len() is always non-negative and small.
 	bytesIn := client.BytesIn
 	bytesOut := client.BytesOut
 	createdAt := client.CreatedAt
