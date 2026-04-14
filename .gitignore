@@ -56,3 +56,6 @@ temp/
 # Debug
 debug
 __debug_bin
+
+# Personal files
+docs/personal/

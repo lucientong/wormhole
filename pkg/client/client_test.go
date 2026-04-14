@@ -242,7 +242,7 @@ func TestClient_FallbackToRelay_InP2PMode(t *testing.T) {
 	c.fallbackToRelay("read error")
 
 	assert.False(t, c.IsP2PMode())
-	assert.Nil(t, c.p2pTransport)
+	assert.Nil(t, c.p2pMux)
 	assert.Nil(t, c.p2pConn)
 	assert.Nil(t, c.p2pPeer)
 	assert.Nil(t, c.p2pKeyPair)
@@ -275,6 +275,27 @@ func TestClient_StartInspector_ZeroPort(t *testing.T) {
 }
 
 // --- Helper: create a mux pair for integration tests ---
+
+// newUDPConnPair creates two connected in-memory UDP socket pairs for testing.
+// It returns (conn1, conn2, addr1, addr2) where conn1 sends to addr2 and
+// conn2 sends to addr1.
+func newUDPConnPair(t *testing.T) (net.PacketConn, net.PacketConn, *net.UDPAddr, *net.UDPAddr) {
+	t.Helper()
+
+	ln1, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	ln2, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	addr1 := ln1.LocalAddr().(*net.UDPAddr)
+	addr2 := ln2.LocalAddr().(*net.UDPAddr)
+
+	t.Cleanup(func() {
+		_ = ln1.Close()
+		_ = ln2.Close()
+	})
+	return ln1, ln2, addr1, addr2
+}
 
 func newClientMuxPair(t *testing.T) (*tunnel.Mux, *tunnel.Mux) {
 	t.Helper()
@@ -1627,127 +1648,9 @@ func TestClient_HandleStream_P2POfferResponse(t *testing.T) {
 
 // --- P2P data handling tests ---
 
-// TestClient_SendP2PResponse_EncodeError verifies that sendP2PResponse
-// handles the encode path and nil transport gracefully.
-// The non-nil transport write path is covered indirectly by
-// TestClient_ForwardP2PRequestToLocal_Success + TestClient_ForwardP2PDataToLocal_Success.
-
-// TestClient_SendP2PResponse_NilTransport verifies no-op when transport is nil.
-func TestClient_SendP2PResponse_NilTransport(_ *testing.T) {
-	cfg := DefaultConfig()
-	c := NewClient(cfg)
-
-	// Transport is nil. Should not panic.
-	c.sendP2PResponse("req-456", false, "some error")
-}
-
-// TestClient_HandleP2PData_ValidStreamRequest exercises the StreamRequest branch.
-func TestClient_HandleP2PData_ValidStreamRequest(t *testing.T) {
-	// Start a local TCP server to receive the forwarded P2P request.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer ln.Close()
-
-	go func() {
-		for {
-			conn, acceptErr := ln.Accept()
-			if acceptErr != nil {
-				return
-			}
-			conn.Close()
-		}
-	}()
-
-	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
-	port := 0
-	fmt.Sscanf(portStr, "%d", &port)
-
-	cfg := DefaultConfig()
-	cfg.LocalHost = "127.0.0.1"
-	cfg.LocalPort = port
-	c := NewClient(cfg)
-
-	// Encode a StreamRequest to simulate P2P data.
-	req := proto.NewStreamRequest("", "p2p-req-1", "1.2.3.4:1234", proto.ProtocolHTTP)
-	data, _ := req.Encode()
-
-	// handleP2PData should decode the message and route to forwardP2PRequestToLocal.
-	c.handleP2PData(context.Background(), data)
-
-	// Requests counter should be incremented.
-	assert.Equal(t, uint64(1), atomic.LoadUint64(&c.stats.Requests))
-}
-
-// TestClient_HandleP2PData_InvalidData exercises the raw data fallback.
-func TestClient_HandleP2PData_InvalidData(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.LocalHost = "127.0.0.1"
-	cfg.LocalPort = 19993 // Nothing listening.
-	c := NewClient(cfg)
-
-	// Garbage data that can't be decoded as a proto message.
-	c.handleP2PData(context.Background(), []byte("raw-binary-data"))
-
-	// Should not panic; requests counter should not be incremented.
-	assert.Equal(t, uint64(0), atomic.LoadUint64(&c.stats.Requests))
-}
-
-// TestClient_ForwardP2PDataToLocal_Success exercises the full P2P data forwarding path.
-func TestClient_ForwardP2PDataToLocal_Success(t *testing.T) {
-	// Start a local TCP server that receives data and sends a response.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer ln.Close()
-
-	go func() {
-		for {
-			conn, acceptErr := ln.Accept()
-			if acceptErr != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				buf := make([]byte, 4096)
-				n, readErr := c.Read(buf)
-				if readErr != nil {
-					return
-				}
-				_, _ = c.Write([]byte("response-to:" + string(buf[:n])))
-			}(conn)
-		}
-	}()
-
-	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
-	port := 0
-	fmt.Sscanf(portStr, "%d", &port)
-
-	cfg := DefaultConfig()
-	cfg.LocalHost = "127.0.0.1"
-	cfg.LocalPort = port
-	c := NewClient(cfg)
-
-	// p2pTransport is nil — the response write-back part will be skipped,
-	// but the local forward + BytesIn tracking should still work.
-	c.forwardP2PDataToLocal(context.Background(), []byte("test-payload"))
-
-	// Verify BytesIn was updated.
-	stats := c.GetStats()
-	assert.Greater(t, stats.BytesIn, uint64(0), "BytesIn should be updated after P2P data forwarding")
-}
-
-// TestClient_ForwardP2PDataToLocal_LocalDown verifies graceful handling when local is down.
-func TestClient_ForwardP2PDataToLocal_LocalDown(_ *testing.T) {
-	cfg := DefaultConfig()
-	cfg.LocalHost = "127.0.0.1"
-	cfg.LocalPort = 19992 // Nothing listening.
-	c := NewClient(cfg)
-
-	// Should not panic even when local service is unavailable.
-	c.forwardP2PDataToLocal(context.Background(), []byte("orphan-data"))
-}
-
-// TestClient_ForwardP2PRequestToLocal_Success verifies P2P request forwarding to local.
-func TestClient_ForwardP2PRequestToLocal_Success(t *testing.T) {
+// TestClient_AcceptP2PStreams_ForwardsRequest verifies that acceptP2PStreams
+// accepts incoming P2P mux streams and dispatches them to forwardToLocal.
+func TestClient_AcceptP2PStreams_ForwardsRequest(t *testing.T) {
 	// Start a local TCP server.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -1770,33 +1673,71 @@ func TestClient_ForwardP2PRequestToLocal_Success(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.LocalHost = "127.0.0.1"
 	cfg.LocalPort = port
+	cfg.P2PEnabled = true
 	c := NewClient(cfg)
+	c.inspector.SetEnabled(false)
 
-	req := &proto.StreamRequest{
-		RequestID: "p2p-fwd-1",
-		Protocol:  proto.ProtocolHTTP,
-	}
+	// Create a pair of in-memory UDP connections.
+	conn1, conn2, peer1Addr, peer2Addr := newUDPConnPair(t)
 
-	// Should connect to local, then send a success response via P2P transport.
-	// Without a transport set, sendP2PResponse will be a no-op.
-	c.forwardP2PRequestToLocal(context.Background(), req)
+	// Server-side mux (isInitiator=true, opens streams).
+	serverMux := p2p.NewUDPMux(conn1, peer2Addr, p2p.DefaultTransportConfig(), nil, true)
+	defer serverMux.Close()
+
+	// Client-side mux (isInitiator=false, accepts streams).
+	clientMux := p2p.NewUDPMux(conn2, peer1Addr, p2p.DefaultTransportConfig(), nil, false)
+
+	closeCh := make(chan struct{})
+	go c.acceptP2PStreams(context.Background(), clientMux, closeCh)
+
+	// Server opens a stream and sends a StreamRequest.
+	stream, err := serverMux.OpenStream()
+	require.NoError(t, err)
+
+	req := proto.NewStreamRequest("", "p2p-stream-1", "1.2.3.4:1234", proto.ProtocolHTTP)
+	err = proto.WriteControlMessage(stream, req)
+	require.NoError(t, err)
+
+	// Give the accept loop time to process.
+	time.Sleep(300 * time.Millisecond)
+
+	// Requests counter should be incremented.
+	assert.Equal(t, uint64(1), atomic.LoadUint64(&c.stats.Requests))
+
+	close(closeCh)
+	_ = clientMux.Close()
 }
 
-// TestClient_ForwardP2PRequestToLocal_LocalDown verifies that when local is down,
-// a failure P2P response is sent.
-func TestClient_ForwardP2PRequestToLocal_LocalDown(_ *testing.T) {
+// TestClient_AcceptP2PStreams_FallbackOnClose verifies that acceptP2PStreams
+// triggers relay fallback when the mux is closed.
+func TestClient_AcceptP2PStreams_FallbackOnClose(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.LocalHost = "127.0.0.1"
-	cfg.LocalPort = 19991
+	cfg.P2PEnabled = true
 	c := NewClient(cfg)
 
-	req := &proto.StreamRequest{
-		RequestID: "p2p-fwd-fail",
-		Protocol:  proto.ProtocolHTTP,
-	}
+	conn1, conn2, _, peer2Addr := newUDPConnPair(t)
+	defer conn1.Close()
 
-	// Should not panic; sendP2PResponse with failure will be called.
-	c.forwardP2PRequestToLocal(context.Background(), req)
+	clientMux := p2p.NewUDPMux(conn2, peer2Addr, p2p.DefaultTransportConfig(), nil, false)
+	atomic.StoreUint32(&c.p2pMode, 1)
+
+	closeCh := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.acceptP2PStreams(context.Background(), clientMux, closeCh)
+	}()
+
+	// Close the mux to trigger fallback.
+	_ = clientMux.Close()
+
+	select {
+	case <-done:
+		// Accept loop should have exited.
+	case <-time.After(3 * time.Second):
+		t.Fatal("acceptP2PStreams did not exit after mux close")
+	}
+	assert.False(t, c.IsP2PMode())
 }
 
 // TestClient_ForwardHTTPWithInspect_InvalidHTTP verifies the fallback to raw TCP

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/lucientong/wormhole/pkg/auth"
+	"github.com/lucientong/wormhole/pkg/p2p"
 	"github.com/lucientong/wormhole/pkg/proto"
 	"github.com/lucientong/wormhole/pkg/tunnel"
 	"github.com/rs/zerolog/log"
@@ -73,6 +74,7 @@ type ClientSession struct {
 	P2PNATType    string
 	P2PLocalAddr  string
 	P2PPublicKey  string // ECDH public key (base64-encoded) for E2E encryption.
+	P2PTunnelID   string // Tunnel ID from the latest P2P offer.
 
 	mu sync.Mutex
 }
@@ -829,6 +831,7 @@ func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, re
 	client.P2PNATType = req.NATType
 	client.P2PLocalAddr = req.LocalAddr
 	client.P2PPublicKey = req.PublicKey
+	client.P2PTunnelID = req.TunnelID
 	client.mu.Unlock()
 
 	log.Info().
@@ -871,14 +874,41 @@ func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, re
 	peerAddr := peer.P2PPublicAddr
 	peerNATType := peer.P2PNATType
 	peerPublicKey := peer.P2PPublicKey
+	peerTunnelID := peer.P2PTunnelID
 	peer.mu.Unlock()
 
 	log.Info().
 		Str("client", client.ID).
 		Str("peer", peer.ID).
 		Str("peer_addr", peerAddr).
+		Str("client_nat", req.NATType).
+		Str("peer_nat", peerNATType).
 		Bool("has_peer_key", peerPublicKey != "").
 		Msg("P2P peer matched")
+
+	// For Symmetric+Symmetric NAT, generate port prediction candidates and
+	// send them as a P2PCandidates message before the offer response.
+	bothSymmetric := req.NATType == "Symmetric" && peerNATType == "Symmetric"
+	if bothSymmetric {
+		initiatorCandidates := predictCandidatesForSymmetric(req.PublicAddr, req.NATType, 8)
+		peerCandidates := predictCandidatesForSymmetric(peerAddr, peerNATType, 8)
+
+		// Send peer's predicted candidates to the initiating client.
+		if len(peerCandidates) > 0 {
+			candidatesMsg := proto.NewP2PCandidates(peerTunnelID, peerCandidates)
+			cData, _ := candidatesMsg.Encode()
+			_, _ = stream.Write(cData)
+		}
+		// Initiator's predicted candidates will be forwarded to peer in notifyPeerOfP2P.
+		_ = initiatorCandidates
+
+		log.Info().
+			Str("client", client.ID).
+			Str("peer", peer.ID).
+			Int("peer_candidates", len(peerCandidates)).
+			Int("initiator_candidates", len(initiatorCandidates)).
+			Msg("Symmetric+Symmetric NAT: using port prediction for P2P")
+	}
 
 	// Send peer info (including ECDH public key) to initiating client.
 	resp := proto.NewP2POfferResponse(true, "", peerAddr, peerNATType, peerPublicKey)
@@ -897,23 +927,62 @@ func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, re
 }
 
 // isP2PCompatible checks if two NAT types can establish a P2P connection.
+// With port prediction, Symmetric-Symmetric is attempted (lower success rate).
 func (s *Server) isP2PCompatible(natType1, natType2 string) bool {
-	// Symmetric NAT on both sides is generally not traversable.
-	symmetric := "Symmetric"
-	if natType1 == symmetric && natType2 == symmetric {
-		return false
+	// Any combination that includes at least one non-Symmetric NAT is traversable.
+	// Symmetric+Symmetric is also attempted using port prediction heuristics.
+	return natPriority(natType1) > 0 && natPriority(natType2) > 0
+}
+
+// predictCandidatesForSymmetric generates port candidates for the given
+// Symmetric NAT address using the port predictor.
+// Returns nil if the address is not Symmetric NAT or prediction is not possible.
+func predictCandidatesForSymmetric(addr string, natType string, count int) []string {
+	if natType != "Symmetric" || addr == "" {
+		return nil
 	}
-	// At least one side should be traversable (non-symmetric).
-	return true
+
+	host, portStr, err := splitHostPort(addr)
+	if err != nil {
+		return nil
+	}
+
+	port := 0
+	if _, scanErr := fmt.Sscanf(portStr, "%d", &port); scanErr != nil || port <= 0 {
+		return nil
+	}
+
+	pred := p2p.NewPredictor()
+	pred.AddSample(port)
+	ports := pred.Predict(count)
+
+	candidates := make([]string, 0, len(ports))
+	for _, p := range ports {
+		candidates = append(candidates, fmt.Sprintf("%s:%d", host, p))
+	}
+	return candidates
+}
+
+// splitHostPort is a thin wrapper around net.SplitHostPort that returns
+// ("", "", err) on failure so callers can handle it cleanly.
+func splitHostPort(addr string) (host, port string, err error) {
+	return net.SplitHostPort(addr)
 }
 
 // notifyPeerOfP2P sends a P2P offer notification to the peer client.
+// For Symmetric+Symmetric NAT pairs it also sends predicted port candidates
+// for the initiator side so the peer can attempt hole punching.
 func (s *Server) notifyPeerOfP2P(peer *ClientSession, initiator *ClientSession) {
 	initiator.mu.Lock()
 	initiatorAddr := initiator.P2PPublicAddr
 	initiatorNATType := initiator.P2PNATType
 	initiatorPublicKey := initiator.P2PPublicKey
+	initiatorTunnelID := initiator.P2PTunnelID
 	initiator.mu.Unlock()
+
+	peer.mu.Lock()
+	peerNATType := peer.P2PNATType
+	peer.mu.Unlock()
 
 	// Open a stream to the peer to notify them.
 	stream, err := peer.Mux.OpenStreamContext(context.Background())
@@ -923,16 +992,30 @@ func (s *Server) notifyPeerOfP2P(peer *ClientSession, initiator *ClientSession) 
 	}
 	defer stream.Close()
 
+	if err := stream.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		log.Error().Err(err).Msg("Failed to set P2P notification deadline")
+		return
+	}
+
+	// For Symmetric+Symmetric, send initiator's predicted candidates first.
+	if initiatorNATType == "Symmetric" && peerNATType == "Symmetric" {
+		candidates := predictCandidatesForSymmetric(initiatorAddr, initiatorNATType, 8)
+		if len(candidates) > 0 {
+			candidatesMsg := proto.NewP2PCandidates(initiatorTunnelID, candidates)
+			cData, _ := candidatesMsg.Encode()
+			_, _ = stream.Write(cData)
+			log.Debug().
+				Str("peer", peer.ID).
+				Int("candidates", len(candidates)).
+				Msg("Sent initiator port prediction candidates to peer")
+		}
+	}
+
 	// Send P2P offer response (as a notification) with the initiator's info and public key.
 	msg := proto.NewP2POfferResponse(true, "", initiatorAddr, initiatorNATType, initiatorPublicKey)
 	data, err := msg.Encode()
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to encode P2P notification")
-		return
-	}
-
-	if err := stream.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		log.Error().Err(err).Msg("Failed to set P2P notification deadline")
 		return
 	}
 
@@ -969,18 +1052,45 @@ func (s *Server) handleP2PResult(client *ClientSession, result *proto.P2PResult)
 	}
 }
 
-// FindPeerForP2P looks up a peer client that could establish a P2P connection.
+// natPriority returns a priority score for a NAT type.
+// Higher score = more traversal-friendly = preferred peer.
+func natPriority(natType string) int {
+	switch natType {
+	case "Full Cone":
+		return 4
+	case "Restricted Cone":
+		return 3
+	case "Port Restricted Cone":
+		return 2
+	case "Symmetric":
+		return 1
+	default:
+		return 0
+	}
+}
+
+// FindPeerForP2P looks up the best peer client for P2P connection with the
+// given initiator.  Candidates are ranked by NAT traversal friendliness:
+// Full Cone > Restricted Cone > Port Restricted > Symmetric.
 // Returns nil if no suitable peer is found.
 func (s *Server) FindPeerForP2P(excludeClientID string) *ClientSession {
 	s.clientLock.RLock()
 	defer s.clientLock.RUnlock()
 
+	var best *ClientSession
+	bestScore := -1
+
 	for _, client := range s.clients {
-		if client.ID != excludeClientID && client.P2PPublicAddr != "" {
-			return client
+		if client.ID == excludeClientID || client.P2PPublicAddr == "" {
+			continue
+		}
+		score := natPriority(client.P2PNATType)
+		if score > bestScore {
+			bestScore = score
+			best = client
 		}
 	}
-	return nil
+	return best
 }
 
 // serveHTTP serves HTTP requests using the new HTTPHandler.

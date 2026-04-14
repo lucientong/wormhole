@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -48,14 +47,14 @@ type Client struct {
 	inspectorServer  *http.Server
 
 	// P2P
-	p2pManager   *p2p.Manager
-	p2pConn      net.PacketConn     // UDP connection for P2P
-	p2pPeer      *net.UDPAddr       // Peer's confirmed UDP address
-	p2pTransport *p2p.Transport     // Reliable UDP transport for P2P data
-	p2pMode      uint32             // 1 if using P2P, 0 for relay
-	p2pCloseCh   chan struct{}      // Signal to stop P2P read loop
-	p2pKeyPair   *p2p.KeyPair       // ECDH key pair for this session
-	p2pCipher    *p2p.SessionCipher // Derived session cipher for E2E encryption
+	p2pManager     *p2p.Manager
+	p2pConn        net.PacketConn     // UDP connection for P2P
+	p2pPeer        *net.UDPAddr       // Peer's confirmed UDP address
+	p2pMux         *p2p.UDPMux        // Multiplexed P2P transport (replaces Transport)
+	p2pMode        uint32             // 1 if using P2P, 0 for relay
+	p2pCloseCh     chan struct{}       // Signal to stop P2P accept loop
+	p2pKeyPair     *p2p.KeyPair       // ECDH key pair for this session
+	p2pCipher      *p2p.SessionCipher // Derived session cipher for E2E encryption
 
 	// Statistics
 	stats Stats
@@ -510,26 +509,30 @@ func (c *Client) handleStream(ctx context.Context, stream *tunnel.Stream) {
 }
 
 // forwardToLocal forwards a stream to the local service.
-func (c *Client) forwardToLocal(ctx context.Context, stream *tunnel.Stream, req *proto.StreamRequest) {
+// streamConn is implemented by both *tunnel.Stream and *p2p.UDPStream,
+// allowing forwardToLocal to handle both relay and P2P data paths.
+type streamConn = io.ReadWriteCloser
+
+func (c *Client) forwardToLocal(ctx context.Context, conn streamConn, req *proto.StreamRequest) {
 	// Use HTTP-aware forwarding when inspector is active and protocol is HTTP.
 	if req.Protocol == proto.ProtocolHTTP && c.inspector.IsEnabled() {
-		c.forwardHTTPWithInspect(ctx, stream, req)
+		c.forwardHTTPWithInspect(ctx, conn, req)
 		return
 	}
 
 	// Fallback: raw TCP bidirectional proxy.
-	c.forwardRawTCP(ctx, stream, req)
+	c.forwardRawTCP(ctx, conn, req)
 }
 
 // forwardRawTCP forwards a stream to the local service using raw TCP proxy.
-func (c *Client) forwardRawTCP(ctx context.Context, stream *tunnel.Stream, req *proto.StreamRequest) {
-	c.dialAndProxy(ctx, stream, stream, req)
+func (c *Client) forwardRawTCP(ctx context.Context, conn streamConn, req *proto.StreamRequest) {
+	c.dialAndProxy(ctx, conn, conn, req)
 }
 
 // forwardRawTCPWithReader is like forwardRawTCP but uses a custom reader
 // for the stream->local direction (used when we've partially consumed the stream).
-func (c *Client) forwardRawTCPWithReader(ctx context.Context, reader io.Reader, stream *tunnel.Stream, sreq *proto.StreamRequest) {
-	c.dialAndProxy(ctx, reader, stream, sreq)
+func (c *Client) forwardRawTCPWithReader(ctx context.Context, reader io.Reader, conn streamConn, sreq *proto.StreamRequest) {
+	c.dialAndProxy(ctx, reader, conn, sreq)
 }
 
 // dialAndProxy connects to the local service and proxies data bidirectionally
@@ -575,7 +578,7 @@ func (c *Client) dialAndProxy(ctx context.Context, inReader io.Reader, outWriter
 // traffic inspection. It parses the raw HTTP request from the stream,
 // forwards it to the local service via http.Transport, captures the
 // request/response pair in the inspector, and writes the response back.
-func (c *Client) forwardHTTPWithInspect(ctx context.Context, stream *tunnel.Stream, sreq *proto.StreamRequest) {
+func (c *Client) forwardHTTPWithInspect(ctx context.Context, stream streamConn, sreq *proto.StreamRequest) {
 	localAddr := net.JoinHostPort(c.config.LocalHost, fmt.Sprintf("%d", c.config.LocalPort))
 
 	start := time.Now()
@@ -833,8 +836,8 @@ func (c *Client) sendP2POffer(ctx context.Context) {
 			Bool("encrypted", c.p2pCipher != nil).
 			Msg("P2P peer found, attempting connection")
 
-		// Initiate hole punching with the peer endpoint.
-		go c.attemptP2P(ctx, resp.PeerAddr)
+		// Offer sender is the initiator for stream-ID allocation.
+		go c.attemptP2P(ctx, resp.PeerAddr, true)
 	} else {
 		log.Debug().
 			Str("reason", resp.Error).
@@ -871,7 +874,9 @@ func (c *Client) deriveP2PCipher(peerPubKeyB64 string) error {
 }
 
 // attemptP2P attempts to establish a P2P connection with the given peer address.
-func (c *Client) attemptP2P(ctx context.Context, peerAddr string) {
+// isInitiator must be true on exactly one side; the other side passes false.
+// The initiator allocates odd stream IDs; the acceptor uses even IDs.
+func (c *Client) attemptP2P(ctx context.Context, peerAddr string, isInitiator bool) {
 	// Parse peer endpoint.
 	peerEndpoint, err := c.parseEndpoint(peerAddr)
 	if err != nil {
@@ -882,6 +887,7 @@ func (c *Client) attemptP2P(ctx context.Context, peerAddr string) {
 
 	log.Info().
 		Str("peer", peerAddr).
+		Bool("initiator", isInitiator).
 		Msg("Attempting P2P hole punching")
 
 	// Get cipher for authenticated hole punching.
@@ -897,8 +903,8 @@ func (c *Client) attemptP2P(ctx context.Context, peerAddr string) {
 		return
 	}
 
-	// Create reliable transport over the UDP connection (with optional E2E encryption).
-	transport := p2p.NewTransport(conn, confirmedPeer, p2p.DefaultTransportConfig(), cipher)
+	// Create multiplexed UDP transport over the P2P connection.
+	mux := p2p.NewUDPMux(conn, confirmedPeer, p2p.DefaultTransportConfig(), cipher, isInitiator)
 
 	// Create P2P close channel for graceful shutdown.
 	p2pCloseCh := make(chan struct{})
@@ -907,29 +913,81 @@ func (c *Client) attemptP2P(ctx context.Context, peerAddr string) {
 	c.mu.Lock()
 	c.p2pConn = conn
 	c.p2pPeer = confirmedPeer
-	c.p2pTransport = transport
+	c.p2pMux = mux
 	c.p2pCloseCh = p2pCloseCh
 	atomic.StoreUint32(&c.p2pMode, 1)
 	c.mu.Unlock()
 
 	peerAddrStr := confirmedPeer.String()
-	encrypted := transport.IsEncrypted()
+	encrypted := cipher != nil
 	log.Info().
 		Str("peer", peerAddrStr).
 		Str("local", conn.LocalAddr().String()).
 		Bool("encrypted", encrypted).
-		Msg("P2P connection established successfully")
+		Bool("initiator", isInitiator).
+		Msg("P2P connection established (mux)")
 
 	// Notify server of successful P2P connection.
 	c.sendP2PResult(ctx, true, peerAddrStr, "")
 
-	// Start P2P data read loop in background.
-	go c.p2pReadLoop(ctx, p2pCloseCh)
+	// Accept incoming P2P streams and proxy them to local service.
+	go c.acceptP2PStreams(ctx, mux, p2pCloseCh)
 
 	if encrypted {
 		fmt.Printf("  🎉 P2P Mode: Direct connection to %s (encrypted)\n", peerAddrStr)
 	} else {
 		fmt.Printf("  🎉 P2P Mode: Direct connection to %s\n", peerAddrStr)
+	}
+}
+
+// acceptP2PStreams accepts incoming multiplexed P2P streams and proxies each
+// one to the local service — exactly like the relay path but over P2P UDP.
+func (c *Client) acceptP2PStreams(ctx context.Context, mux *p2p.UDPMux, closeCh chan struct{}) {
+	log.Info().Msg("P2P accept loop started")
+	defer log.Info().Msg("P2P accept loop stopped")
+
+	for {
+		select {
+		case <-closeCh:
+			return
+		case <-c.closeCh:
+			return
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		stream, err := mux.AcceptStream()
+		if err != nil {
+			if mux.IsClosed() {
+				c.fallbackToRelay("P2P mux closed")
+				return
+			}
+			log.Warn().Err(err).Msg("P2P accept stream error, falling back to relay")
+			c.fallbackToRelay("P2P accept error")
+			return
+		}
+
+		// Each stream carries one logical request: read the StreamRequest
+		// header (length-prefixed protobuf) then proxy to local service.
+		go func(s *p2p.UDPStream) {
+			defer s.Close()
+
+			msg, readErr := proto.ReadControlMessage(s)
+			if readErr != nil {
+				log.Error().Err(readErr).Uint32("stream_id", s.StreamID()).
+					Msg("P2P: read stream request failed")
+				return
+			}
+			if msg.StreamRequest == nil {
+				log.Warn().Uint32("stream_id", s.StreamID()).
+					Msg("P2P: expected StreamRequest, got other message type")
+				return
+			}
+
+			atomic.AddUint64(&c.stats.Requests, 1)
+			c.forwardToLocal(ctx, s, msg.StreamRequest)
+		}(stream)
 	}
 }
 
@@ -1029,183 +1087,8 @@ func (c *Client) handleP2PNotification(ctx context.Context, resp *proto.P2POffer
 		}
 	}
 
-	// Attempt hole punching with the peer.
-	go c.attemptP2P(ctx, resp.PeerAddr)
-}
-
-// p2pReadLoop reads data from the P2P transport and forwards to local service.
-// This handles the hot-switching from relay to P2P mode.
-func (c *Client) p2pReadLoop(ctx context.Context, closeCh chan struct{}) {
-	log.Info().Msg("P2P read loop started")
-
-	buf := make([]byte, 64*1024) // 64KB buffer
-
-	for {
-		select {
-		case <-closeCh:
-			log.Info().Msg("P2P read loop stopped (close signal)")
-			return
-		case <-c.closeCh:
-			log.Info().Msg("P2P read loop stopped (client closing)")
-			return
-		case <-ctx.Done():
-			log.Info().Msg("P2P read loop stopped (context canceled)")
-			return
-		default:
-		}
-
-		// Get transport with lock.
-		c.mu.Lock()
-		transport := c.p2pTransport
-		c.mu.Unlock()
-
-		if transport == nil {
-			log.Debug().Msg("P2P transport is nil, exiting read loop")
-			return
-		}
-
-		// Read data from P2P transport (with timeout built into transport).
-		n, err := transport.Read(buf)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				log.Info().Msg("P2P transport closed by peer")
-			} else {
-				log.Warn().Err(err).Msg("P2P read error, falling back to relay")
-			}
-			c.fallbackToRelay("P2P read error")
-			return
-		}
-
-		if n == 0 {
-			continue
-		}
-
-		// Parse the incoming P2P message.
-		// Expected format: P2P protocol message (proto.Message with P2PDataRequest).
-		data := buf[:n]
-		c.handleP2PData(ctx, data)
-	}
-}
-
-// handleP2PData processes data received from the P2P connection.
-// The data should be a protocol message containing P2P-specific payload.
-func (c *Client) handleP2PData(ctx context.Context, data []byte) {
-	// Decode the protocol message.
-	msg, err := proto.DecodeControlMessage(data)
-	if err != nil {
-		log.Debug().Err(err).Msg("Failed to decode P2P data, treating as raw payload")
-		// Fallback: forward raw data to local service.
-		c.forwardP2PDataToLocal(ctx, data)
-		return
-	}
-
-	// Handle based on message type.
-	switch {
-	case msg.StreamRequest != nil:
-		// This is a forwarded request from the peer client.
-		atomic.AddUint64(&c.stats.Requests, 1)
-		c.forwardP2PRequestToLocal(ctx, msg.StreamRequest)
-	default:
-		// Unknown message type - log and forward raw.
-		log.Debug().Int("type", int(msg.Type)).Msg("Unknown P2P message type")
-		c.forwardP2PDataToLocal(ctx, data)
-	}
-}
-
-// forwardP2PRequestToLocal handles a P2P stream request by forwarding to local service.
-func (c *Client) forwardP2PRequestToLocal(ctx context.Context, req *proto.StreamRequest) {
-	localAddr := net.JoinHostPort(c.config.LocalHost, fmt.Sprintf("%d", c.config.LocalPort))
-
-	// Connect to local service.
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	localConn, err := dialer.DialContext(ctx, "tcp", localAddr)
-	if err != nil {
-		log.Error().Err(err).Str("addr", localAddr).Msg("P2P: connect to local failed")
-		c.sendP2PResponse(req.RequestID, false, "Local service unavailable")
-		return
-	}
-	defer localConn.Close()
-
-	// For P2P mode, we need to handle the bidirectional proxy differently.
-	// The request body should be forwarded to local, and response sent back via P2P.
-	// This is a simplified implementation - full implementation would need
-	// proper stream multiplexing over UDP.
-
-	log.Debug().
-		Str("request_id", req.RequestID).
-		Str("protocol", req.Protocol.String()).
-		Msg("P2P: forwarding request to local service")
-
-	// Send success response.
-	c.sendP2PResponse(req.RequestID, true, "")
-
-	// Note: Full bidirectional streaming over P2P UDP would require more
-	// complex protocol handling. This implementation supports simple
-	// request/response patterns.
-}
-
-// forwardP2PDataToLocal forwards raw data to the local service.
-func (c *Client) forwardP2PDataToLocal(ctx context.Context, data []byte) {
-	localAddr := net.JoinHostPort(c.config.LocalHost, fmt.Sprintf("%d", c.config.LocalPort))
-
-	// Simple forward: connect, send, close.
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	localConn, err := dialer.DialContext(ctx, "tcp", localAddr)
-	if err != nil {
-		log.Error().Err(err).Str("addr", localAddr).Msg("P2P: forward to local failed")
-		return
-	}
-	defer localConn.Close()
-
-	n, writeErr := localConn.Write(data)
-	if writeErr != nil {
-		log.Error().Err(writeErr).Msg("P2P: write to local failed")
-		return
-	}
-
-	atomic.AddUint64(&c.stats.BytesIn, uint64(n)) // #nosec G115 -- n from Write is always non-negative
-
-	// Read response from local and send back via P2P.
-	respBuf := make([]byte, 64*1024)
-	respN, readErr := localConn.Read(respBuf)
-	if readErr != nil && !errors.Is(readErr, io.EOF) {
-		log.Debug().Err(readErr).Msg("P2P: read response from local failed")
-		return
-	}
-
-	if respN > 0 {
-		c.mu.Lock()
-		transport := c.p2pTransport
-		c.mu.Unlock()
-
-		if transport != nil {
-			if _, writeBackErr := transport.Write(respBuf[:respN]); writeBackErr != nil {
-				log.Error().Err(writeBackErr).Msg("P2P: write response back failed")
-			} else {
-				atomic.AddUint64(&c.stats.BytesOut, uint64(respN))
-			}
-		}
-	}
-}
-
-// sendP2PResponse sends a response back through the P2P transport.
-func (c *Client) sendP2PResponse(requestID string, success bool, errMsg string) {
-	resp := proto.NewStreamResponse(requestID, success, errMsg)
-	data, err := resp.Encode()
-	if err != nil {
-		log.Error().Err(err).Msg("Failed to encode P2P response")
-		return
-	}
-
-	c.mu.Lock()
-	transport := c.p2pTransport
-	c.mu.Unlock()
-
-	if transport != nil {
-		if _, writeErr := transport.Write(data); writeErr != nil {
-			log.Error().Err(writeErr).Msg("Failed to send P2P response")
-		}
-	}
+	// Notified side is the acceptor for stream-ID allocation.
+	go c.attemptP2P(ctx, resp.PeerAddr, false)
 }
 
 // fallbackToRelay switches from P2P back to relay mode.
@@ -1221,9 +1104,9 @@ func (c *Client) fallbackToRelay(reason string) {
 	log.Info().Str("reason", reason).Msg("Falling back to relay mode")
 
 	// Close P2P resources.
-	if c.p2pTransport != nil {
-		_ = c.p2pTransport.Close()
-		c.p2pTransport = nil
+	if c.p2pMux != nil {
+		_ = c.p2pMux.Close()
+		c.p2pMux = nil
 	}
 	if c.p2pConn != nil {
 		_ = c.p2pConn.Close()
@@ -1289,9 +1172,9 @@ func (c *Client) Close() error {
 		close(c.p2pCloseCh)
 		c.p2pCloseCh = nil
 	}
-	if c.p2pTransport != nil {
-		_ = c.p2pTransport.Close()
-		c.p2pTransport = nil
+	if c.p2pMux != nil {
+		_ = c.p2pMux.Close()
+		c.p2pMux = nil
 	}
 	if c.p2pConn != nil {
 		_ = c.p2pConn.Close()

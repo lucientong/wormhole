@@ -84,9 +84,11 @@ func TestServer_IsP2PCompatible(t *testing.T) {
 		{"Both Full Cone", "Full Cone", "Full Cone", true},
 		{"Full Cone and Restricted", "Full Cone", "Restricted Cone", true},
 		{"Symmetric and Full Cone", "Symmetric", "Full Cone", true},
-		{"Both Symmetric", "Symmetric", "Symmetric", false},
+		// Both Symmetric is now attempted with port prediction instead of rejected.
+		{"Both Symmetric", "Symmetric", "Symmetric", true},
 		{"Port Restricted and Symmetric", "Port Restricted Cone", "Symmetric", true},
-		{"Empty and Full Cone", "", "Full Cone", true},
+		// Unknown/empty NAT type has priority 0 — incompatible.
+		{"Empty and Full Cone", "", "Full Cone", false},
 	}
 
 	for _, tt := range tests {
@@ -133,6 +135,33 @@ func TestServer_FindPeerForP2P_ExcludesNonP2P(t *testing.T) {
 
 	peer := s.FindPeerForP2P("client-1")
 	assert.Nil(t, peer)
+}
+
+func TestServer_FindPeerForP2P_SelectsBestNATType(t *testing.T) {
+	cfg := DefaultConfig()
+	s := NewServer(cfg)
+
+	// Add multiple peers with different NAT types.
+	s.clients["sym-peer"] = &ClientSession{
+		ID:            "sym-peer",
+		P2PPublicAddr: "1.2.3.4:5000",
+		P2PNATType:    "Symmetric",
+	}
+	s.clients["rc-peer"] = &ClientSession{
+		ID:            "rc-peer",
+		P2PPublicAddr: "2.3.4.5:5000",
+		P2PNATType:    "Restricted Cone",
+	}
+	s.clients["fc-peer"] = &ClientSession{
+		ID:            "fc-peer",
+		P2PPublicAddr: "3.4.5.6:5000",
+		P2PNATType:    "Full Cone",
+	}
+
+	// Should prefer Full Cone (highest priority).
+	peer := s.FindPeerForP2P("initiator")
+	require.NotNil(t, peer)
+	assert.Equal(t, "fc-peer", peer.ID)
 }
 
 func TestServer_GetStats(t *testing.T) {
@@ -1551,21 +1580,26 @@ func TestServer_HandleRegister_TCP(t *testing.T) {
 	s.portAllocator.Release(int(tcpPort))
 }
 
-// TestServer_HandleP2POffer_IncompatibleNAT verifies that when both peers
-// have Symmetric NAT, the server responds with a failure.
-func TestServer_HandleP2POffer_IncompatibleNAT(t *testing.T) {
+// TestServer_HandleP2POffer_SymmetricSymmetric verifies that when both peers
+// have Symmetric NAT, the server now uses port prediction and proceeds with P2P
+// (rather than immediately rejecting the pairing).
+func TestServer_HandleP2POffer_SymmetricSymmetric(t *testing.T) {
 	s := newTestServerForIntegration()
 
-	clientMux, serverMux := newMuxPair(t)
+	// Both the initiator and peer need a live Mux so notifyPeerOfP2P can open a stream.
+	clientMux1, serverMux1 := newMuxPair(t)
+	clientMux2, serverMux2 := newMuxPair(t)
 
 	initiator := &ClientSession{
 		ID:  "sym-initiator",
-		Mux: serverMux,
+		Mux: serverMux1,
 	}
 	peer := &ClientSession{
 		ID:            "sym-peer",
 		P2PPublicAddr: "5.6.7.8:6000",
 		P2PNATType:    "Symmetric",
+		P2PTunnelID:   "peer-tunnel-1",
+		Mux:           serverMux2,
 	}
 
 	s.clientLock.Lock()
@@ -1573,7 +1607,86 @@ func TestServer_HandleP2POffer_IncompatibleNAT(t *testing.T) {
 	s.clients[peer.ID] = peer
 	s.clientLock.Unlock()
 
-	// Initiator sends P2P offer with Symmetric NAT.
+	// Goroutine simulating the peer client — reads the notification stream.
+	peerDone := make(chan struct{})
+	go func() {
+		defer close(peerDone)
+		// Accept the notification stream opened by notifyPeerOfP2P.
+		stream, err := clientMux2.AcceptStream()
+		if err != nil {
+			return
+		}
+		defer stream.Close()
+		// Drain all messages written into this stream (candidates + notification).
+		buf := make([]byte, 4096)
+		_, _ = stream.Read(buf)
+	}()
+
+	// Goroutine simulating the initiating client — sends offer and reads responses.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		stream, err := clientMux1.OpenStream()
+		if err != nil {
+			return
+		}
+		defer stream.Close()
+
+		req := proto.NewP2POfferRequest("tunnel-1", "Symmetric", "1.2.3.4:5000", "192.168.1.1:5000", "key")
+		data, _ := req.Encode()
+		_, _ = stream.Write(data)
+
+		// Read one or two messages (optional candidates + offer response).
+		buf := make([]byte, 8192)
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			return
+		}
+		msg, _ := proto.DecodeControlMessage(buf[:n])
+		if msg != nil && msg.P2POfferResponse != nil {
+			// With port prediction enabled, Symmetric+Symmetric should succeed.
+			assert.True(t, msg.P2POfferResponse.Success)
+		}
+	}()
+
+	stream, err := serverMux1.AcceptStream()
+	require.NoError(t, err)
+
+	buf := make([]byte, 4096)
+	n, err := stream.Read(buf)
+	require.NoError(t, err)
+
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	require.NoError(t, err)
+	require.NotNil(t, msg.P2POfferRequest)
+
+	s.handleP2POffer(initiator, stream, msg.P2POfferRequest)
+	<-done
+	<-peerDone
+}
+
+// TestServer_HandleP2POffer_IncompatibleNAT verifies that two clients with
+// completely unknown/empty NAT types are rejected.
+func TestServer_HandleP2POffer_IncompatibleNAT(t *testing.T) {
+	s := newTestServerForIntegration()
+
+	clientMux, serverMux := newMuxPair(t)
+
+	initiator := &ClientSession{
+		ID:  "unknown-initiator",
+		Mux: serverMux,
+	}
+	peer := &ClientSession{
+		ID:            "unknown-peer",
+		P2PPublicAddr: "5.6.7.8:6000",
+		P2PNATType:    "", // unknown type — priority 0
+	}
+
+	s.clientLock.Lock()
+	s.clients[initiator.ID] = initiator
+	s.clients[peer.ID] = peer
+	s.clientLock.Unlock()
+
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -1583,7 +1696,7 @@ func TestServer_HandleP2POffer_IncompatibleNAT(t *testing.T) {
 		}
 		defer stream.Close()
 
-		req := proto.NewP2POfferRequest("tunnel-1", "Symmetric", "1.2.3.4:5000", "192.168.1.1:5000", "key")
+		req := proto.NewP2POfferRequest("tunnel-1", "", "1.2.3.4:5000", "192.168.1.1:5000", "key")
 		data, _ := req.Encode()
 		_, _ = stream.Write(data)
 
