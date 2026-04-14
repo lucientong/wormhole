@@ -22,11 +22,11 @@ package p2p
 // when both sides open streams simultaneously.
 
 import (
+	cryptorand "crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -86,9 +86,14 @@ func NewUDPMux(conn net.PacketConn, peerAddr *net.UDPAddr, config TransportConfi
 	} else {
 		firstID = 2 // even IDs: 2, 4, 6 …
 	}
-	// Randomise the starting offset so repeated sessions are less predictable.
-	offset := rand.Uint32() & 0xFFFE // even number in [0, 65534]
-	firstID += uint32(offset) * 2
+	// Randomize the starting stream ID so repeated sessions are less predictable.
+	var randBuf [4]byte
+	if _, err := cryptorand.Read(randBuf[:]); err != nil {
+		// Fall back to a static offset on read failure; still usable.
+		randBuf = [4]byte{0, 0, 0, 2}
+	}
+	offset := (uint32(randBuf[0])<<8 | uint32(randBuf[1])) & 0xFFFE // even in [0, 65534]
+	firstID += offset * 2
 
 	m := &UDPMux{
 		conn:         conn,
@@ -271,23 +276,30 @@ func (m *UDPMux) readLoop() {
 		seq := binary.BigEndian.Uint32(buf[5:9])
 		rawPayload := buf[9:n]
 
-		// Decrypt payload.
-		var payload []byte
-		if m.cipher != nil && len(rawPayload) > 0 {
-			decrypted, decErr := m.cipher.Decrypt(rawPayload)
-			if decErr != nil {
-				log.Warn().Err(decErr).Uint32("stream_id", streamID).Msg("P2P mux: decrypt failed, dropping")
-				continue
-			}
-			payload = decrypted
-		} else {
-			// Copy to avoid buf overwrite on next iteration.
-			payload = make([]byte, len(rawPayload))
-			copy(payload, rawPayload)
+		payload, ok := m.decryptPayload(streamID, rawPayload)
+		if !ok {
+			continue
 		}
-
 		m.dispatch(streamID, pktType, seq, payload)
 	}
+}
+
+// decryptPayload decrypts rawPayload using the mux cipher (if configured) and
+// returns a copy safe to hold across iterations.
+// Returns (nil, false) when decryption fails.
+func (m *UDPMux) decryptPayload(streamID uint32, rawPayload []byte) ([]byte, bool) {
+	if m.cipher != nil && len(rawPayload) > 0 {
+		decrypted, decErr := m.cipher.Decrypt(rawPayload)
+		if decErr != nil {
+			log.Warn().Err(decErr).Uint32("stream_id", streamID).Msg("P2P mux: decrypt failed, dropping")
+			return nil, false
+		}
+		return decrypted, true
+	}
+	// Copy to avoid buf overwrite on next iteration.
+	cp := make([]byte, len(rawPayload))
+	copy(cp, rawPayload)
+	return cp, true
 }
 
 // dispatch routes a decoded frame to the appropriate stream.

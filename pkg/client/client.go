@@ -47,14 +47,14 @@ type Client struct {
 	inspectorServer  *http.Server
 
 	// P2P
-	p2pManager     *p2p.Manager
-	p2pConn        net.PacketConn     // UDP connection for P2P
-	p2pPeer        *net.UDPAddr       // Peer's confirmed UDP address
-	p2pMux         *p2p.UDPMux        // Multiplexed P2P transport (replaces Transport)
-	p2pMode        uint32             // 1 if using P2P, 0 for relay
-	p2pCloseCh     chan struct{}       // Signal to stop P2P accept loop
-	p2pKeyPair     *p2p.KeyPair       // ECDH key pair for this session
-	p2pCipher      *p2p.SessionCipher // Derived session cipher for E2E encryption
+	p2pManager *p2p.Manager
+	p2pConn    net.PacketConn     // UDP connection for P2P
+	p2pPeer    *net.UDPAddr       // Peer's confirmed UDP address
+	p2pMux     *p2p.UDPMux        // Multiplexed P2P transport (replaces Transport)
+	p2pMode    uint32             // 1 if using P2P, 0 for relay
+	p2pCloseCh chan struct{}      // Signal to stop P2P accept loop
+	p2pKeyPair *p2p.KeyPair       // ECDH key pair for this session
+	p2pCipher  *p2p.SessionCipher // Derived session cipher for E2E encryption
 
 	// Statistics
 	stats Stats

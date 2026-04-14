@@ -107,7 +107,7 @@ func TestUDPMux_MultiStream_Concurrent(t *testing.T) {
 				return
 			}
 			defer stream.Close()
-			_, _ = stream.Write([]byte(fmt.Sprintf("msg-%d", i)))
+			_, _ = fmt.Fprintf(stream, "msg-%d", i)
 		}(i)
 	}
 	wg.Wait()

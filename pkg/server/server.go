@@ -20,6 +20,9 @@ import (
 )
 
 // Server is the wormhole server.
+// natTypeSymmetric is the canonical string for Symmetric NAT type.
+const natTypeSymmetric = "Symmetric"
+
 type Server struct {
 	config Config
 
@@ -888,7 +891,7 @@ func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, re
 
 	// For Symmetric+Symmetric NAT, generate port prediction candidates and
 	// send them as a P2PCandidates message before the offer response.
-	bothSymmetric := req.NATType == "Symmetric" && peerNATType == "Symmetric"
+	bothSymmetric := req.NATType == natTypeSymmetric && peerNATType == natTypeSymmetric
 	if bothSymmetric {
 		initiatorCandidates := predictCandidatesForSymmetric(req.PublicAddr, req.NATType, 8)
 		peerCandidates := predictCandidatesForSymmetric(peerAddr, peerNATType, 8)
@@ -938,7 +941,7 @@ func (s *Server) isP2PCompatible(natType1, natType2 string) bool {
 // Symmetric NAT address using the port predictor.
 // Returns nil if the address is not Symmetric NAT or prediction is not possible.
 func predictCandidatesForSymmetric(addr string, natType string, count int) []string {
-	if natType != "Symmetric" || addr == "" {
+	if natType != natTypeSymmetric || addr == "" {
 		return nil
 	}
 
@@ -992,13 +995,13 @@ func (s *Server) notifyPeerOfP2P(peer *ClientSession, initiator *ClientSession) 
 	}
 	defer stream.Close()
 
-	if err := stream.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		log.Error().Err(err).Msg("Failed to set P2P notification deadline")
+	if deadlineErr := stream.SetDeadline(time.Now().Add(10 * time.Second)); deadlineErr != nil {
+		log.Error().Err(deadlineErr).Msg("Failed to set P2P notification deadline")
 		return
 	}
 
 	// For Symmetric+Symmetric, send initiator's predicted candidates first.
-	if initiatorNATType == "Symmetric" && peerNATType == "Symmetric" {
+	if initiatorNATType == natTypeSymmetric && peerNATType == natTypeSymmetric {
 		candidates := predictCandidatesForSymmetric(initiatorAddr, initiatorNATType, 8)
 		if len(candidates) > 0 {
 			candidatesMsg := proto.NewP2PCandidates(initiatorTunnelID, candidates)
@@ -1062,7 +1065,7 @@ func natPriority(natType string) int {
 		return 3
 	case "Port Restricted Cone":
 		return 2
-	case "Symmetric":
+	case natTypeSymmetric:
 		return 1
 	default:
 		return 0

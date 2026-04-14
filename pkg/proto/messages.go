@@ -341,75 +341,53 @@ func (m *ControlMessage) toProtobuf() *pb.ControlMessage {
 		Type:     pb.MessageType(m.Type),
 		Sequence: m.Sequence,
 	}
+	m.setSessionPayload(pbMsg)
+	m.setP2PPayload(pbMsg)
+	return pbMsg
+}
 
+// setSessionPayload fills session/tunnel-related oneof payload in pbMsg.
+func (m *ControlMessage) setSessionPayload(pbMsg *pb.ControlMessage) {
 	switch {
 	case m.AuthRequest != nil:
-		pbMsg.Payload = &pb.ControlMessage_AuthRequest{
-			AuthRequest: authRequestToProto(m.AuthRequest),
-		}
+		pbMsg.Payload = &pb.ControlMessage_AuthRequest{AuthRequest: authRequestToProto(m.AuthRequest)}
 	case m.AuthResponse != nil:
-		pbMsg.Payload = &pb.ControlMessage_AuthResponse{
-			AuthResponse: authResponseToProto(m.AuthResponse),
-		}
+		pbMsg.Payload = &pb.ControlMessage_AuthResponse{AuthResponse: authResponseToProto(m.AuthResponse)}
 	case m.RegisterRequest != nil:
-		pbMsg.Payload = &pb.ControlMessage_RegisterRequest{
-			RegisterRequest: registerRequestToProto(m.RegisterRequest),
-		}
+		pbMsg.Payload = &pb.ControlMessage_RegisterRequest{RegisterRequest: registerRequestToProto(m.RegisterRequest)}
 	case m.RegisterResponse != nil:
-		pbMsg.Payload = &pb.ControlMessage_RegisterResponse{
-			RegisterResponse: registerResponseToProto(m.RegisterResponse),
-		}
+		pbMsg.Payload = &pb.ControlMessage_RegisterResponse{RegisterResponse: registerResponseToProto(m.RegisterResponse)}
 	case m.PingRequest != nil:
-		pbMsg.Payload = &pb.ControlMessage_PingRequest{
-			PingRequest: pingRequestToProto(m.PingRequest),
-		}
+		pbMsg.Payload = &pb.ControlMessage_PingRequest{PingRequest: pingRequestToProto(m.PingRequest)}
 	case m.PingResponse != nil:
-		pbMsg.Payload = &pb.ControlMessage_PingResponse{
-			PingResponse: pingResponseToProto(m.PingResponse),
-		}
+		pbMsg.Payload = &pb.ControlMessage_PingResponse{PingResponse: pingResponseToProto(m.PingResponse)}
 	case m.StreamRequest != nil:
-		pbMsg.Payload = &pb.ControlMessage_StreamRequest{
-			StreamRequest: streamRequestToProto(m.StreamRequest),
-		}
+		pbMsg.Payload = &pb.ControlMessage_StreamRequest{StreamRequest: streamRequestToProto(m.StreamRequest)}
 	case m.StreamResponse != nil:
-		pbMsg.Payload = &pb.ControlMessage_StreamResponse{
-			StreamResponse: streamResponseToProto(m.StreamResponse),
-		}
+		pbMsg.Payload = &pb.ControlMessage_StreamResponse{StreamResponse: streamResponseToProto(m.StreamResponse)}
 	case m.StatsRequest != nil:
-		pbMsg.Payload = &pb.ControlMessage_StatsRequest{
-			StatsRequest: statsRequestToProto(m.StatsRequest),
-		}
+		pbMsg.Payload = &pb.ControlMessage_StatsRequest{StatsRequest: statsRequestToProto(m.StatsRequest)}
 	case m.StatsResponse != nil:
-		pbMsg.Payload = &pb.ControlMessage_StatsResponse{
-			StatsResponse: statsResponseToProto(m.StatsResponse),
-		}
+		pbMsg.Payload = &pb.ControlMessage_StatsResponse{StatsResponse: statsResponseToProto(m.StatsResponse)}
 	case m.CloseRequest != nil:
-		pbMsg.Payload = &pb.ControlMessage_CloseRequest{
-			CloseRequest: closeRequestToProto(m.CloseRequest),
-		}
+		pbMsg.Payload = &pb.ControlMessage_CloseRequest{CloseRequest: closeRequestToProto(m.CloseRequest)}
 	case m.CloseResponse != nil:
-		pbMsg.Payload = &pb.ControlMessage_CloseResponse{
-			CloseResponse: closeResponseToProto(m.CloseResponse),
-		}
-	case m.P2POfferRequest != nil:
-		pbMsg.Payload = &pb.ControlMessage_P2POfferRequest{
-			P2POfferRequest: p2pOfferRequestToProto(m.P2POfferRequest),
-		}
-	case m.P2POfferResponse != nil:
-		pbMsg.Payload = &pb.ControlMessage_P2POfferResponse{
-			P2POfferResponse: p2pOfferResponseToProto(m.P2POfferResponse),
-		}
-	case m.P2PCandidates != nil:
-		pbMsg.Payload = &pb.ControlMessage_P2PCandidates{
-			P2PCandidates: p2pCandidatesToProto(m.P2PCandidates),
-		}
-	case m.P2PResult != nil:
-		pbMsg.Payload = &pb.ControlMessage_P2PResult{
-			P2PResult: p2pResultToProto(m.P2PResult),
-		}
+		pbMsg.Payload = &pb.ControlMessage_CloseResponse{CloseResponse: closeResponseToProto(m.CloseResponse)}
 	}
+}
 
-	return pbMsg
+// setP2PPayload fills P2P-related oneof payload in pbMsg.
+func (m *ControlMessage) setP2PPayload(pbMsg *pb.ControlMessage) {
+	switch {
+	case m.P2POfferRequest != nil:
+		pbMsg.Payload = &pb.ControlMessage_P2POfferRequest{P2POfferRequest: p2pOfferRequestToProto(m.P2POfferRequest)}
+	case m.P2POfferResponse != nil:
+		pbMsg.Payload = &pb.ControlMessage_P2POfferResponse{P2POfferResponse: p2pOfferResponseToProto(m.P2POfferResponse)}
+	case m.P2PCandidates != nil:
+		pbMsg.Payload = &pb.ControlMessage_P2PCandidates{P2PCandidates: p2pCandidatesToProto(m.P2PCandidates)}
+	case m.P2PResult != nil:
+		pbMsg.Payload = &pb.ControlMessage_P2PResult{P2PResult: p2pResultToProto(m.P2PResult)}
+	}
 }
 
 // fromProtobuf converts the generated pb ControlMessage back to the hand-written type.
@@ -418,43 +396,53 @@ func fromProtobuf(pbMsg *pb.ControlMessage) *ControlMessage {
 		Type:     MessageType(pbMsg.Type),
 		Sequence: pbMsg.Sequence,
 	}
-
-	switch p := pbMsg.Payload.(type) {
-	case *pb.ControlMessage_AuthRequest:
-		m.AuthRequest = authRequestFromProto(p.AuthRequest)
-	case *pb.ControlMessage_AuthResponse:
-		m.AuthResponse = authResponseFromProto(p.AuthResponse)
-	case *pb.ControlMessage_RegisterRequest:
-		m.RegisterRequest = registerRequestFromProto(p.RegisterRequest)
-	case *pb.ControlMessage_RegisterResponse:
-		m.RegisterResponse = registerResponseFromProto(p.RegisterResponse)
-	case *pb.ControlMessage_PingRequest:
-		m.PingRequest = pingRequestFromProto(p.PingRequest)
-	case *pb.ControlMessage_PingResponse:
-		m.PingResponse = pingResponseFromProto(p.PingResponse)
-	case *pb.ControlMessage_StreamRequest:
-		m.StreamRequest = streamRequestFromProto(p.StreamRequest)
-	case *pb.ControlMessage_StreamResponse:
-		m.StreamResponse = streamResponseFromProto(p.StreamResponse)
-	case *pb.ControlMessage_StatsRequest:
-		m.StatsRequest = statsRequestFromProto(p.StatsRequest)
-	case *pb.ControlMessage_StatsResponse:
-		m.StatsResponse = statsResponseFromProto(p.StatsResponse)
-	case *pb.ControlMessage_CloseRequest:
-		m.CloseRequest = closeRequestFromProto(p.CloseRequest)
-	case *pb.ControlMessage_CloseResponse:
-		m.CloseResponse = closeResponseFromProto(p.CloseResponse)
-	case *pb.ControlMessage_P2POfferRequest:
-		m.P2POfferRequest = p2pOfferRequestFromProto(p.P2POfferRequest)
-	case *pb.ControlMessage_P2POfferResponse:
-		m.P2POfferResponse = p2pOfferResponseFromProto(p.P2POfferResponse)
-	case *pb.ControlMessage_P2PCandidates:
-		m.P2PCandidates = p2pCandidatesFromProto(p.P2PCandidates)
-	case *pb.ControlMessage_P2PResult:
-		m.P2PResult = p2pResultFromProto(p.P2PResult)
-	}
-
+	fromProtobufSession(m, pbMsg.Payload)
+	fromProtobufP2P(m, pbMsg.Payload)
 	return m
+}
+
+// fromProtobufSession fills session/tunnel payload fields from a pb oneof value.
+func fromProtobufSession(m *ControlMessage, p interface{}) {
+	switch v := p.(type) {
+	case *pb.ControlMessage_AuthRequest:
+		m.AuthRequest = authRequestFromProto(v.AuthRequest)
+	case *pb.ControlMessage_AuthResponse:
+		m.AuthResponse = authResponseFromProto(v.AuthResponse)
+	case *pb.ControlMessage_RegisterRequest:
+		m.RegisterRequest = registerRequestFromProto(v.RegisterRequest)
+	case *pb.ControlMessage_RegisterResponse:
+		m.RegisterResponse = registerResponseFromProto(v.RegisterResponse)
+	case *pb.ControlMessage_PingRequest:
+		m.PingRequest = pingRequestFromProto(v.PingRequest)
+	case *pb.ControlMessage_PingResponse:
+		m.PingResponse = pingResponseFromProto(v.PingResponse)
+	case *pb.ControlMessage_StreamRequest:
+		m.StreamRequest = streamRequestFromProto(v.StreamRequest)
+	case *pb.ControlMessage_StreamResponse:
+		m.StreamResponse = streamResponseFromProto(v.StreamResponse)
+	case *pb.ControlMessage_StatsRequest:
+		m.StatsRequest = statsRequestFromProto(v.StatsRequest)
+	case *pb.ControlMessage_StatsResponse:
+		m.StatsResponse = statsResponseFromProto(v.StatsResponse)
+	case *pb.ControlMessage_CloseRequest:
+		m.CloseRequest = closeRequestFromProto(v.CloseRequest)
+	case *pb.ControlMessage_CloseResponse:
+		m.CloseResponse = closeResponseFromProto(v.CloseResponse)
+	}
+}
+
+// fromProtobufP2P fills P2P payload fields from a pb oneof value.
+func fromProtobufP2P(m *ControlMessage, p interface{}) {
+	switch v := p.(type) {
+	case *pb.ControlMessage_P2POfferRequest:
+		m.P2POfferRequest = p2pOfferRequestFromProto(v.P2POfferRequest)
+	case *pb.ControlMessage_P2POfferResponse:
+		m.P2POfferResponse = p2pOfferResponseFromProto(v.P2POfferResponse)
+	case *pb.ControlMessage_P2PCandidates:
+		m.P2PCandidates = p2pCandidatesFromProto(v.P2PCandidates)
+	case *pb.ControlMessage_P2PResult:
+		m.P2PResult = p2pResultFromProto(v.P2PResult)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -475,7 +463,7 @@ func authResponseToProto(a *AuthResponse) *pb.AuthResponse {
 		Success:      a.Success,
 		Error:        a.Error,
 		Subdomain:    a.Subdomain,
-		PublicUrl:     a.PublicURL,
+		PublicUrl:    a.PublicURL,
 		TcpPort:      a.TCPPort,
 		Capabilities: a.Capabilities,
 		SessionId:    a.SessionID,

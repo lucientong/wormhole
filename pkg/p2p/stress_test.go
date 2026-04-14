@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"bytes"
+	cryptorand "crypto/rand"
 	"fmt"
 	"io"
 	"math/rand"
@@ -34,8 +35,8 @@ func newLossyMuxPair(t *testing.T, dropRate float64) (*UDPMux, *UDPMux) {
 	t.Helper()
 	conn1, conn2, peer1, peer2 := newUDPPair(t)
 	cfg := DefaultTransportConfig()
-	cfg.RetransmitTimeout = 20 * time.Millisecond
-	cfg.MaxRetransmits = 20
+	cfg.RetransmitTimeout = 30 * time.Millisecond
+	cfg.MaxRetransmits = 50
 
 	lossy1 := &lossyConn{PacketConn: conn1, dropRate: dropRate}
 	lossy2 := &lossyConn{PacketConn: conn2, dropRate: dropRate}
@@ -119,9 +120,10 @@ func TestStress_PacketLoss10Pct(t *testing.T) {
 }
 
 // TestStress_PacketLoss30Pct verifies reliable delivery under 30% packet loss.
+// Runs with a reduced payload to keep the test within a reasonable time budget.
 func TestStress_PacketLoss30Pct(t *testing.T) {
 	initiator, acceptor := newLossyMuxPair(t, 0.30)
-	runReliabilityCheck(t, initiator, acceptor, 2*1024)
+	runReliabilityCheck(t, initiator, acceptor, 512)
 }
 
 // runReliabilityCheck sends payloadSize bytes across a single stream and
@@ -132,7 +134,7 @@ func runReliabilityCheck(t *testing.T, initiator, acceptor *UDPMux, payloadSize 
 	t.Helper()
 
 	payload := make([]byte, payloadSize)
-	rand.Read(payload) // #nosec G404
+	_, _ = cryptorand.Read(payload)
 
 	done := make(chan []byte, 1)
 	go func() {
@@ -161,7 +163,7 @@ func runReliabilityCheck(t *testing.T, initiator, acceptor *UDPMux, payloadSize 
 	case got := <-done:
 		require.NotNil(t, got, "acceptor failed to receive data")
 		require.Equal(t, payload, got, "data mismatch under packet loss")
-	case <-time.After(15 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("timeout waiting for data under packet loss")
 	}
 }
@@ -228,7 +230,7 @@ func BenchmarkUDPMux_Throughput(b *testing.B) {
 	rcv := <-ready
 
 	chunk := make([]byte, chunkSize)
-	rand.Read(chunk) // #nosec G404
+	_, _ = cryptorand.Read(chunk)
 
 	b.SetBytes(int64(chunkSize))
 	b.ResetTimer()

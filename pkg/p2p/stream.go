@@ -61,7 +61,7 @@ type UDPStream struct {
 	// buffer was smaller than the received data segment.
 	readBuf []byte
 
-	// Finalisation.
+	// Finalization.
 	closed    uint32
 	closeCh   chan struct{}
 	closeOnce sync.Once
@@ -160,9 +160,8 @@ func (s *UDPStream) Write(data []byte) (int, error) {
 	return written, nil
 }
 
-
 // Read blocks until data arrives from the peer.
-// It honours the io.Reader contract: if the caller's buffer is smaller than
+// It honors the io.Reader contract: if the caller's buffer is smaller than
 // one incoming segment, the remainder is buffered and returned on the next call.
 func (s *UDPStream) Read(buf []byte) (int, error) {
 	// Return any leftover bytes from a previous partial read first.
@@ -197,7 +196,7 @@ func (s *UDPStream) Read(buf []byte) (int, error) {
 		}
 		return deliver(data), nil
 	case <-s.closeCh:
-		// Drain any remaining buffered data before signalling EOF.
+		// Drain any remaining buffered data before signaling EOF.
 		select {
 		case data := <-s.recvCh:
 			if len(data) == 0 {
@@ -235,6 +234,7 @@ func (s *UDPStream) forceClose() {
 	}
 	s.closeOnce.Do(func() {
 		close(s.closeCh)
+		s.drainCredits()
 		log.Debug().Uint32("stream_id", s.id).Msg("P2P stream: force closed (RST)")
 	})
 }
