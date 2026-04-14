@@ -1,10 +1,15 @@
 package proto
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"testing"
 
+	pbpkg "github.com/lucientong/wormhole/pkg/proto/pb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 )
 
 // --- Protocol.String() tests ---
@@ -338,6 +343,209 @@ func TestRoundTrip_P2PResult(t *testing.T) {
 	require.NotNil(t, decoded.P2PResult)
 	assert.True(t, decoded.P2PResult.Success)
 	assert.Equal(t, "1.2.3.4:5000", decoded.P2PResult.PeerAddr)
+}
+
+// --- Protobuf encoding verification ---
+
+// TestControlMessage_EncodesAsProtobuf verifies that Encode() produces valid
+// protobuf binary (not JSON) by checking the output is not valid JSON and can
+// be unmarshalled with the protobuf library.
+func TestControlMessage_EncodesAsProtobuf(t *testing.T) {
+	msg := NewAuthRequest("token123", "v1.0.0", "myapp")
+	data, err := msg.Encode()
+	require.NoError(t, err)
+	require.NotEmpty(t, data)
+
+	// Output must NOT be valid JSON.
+	var jsonCheck map[string]any
+	assert.Error(t, json.Unmarshal(data, &jsonCheck), "Encode() should produce protobuf, not JSON")
+
+	// Output must be valid protobuf: re-decode using raw proto library.
+	pbMsg := &pbpkg.ControlMessage{}
+	require.NoError(t, proto.Unmarshal(data, pbMsg), "Encode() output should be parseable as protobuf")
+}
+
+// TestControlMessage_EncodeJSON verifies that EncodeJSON() produces valid JSON.
+func TestControlMessage_EncodeJSON(t *testing.T) {
+	msg := NewPingRequest(42)
+	data, err := msg.EncodeJSON()
+	require.NoError(t, err)
+
+	// Must be valid JSON.
+	var jsonCheck map[string]any
+	require.NoError(t, json.Unmarshal(data, &jsonCheck))
+}
+
+// --- JSON backward-compatibility (fallback) ---
+
+// TestDecodeControlMessage_JSONFallback verifies that a JSON-encoded message
+// (as sent by old v1 clients) is correctly decoded when protobuf parse fails.
+func TestDecodeControlMessage_JSONFallback(t *testing.T) {
+	// Simulate a v1 client sending a JSON-encoded AuthRequest.
+	jsonPayload := `{"type":1,"auth_request":{"token":"old-token","version":"v0.3.0","subdomain":"legacy"}}`
+
+	decoded, err := DecodeControlMessage([]byte(jsonPayload))
+	require.NoError(t, err)
+	require.NotNil(t, decoded.AuthRequest)
+	assert.Equal(t, "old-token", decoded.AuthRequest.Token)
+	assert.Equal(t, "v0.3.0", decoded.AuthRequest.Version)
+	assert.Equal(t, "legacy", decoded.AuthRequest.Subdomain)
+}
+
+// TestDecodeControlMessage_JSONFallback_P2PResult verifies JSON fallback for P2P messages.
+func TestDecodeControlMessage_JSONFallback_P2PResult(t *testing.T) {
+	jsonPayload := `{"type":16,"p2p_result":{"tunnel_id":"t-1","success":true,"peer_addr":"1.2.3.4:5000"}}`
+
+	decoded, err := DecodeControlMessage([]byte(jsonPayload))
+	require.NoError(t, err)
+	require.NotNil(t, decoded.P2PResult)
+	assert.True(t, decoded.P2PResult.Success)
+	assert.Equal(t, "1.2.3.4:5000", decoded.P2PResult.PeerAddr)
+}
+
+// TestDecodeControlMessage_BothFormats verifies that protobuf-encoded and
+// JSON-encoded messages produce equivalent results for the same content.
+func TestDecodeControlMessage_BothFormats(t *testing.T) {
+	original := NewRegisterRequest(8080, ProtocolHTTP, "testapp", "myhost.example.com", "/api")
+
+	// Decode from protobuf.
+	pbData, err := original.Encode()
+	require.NoError(t, err)
+	fromPB, err := DecodeControlMessage(pbData)
+	require.NoError(t, err)
+
+	// Decode from JSON.
+	jsonData, err := original.EncodeJSON()
+	require.NoError(t, err)
+	fromJSON, err := DecodeControlMessage(jsonData)
+	require.NoError(t, err)
+
+	// Both should yield the same result.
+	require.NotNil(t, fromPB.RegisterRequest)
+	require.NotNil(t, fromJSON.RegisterRequest)
+	assert.Equal(t, fromPB.RegisterRequest.LocalPort, fromJSON.RegisterRequest.LocalPort)
+	assert.Equal(t, fromPB.RegisterRequest.Subdomain, fromJSON.RegisterRequest.Subdomain)
+	assert.Equal(t, fromPB.RegisterRequest.Hostname, fromJSON.RegisterRequest.Hostname)
+	assert.Equal(t, fromPB.RegisterRequest.PathPrefix, fromJSON.RegisterRequest.PathPrefix)
+}
+
+// --- WriteControlMessage / ReadControlMessage framing ---
+
+// TestWriteReadControlMessage_RoundTrip verifies the length-prefix framing works
+// for all common message types.
+func TestWriteReadControlMessage_RoundTrip(t *testing.T) {
+	msgs := []*ControlMessage{
+		NewAuthRequest("tok", "v1", "sub"),
+		NewAuthResponse(true, "", "sub", "https://sub.example.com", "sess"),
+		NewRegisterRequest(9000, ProtocolTCP, "app", "", ""),
+		NewRegisterResponse(true, "", "tid", "https://app.worm.io", 9001),
+		NewPingRequest(77),
+		NewPingResponse(77),
+		NewStreamRequest("t-1", "r-1", "10.0.0.1:80", ProtocolHTTP),
+		NewStreamResponse("r-1", true, ""),
+		NewCloseRequest("t-1", "shutdown"),
+		NewCloseResponse(true),
+		NewP2POfferRequest("t-1", "Full Cone", "1.2.3.4:5000", "192.168.1.1:5000", "pubkey"),
+		NewP2POfferResponse(true, "", "5.6.7.8:6000", "Restricted", "peerkey"),
+		NewP2PCandidates("t-1", []string{"1.1.1.1:100", "2.2.2.2:200"}),
+		NewP2PResult("t-1", true, "1.2.3.4:5000", ""),
+	}
+
+	for _, original := range msgs {
+		t.Run(fmt.Sprintf("type_%d", original.Type), func(t *testing.T) {
+			var buf bytes.Buffer
+			err := WriteControlMessage(&buf, original)
+			require.NoError(t, err)
+
+			decoded, err := ReadControlMessage(&buf)
+			require.NoError(t, err)
+			assert.Equal(t, original.Type, decoded.Type)
+		})
+	}
+}
+
+// TestReadControlMessage_TooLarge verifies that oversized messages are rejected.
+func TestReadControlMessage_TooLarge(t *testing.T) {
+	var buf bytes.Buffer
+	// Write a 4-byte length header indicating 2MB (> maxControlMessageSize).
+	buf.Write([]byte{0x00, 0x20, 0x00, 0x01}) // 2097153 bytes
+	_, err := ReadControlMessage(&buf)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "too large")
+}
+
+// TestWriteReadControlMessage_Sequential verifies that multiple messages can
+// be written and read sequentially from the same stream.
+func TestWriteReadControlMessage_Sequential(t *testing.T) {
+	var buf bytes.Buffer
+
+	msgs := []*ControlMessage{
+		NewPingRequest(1),
+		NewPingRequest(2),
+		NewPingRequest(3),
+	}
+
+	for _, m := range msgs {
+		require.NoError(t, WriteControlMessage(&buf, m))
+	}
+
+	for i := range msgs {
+		decoded, err := ReadControlMessage(&buf)
+		require.NoError(t, err)
+		require.NotNil(t, decoded.PingRequest)
+		assert.Equal(t, uint64(i+1), decoded.PingRequest.PingID)
+	}
+}
+
+// --- Benchmark ---
+
+// BenchmarkEncode_Protobuf measures Protobuf encoding performance.
+func BenchmarkEncode_Protobuf(b *testing.B) {
+	msg := NewStreamRequest("tunnel-1", "req-bench", "10.0.0.1:8080", ProtocolHTTP)
+	b.ResetTimer()
+	for range b.N {
+		_, _ = msg.Encode()
+	}
+}
+
+// BenchmarkEncode_JSON measures JSON encoding performance for comparison.
+func BenchmarkEncode_JSON(b *testing.B) {
+	msg := NewStreamRequest("tunnel-1", "req-bench", "10.0.0.1:8080", ProtocolHTTP)
+	b.ResetTimer()
+	for range b.N {
+		_, _ = msg.EncodeJSON()
+	}
+}
+
+// BenchmarkDecode_Protobuf measures Protobuf decoding performance.
+func BenchmarkDecode_Protobuf(b *testing.B) {
+	msg := NewStreamRequest("tunnel-1", "req-bench", "10.0.0.1:8080", ProtocolHTTP)
+	data, _ := msg.Encode()
+	b.ResetTimer()
+	for range b.N {
+		_, _ = DecodeControlMessage(data)
+	}
+}
+
+// BenchmarkDecode_JSON measures JSON decoding performance for comparison.
+func BenchmarkDecode_JSON(b *testing.B) {
+	msg := NewStreamRequest("tunnel-1", "req-bench", "10.0.0.1:8080", ProtocolHTTP)
+	data, _ := msg.EncodeJSON()
+	b.ResetTimer()
+	for range b.N {
+		_, _ = DecodeControlMessage(data)
+	}
+}
+
+// BenchmarkWriteReadControlMessage measures the full length-prefix frame cycle.
+func BenchmarkWriteReadControlMessage(b *testing.B) {
+	msg := NewStreamRequest("tunnel-1", "req-bench", "10.0.0.1:8080", ProtocolHTTP)
+	b.ResetTimer()
+	for range b.N {
+		var buf bytes.Buffer
+		_ = WriteControlMessage(&buf, msg)
+		_, _ = ReadControlMessage(&buf)
+	}
 }
 
 // --- MessageType constants ---

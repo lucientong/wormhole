@@ -1120,14 +1120,8 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 		}
 		defer stream.Close()
 
-		// Read StreamRequest.
-		buf := make([]byte, 4096)
-		n, err := stream.Read(buf)
-		if err != nil {
-			return
-		}
-
-		msg, err := proto.DecodeControlMessage(buf[:n])
+		// Read length-prefixed StreamRequest.
+		msg, err := proto.ReadControlMessage(stream)
 		if err != nil || msg.StreamRequest == nil {
 			return
 		}
@@ -1235,23 +1229,20 @@ func TestServer_ServeTCPTunnel(t *testing.T) {
 		}
 		defer stream.Close()
 
-		buf := make([]byte, 4096)
-		n, readErr := stream.Read(buf)
-		if readErr != nil {
+		// Read length-prefixed StreamRequest.
+		msg, readErr := proto.ReadControlMessage(stream)
+		if readErr != nil || msg.StreamRequest == nil {
 			return
 		}
-
-		msg, _ := proto.DecodeControlMessage(buf[:n])
-		if msg == nil || msg.StreamRequest == nil {
-			return
-		}
+		_ = msg
 
 		// Read one message and echo it back.
-		dn, dataErr := stream.Read(buf)
+		echoBuf := make([]byte, 4096)
+		dn, dataErr := stream.Read(echoBuf)
 		if dataErr != nil {
 			return
 		}
-		_, _ = stream.Write(buf[:dn])
+		_, _ = stream.Write(echoBuf[:dn])
 	}()
 
 	// Start serveTCPTunnel in background (it will close ln on return).

@@ -485,17 +485,10 @@ func (c *Client) acceptStreams(ctx context.Context) {
 func (c *Client) handleStream(ctx context.Context, stream *tunnel.Stream) {
 	defer stream.Close()
 
-	// Read stream request
-	buf := make([]byte, 4096)
-	n, err := stream.Read(buf)
+	// Read length-prefixed stream request.
+	msg, err := proto.ReadControlMessage(stream)
 	if err != nil {
 		log.Error().Err(err).Msg("Read stream request failed")
-		return
-	}
-
-	msg, err := proto.DecodeControlMessage(buf[:n])
-	if err != nil {
-		log.Error().Err(err).Msg("Decode stream request failed")
 		return
 	}
 

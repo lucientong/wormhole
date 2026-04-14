@@ -199,16 +199,7 @@ func (h *HTTPHandler) sendStreamRequest(stream *tunnel.Stream, client *ClientSes
 		ContentLength: r.ContentLength,
 	}
 
-	data, err := streamReq.Encode()
-	if err != nil {
-		return fmt.Errorf("encode stream request: %w", err)
-	}
-
-	if _, err := stream.Write(data); err != nil {
-		return fmt.Errorf("write stream request: %w", err)
-	}
-
-	return nil
+	return proto.WriteControlMessage(stream, streamReq)
 }
 
 // notFound returns a styled 404 page.

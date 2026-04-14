@@ -1064,11 +1064,7 @@ func (s *Server) handleTCPConnection(conn net.Conn, client *ClientSession) {
 
 	// Send stream request.
 	streamReq := proto.NewStreamRequest("", generateID(), conn.RemoteAddr().String(), proto.ProtocolTCP)
-	data, err := streamReq.Encode()
-	if err != nil {
-		return
-	}
-	if _, err := stream.Write(data); err != nil {
+	if err := proto.WriteControlMessage(stream, streamReq); err != nil {
 		return
 	}
 

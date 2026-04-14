@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -333,11 +332,9 @@ func TestHTTPHandler_ForwardHTTP(t *testing.T) {
 		// Use a single bufio.Reader to avoid data loss between reads.
 		br := bufio.NewReader(stream)
 
-		// Use json.Decoder to consume exactly the JSON control message,
-		// leaving the HTTP request bytes in the bufio.Reader's buffer.
-		var msg proto.ControlMessage
-		dec := json.NewDecoder(br)
-		if decErr := dec.Decode(&msg); decErr != nil {
+		// Read the length-prefixed protobuf control message.
+		msg, decErr := proto.ReadControlMessage(br)
+		if decErr != nil {
 			return
 		}
 		if msg.StreamRequest == nil {
@@ -345,10 +342,7 @@ func TestHTTPHandler_ForwardHTTP(t *testing.T) {
 		}
 
 		// Read the raw HTTP request from the buffered reader.
-		// json.Decoder may have buffered extra bytes; create a new reader
-		// that combines the decoder's buffered bytes with the original reader.
-		combined := io.MultiReader(dec.Buffered(), br)
-		httpReq, parseErr := http.ReadRequest(bufio.NewReader(combined))
+		httpReq, parseErr := http.ReadRequest(br)
 		if parseErr != nil {
 			return
 		}
@@ -462,10 +456,8 @@ func TestSendStreamRequest(t *testing.T) {
 	go func() {
 		s, _ := clientMux.AcceptStream()
 		if s != nil {
-			buf := make([]byte, 4096)
-			n, _ := s.Read(buf)
-			if n > 0 {
-				msg, _ := proto.DecodeControlMessage(buf[:n])
+			msg, readErr := proto.ReadControlMessage(s)
+			if readErr == nil {
 				assert.NotNil(t, msg.StreamRequest)
 				assert.Equal(t, proto.ProtocolHTTP, msg.StreamRequest.Protocol)
 				assert.Equal(t, "myhost.example.com", msg.StreamRequest.HTTPMetadata.Host)
@@ -529,10 +521,9 @@ func TestHTTPHandler_HandleWebSocket(t *testing.T) {
 
 		br := bufio.NewReader(stream)
 
-		// Read StreamRequest (JSON).
-		var msg proto.ControlMessage
-		dec := json.NewDecoder(br)
-		if decErr := dec.Decode(&msg); decErr != nil {
+		// Read length-prefixed protobuf StreamRequest.
+		msg, decErr := proto.ReadControlMessage(br)
+		if decErr != nil {
 			return
 		}
 		if msg.StreamRequest == nil {
@@ -540,8 +531,7 @@ func TestHTTPHandler_HandleWebSocket(t *testing.T) {
 		}
 
 		// Read the HTTP upgrade request.
-		combined := io.MultiReader(dec.Buffered(), br)
-		httpReq, parseErr := http.ReadRequest(bufio.NewReader(combined))
+		httpReq, parseErr := http.ReadRequest(br)
 		if parseErr != nil {
 			return
 		}
@@ -726,14 +716,13 @@ func TestHTTPHandler_ForwardHTTP_LargeBody(t *testing.T) {
 		defer stream.Close()
 
 		br := bufio.NewReader(stream)
-		var msg proto.ControlMessage
-		dec := json.NewDecoder(br)
-		if decErr := dec.Decode(&msg); decErr != nil {
+		msg, decErr := proto.ReadControlMessage(br)
+		if decErr != nil {
 			return
 		}
+		_ = msg
 
-		combined := io.MultiReader(dec.Buffered(), br)
-		httpReq, parseErr := http.ReadRequest(bufio.NewReader(combined))
+		httpReq, parseErr := http.ReadRequest(br)
 		if parseErr != nil {
 			return
 		}

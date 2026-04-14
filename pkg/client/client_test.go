@@ -614,8 +614,7 @@ func TestClient_HandleStream_StreamRequest(t *testing.T) {
 	require.NoError(t, err)
 
 	req := proto.NewStreamRequest("", "req-1", "1.2.3.4:1234", proto.ProtocolHTTP)
-	data, _ := req.Encode()
-	_, err = serverStream.Write(data)
+	err = proto.WriteControlMessage(serverStream, req)
 	require.NoError(t, err)
 
 	// Client accepts and handles the stream.
@@ -1049,8 +1048,7 @@ func TestClient_AcceptStreams(t *testing.T) {
 		require.NoError(t, err)
 
 		req := proto.NewStreamRequest("", fmt.Sprintf("req-%d", i), "10.0.0.1:1234", proto.ProtocolHTTP)
-		data, _ := req.Encode()
-		_, _ = stream.Write(data)
+		_ = proto.WriteControlMessage(stream, req)
 
 		// Read response (error response since local is not listening).
 		buf := make([]byte, 4096)
@@ -1448,8 +1446,7 @@ func TestClient_HandleStream_DefaultBranch(t *testing.T) {
 
 	// Send a PingRequest which is not handled by handleStream's switch.
 	msg := proto.NewPingRequest(99)
-	data, _ := msg.Encode()
-	_, err = serverStream.Write(data)
+	err = proto.WriteControlMessage(serverStream, msg)
 	require.NoError(t, err)
 
 	clientStream, err := clientMux.AcceptStream()
@@ -1597,8 +1594,7 @@ func TestClient_HandleStream_P2POfferResponse(t *testing.T) {
 	require.NoError(t, err)
 
 	resp := proto.NewP2POfferResponse(true, "", "10.0.0.1:5000", "Full Cone", peerPubB64)
-	data, _ := resp.Encode()
-	_, err = serverStream.Write(data)
+	err = proto.WriteControlMessage(serverStream, resp)
 	require.NoError(t, err)
 
 	clientStream, err := clientMux.AcceptStream()

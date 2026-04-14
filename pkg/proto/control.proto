@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package wormhole;
 
-option go_package = "github.com/lucientong/wormhole/pkg/proto";
+option go_package = "github.com/lucientong/wormhole/pkg/proto/pb";
 
 // AuthRequest is sent by client to authenticate with the server.
 message AuthRequest {
@@ -56,6 +56,9 @@ message RegisterRequest {
   
   // Custom hostname (for HTTP routing)
   string hostname = 4;
+  
+  // Path prefix for HTTP routing (optional).
+  string path_prefix = 5;
 }
 
 // RegisterResponse is sent by server after tunnel registration.
@@ -195,6 +198,66 @@ message CloseResponse {
   bool success = 1;
 }
 
+// P2POfferRequest is sent by a client to initiate a P2P connection.
+message P2POfferRequest {
+  // Tunnel ID wanting P2P.
+  string tunnel_id = 1;
+  
+  // Sender's detected NAT type.
+  string nat_type = 2;
+  
+  // Sender's public endpoint as discovered by STUN.
+  string public_addr = 3;
+  
+  // Sender's local endpoint.
+  string local_addr = 4;
+  
+  // Sender's ECDH X25519 public key (base64-encoded).
+  string public_key = 5;
+}
+
+// P2POfferResponse is the server's response to a P2P offer.
+message P2POfferResponse {
+  // Whether a peer was found.
+  bool success = 1;
+  
+  // Reason if the offer was rejected.
+  string error = 2;
+  
+  // Peer's public endpoint.
+  string peer_addr = 3;
+  
+  // Peer's NAT type.
+  string peer_nat_type = 4;
+  
+  // Peer's ECDH X25519 public key (base64-encoded).
+  string peer_public_key = 5;
+}
+
+// P2PCandidates carries additional candidate endpoints for hole punching.
+message P2PCandidates {
+  // Tunnel ID.
+  string tunnel_id = 1;
+  
+  // List of candidate endpoints.
+  repeated string candidates = 2;
+}
+
+// P2PResult reports the outcome of a P2P connection attempt.
+message P2PResult {
+  // Tunnel ID.
+  string tunnel_id = 1;
+  
+  // Whether P2P was established.
+  bool success = 2;
+  
+  // Confirmed peer address (if successful).
+  string peer_addr = 3;
+  
+  // Reason if P2P failed.
+  string error = 4;
+}
+
 // ControlMessage is a wrapper for all control messages.
 message ControlMessage {
   // Message type
@@ -217,6 +280,10 @@ message ControlMessage {
     StatsResponse stats_response = 19;
     CloseRequest close_request = 20;
     CloseResponse close_response = 21;
+    P2POfferRequest p2p_offer_request = 22;
+    P2POfferResponse p2p_offer_response = 23;
+    P2PCandidates p2p_candidates = 24;
+    P2PResult p2p_result = 25;
   }
 }
 
@@ -235,4 +302,8 @@ enum MessageType {
   MESSAGE_TYPE_STATS_RESPONSE = 10;
   MESSAGE_TYPE_CLOSE_REQUEST = 11;
   MESSAGE_TYPE_CLOSE_RESPONSE = 12;
+  MESSAGE_TYPE_P2P_OFFER_REQUEST = 13;
+  MESSAGE_TYPE_P2P_OFFER_RESPONSE = 14;
+  MESSAGE_TYPE_P2P_CANDIDATES = 15;
+  MESSAGE_TYPE_P2P_RESULT = 16;
 }
