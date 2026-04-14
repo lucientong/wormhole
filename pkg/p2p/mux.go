@@ -254,7 +254,8 @@ func (m *UDPMux) readLoop() {
 			if errors.As(err, &netErr) && netErr.Timeout() {
 				continue
 			}
-			if atomic.LoadUint32(&m.closed) == 1 {
+			// Treat a closed connection as a clean shutdown signal.
+			if atomic.LoadUint32(&m.closed) == 1 || errors.Is(err, net.ErrClosed) {
 				return
 			}
 			log.Debug().Err(err).Msg("P2P mux: read error")

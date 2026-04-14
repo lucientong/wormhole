@@ -301,7 +301,7 @@ func (s *Server) acceptTunnelLoop() {
 	for {
 		conn, err := s.tunnelListener.Accept()
 		if err != nil {
-			if s.isClosed() {
+			if s.isClosed() || errors.Is(err, net.ErrClosed) {
 				return
 			}
 			log.Error().Err(err).Msg("Accept tunnel connection failed")
@@ -1152,7 +1152,7 @@ func (s *Server) serveTCPTunnel(ln net.Listener, client *ClientSession) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			if s.isClosed() {
+			if s.isClosed() || errors.Is(err, net.ErrClosed) {
 				return
 			}
 			log.Error().Err(err).Msg("Accept TCP tunnel connection failed")
