@@ -59,7 +59,7 @@ func runTunnelsList(_ *cobra.Command, _ []string) {
 	}
 
 	body, readErr := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if readErr != nil {
 		log.Fatal().Err(readErr).Msg("Failed to read response")
 	}

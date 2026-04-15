@@ -61,7 +61,7 @@ func NewRedisStateStore(cfg RedisStateStoreConfig) (*RedisStateStore, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := client.Ping(ctx).Err(); err != nil {
-		client.Close()
+		_ = client.Close()
 		return nil, fmt.Errorf("redis ping failed: %w", err)
 	}
 

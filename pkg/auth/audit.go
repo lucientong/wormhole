@@ -25,7 +25,7 @@ const (
 	// EventTokenRevoked indicates a token was revoked.
 	EventTokenRevoked AuditEventType = "token_revoked"
 	// EventTeamTokensRevoked indicates all tokens for a team were revoked.
-	EventTeamTokensRevoked AuditEventType = "team_tokens_revoked" //nolint:gosec // audit event type string, not a credential
+	EventTeamTokensRevoked AuditEventType = "team_tokens_revoked" //nolint:gosec // #nosec G101 -- audit event type string, not a credential
 	// EventClientConnected indicates a client connected.
 	EventClientConnected AuditEventType = "client_connected"
 	// EventClientDisconnected indicates a client disconnected.

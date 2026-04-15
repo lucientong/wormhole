@@ -232,8 +232,7 @@ func (s *SQLiteAuditStore) Query(q AuditQuery) ([]AuditEvent, error) {
 	}
 
 	where, args := buildWhereClause(q)
-	//nolint:gosec // where clause is built by buildWhereClause using only safe placeholder values
-	query := fmt.Sprintf(
+	query := fmt.Sprintf( //nolint:gosec // #nosec G201 -- where clause is built by buildWhereClause using only safe placeholder values
 		`SELECT timestamp, type, ip, team_name, role, session_id, subdomain, tunnel_id, protocol, error, details
 		 FROM audit_events %s
 		 ORDER BY timestamp DESC, id DESC
