@@ -39,6 +39,18 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Route request to client.
 	client := h.router.Route(r.Host, r.URL.Path)
 	if client == nil {
+		// Try cluster-wide lookup: maybe the client is on another node.
+		if route := h.server.lookupRemoteClient(extractSubdomain(r.Host, h.server.config.Domain)); route != nil {
+			if !h.server.isLocalNode(route.NodeID) && route.NodeAddr != "" {
+				log.Debug().
+					Str("subdomain", route.Subdomain).
+					Str("node", route.NodeAddr).
+					Msg("Cluster: proxying HTTP request to remote node")
+				h.server.proxyToNode(route.NodeAddr, w, r)
+				return
+			}
+		}
+
 		h.notFound(w, r)
 		// Record metrics for unrouted requests.
 		if h.server.metrics != nil {
@@ -216,6 +228,23 @@ func (h *HTTPHandler) notFound(w http.ResponseWriter, r *http.Request) {
 <p style="color:#8b949e;font-size:14px">Make sure your Wormhole client is running.</p>
 </body>
 </html>`, safeHost)
+}
+
+// extractSubdomain extracts the subdomain from a host string given the base domain.
+// For example, extractSubdomain("abc123.example.com", "example.com") → "abc123".
+// Returns an empty string if the host is not a subdomain of domain.
+func extractSubdomain(host, domain string) string {
+	suffix := "." + domain
+	if strings.HasSuffix(host, suffix) {
+		return strings.TrimSuffix(host, suffix)
+	}
+	// Strip port if present.
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		if strings.HasSuffix(h, suffix) {
+			return strings.TrimSuffix(h, suffix)
+		}
+	}
+	return ""
 }
 
 // isWebSocketUpgrade checks if the request is a WebSocket upgrade.

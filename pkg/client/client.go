@@ -29,7 +29,18 @@ import (
 // defaultLocalHost is the default host for local service binding and inspector UI.
 const defaultLocalHost = "127.0.0.1"
 
+// protocolHTTP is the canonical string for HTTP tunnel protocol.
+const protocolHTTP = "http"
+
 // Client is the wormhole client.
+// ActiveTunnel holds runtime state for a registered tunnel.
+type ActiveTunnel struct {
+	Def       TunnelDef
+	TunnelID  string
+	PublicURL string
+	TCPPort   uint32
+}
+
 type Client struct {
 	config Config
 
@@ -40,6 +51,15 @@ type Client struct {
 	publicURL string
 	tunnelID  string
 	sessionID string // Server-assigned session ID (for reconnect awareness).
+
+	// Multi-tunnel state (populated after registration).
+	// Single-tunnel mode uses publicURL/tunnelID directly;
+	// multi-tunnel mode populates this map.
+	activeTunnels   map[string]*ActiveTunnel // name → active tunnel
+	activeTunnelsMu sync.RWMutex
+
+	// Control server (optional; exposes /tunnels for `wormhole tunnels list`).
+	ctrlServer *http.Server
 
 	// Inspector
 	inspector        *inspector.Inspector
@@ -81,10 +101,11 @@ func NewClient(config Config) *Client {
 	p2pConfig := config.P2PConfig
 	p2pConfig.Enabled = config.P2PEnabled
 	return &Client{
-		config:     config,
-		inspector:  insp,
-		p2pManager: p2p.NewManager(p2pConfig),
-		closeCh:    make(chan struct{}),
+		config:        config,
+		inspector:     insp,
+		p2pManager:    p2p.NewManager(p2pConfig),
+		closeCh:       make(chan struct{}),
+		activeTunnels: make(map[string]*ActiveTunnel),
 	}
 }
 
@@ -214,11 +235,19 @@ func (c *Client) connect(ctx context.Context) error {
 		}
 	}
 
-	// Register tunnel
-	if err := c.registerTunnel(ctx); err != nil {
-		_ = mux.Close()
-		_ = conn.Close()
-		return fmt.Errorf("register tunnel: %w", err)
+	// Register tunnel(s).
+	if len(c.config.Tunnels) > 0 {
+		if err := c.registerAllTunnels(ctx); err != nil {
+			_ = mux.Close()
+			_ = conn.Close()
+			return fmt.Errorf("register tunnels: %w", err)
+		}
+	} else {
+		if err := c.registerTunnel(ctx); err != nil {
+			_ = mux.Close()
+			_ = conn.Close()
+			return fmt.Errorf("register tunnel: %w", err)
+		}
 	}
 
 	return nil
@@ -428,6 +457,193 @@ func (c *Client) registerTunnel(ctx context.Context) error {
 	return nil
 }
 
+// registerAllTunnels registers all tunnels from Config.Tunnels.
+// It is used in multi-tunnel (config file) mode.
+func (c *Client) registerAllTunnels(ctx context.Context) error {
+	c.activeTunnelsMu.Lock()
+	// Reset active tunnels map for this connection cycle.
+	c.activeTunnels = make(map[string]*ActiveTunnel, len(c.config.Tunnels))
+	c.activeTunnelsMu.Unlock()
+
+	for _, def := range c.config.Tunnels {
+		at, err := c.registerOneTunnel(ctx, def)
+		if err != nil {
+			log.Error().Err(err).Str("tunnel", def.Name).Msg("Failed to register tunnel")
+			continue // Best effort: skip failed tunnels.
+		}
+		c.activeTunnelsMu.Lock()
+		c.activeTunnels[def.Name] = at
+		c.activeTunnelsMu.Unlock()
+	}
+
+	c.activeTunnelsMu.RLock()
+	count := len(c.activeTunnels)
+	c.activeTunnelsMu.RUnlock()
+
+	if count == 0 {
+		return fmt.Errorf("all tunnel registrations failed")
+	}
+
+	c.printMultiTunnelBanner()
+	return nil
+}
+
+// registerOneTunnel registers a single tunnel definition and returns its state.
+func (c *Client) registerOneTunnel(ctx context.Context, def TunnelDef) (*ActiveTunnel, error) {
+	c.mu.Lock()
+	mux := c.mux
+	c.mu.Unlock()
+
+	if mux == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+
+	stream, err := mux.OpenStreamContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("open stream: %w", err)
+	}
+	defer stream.Close()
+
+	if def.LocalPort < 0 || def.LocalPort > 65535 {
+		return nil, fmt.Errorf("invalid local port: %d", def.LocalPort)
+	}
+
+	p := parseProtocol(def.Protocol)
+	req := proto.NewRegisterRequest(uint32(def.LocalPort), p, def.Subdomain, def.Hostname, def.PathPrefix) // #nosec G115
+	data, err := req.Encode()
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
+	if _, writeErr := stream.Write(data); writeErr != nil {
+		return nil, fmt.Errorf("write request: %w", writeErr)
+	}
+
+	buf := make([]byte, 4096)
+	n, err := stream.Read(buf)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	if err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	if msg.RegisterResponse == nil {
+		return nil, fmt.Errorf("unexpected response type")
+	}
+
+	resp := msg.RegisterResponse
+	if !resp.Success {
+		return nil, fmt.Errorf("registration failed: %s", resp.Error)
+	}
+
+	log.Info().
+		Str("name", def.Name).
+		Str("tunnel_id", resp.TunnelID).
+		Str("public_url", resp.PublicURL).
+		Int("local_port", def.LocalPort).
+		Msg("Tunnel registered")
+
+	return &ActiveTunnel{
+		Def:       def,
+		TunnelID:  resp.TunnelID,
+		PublicURL: resp.PublicURL,
+		TCPPort:   resp.TCPPort,
+	}, nil
+}
+
+// printMultiTunnelBanner prints a startup banner listing all active tunnels.
+func (c *Client) printMultiTunnelBanner() {
+	c.activeTunnelsMu.RLock()
+	defer c.activeTunnelsMu.RUnlock()
+
+	fmt.Printf("\n")
+	fmt.Printf("  🕳️  Wormhole is ready! (%d tunnel(s) active)\n", len(c.activeTunnels))
+	fmt.Printf("\n")
+	for name, at := range c.activeTunnels {
+		fmt.Printf("  %-12s %s  →  %s:%d\n", name+":", at.PublicURL, at.Def.LocalHost, at.Def.LocalPort)
+	}
+	fmt.Printf("\n  Press Ctrl+C to stop\n\n")
+}
+
+// ListActiveTunnels returns a copy of the currently active tunnels.
+func (c *Client) ListActiveTunnels() []ActiveTunnel {
+	c.activeTunnelsMu.RLock()
+	defer c.activeTunnelsMu.RUnlock()
+
+	out := make([]ActiveTunnel, 0, len(c.activeTunnels))
+	for _, at := range c.activeTunnels {
+		out = append(out, *at)
+	}
+	// In single-tunnel mode also expose the main tunnel.
+	if len(out) == 0 && c.tunnelID != "" {
+		out = append(out, ActiveTunnel{
+			Def: TunnelDef{
+				Name:      "default",
+				LocalPort: c.config.LocalPort,
+				LocalHost: c.config.LocalHost,
+				Protocol:  c.config.Protocol,
+			},
+			TunnelID:  c.tunnelID,
+			PublicURL: c.publicURL,
+		})
+	}
+	return out
+}
+
+// ReloadTunnels updates the active tunnel set based on a new list of definitions.
+// New tunnels are registered; removed tunnels are closed via CloseRequest.
+// This is designed to be called when a SIGHUP reloads the config file.
+func (c *Client) ReloadTunnels(ctx context.Context, newDefs []TunnelDef) {
+	c.mu.Lock()
+	mux := c.mux
+	c.mu.Unlock()
+	if mux == nil || mux.IsClosed() {
+		log.Warn().Msg("ReloadTunnels: not connected, skipping")
+		return
+	}
+
+	c.activeTunnelsMu.RLock()
+	current := make(map[string]*ActiveTunnel, len(c.activeTunnels))
+	for k, v := range c.activeTunnels {
+		current[k] = v
+	}
+	c.activeTunnelsMu.RUnlock()
+
+	newSet := make(map[string]TunnelDef, len(newDefs))
+	for _, d := range newDefs {
+		newSet[d.Name] = d
+	}
+
+	// Close tunnels that are no longer in the new config.
+	for name, at := range current {
+		if _, exists := newSet[name]; !exists {
+			log.Info().Str("tunnel", name).Msg("Closing removed tunnel")
+			if err := c.CloseTunnel(ctx, at.TunnelID, "config reload"); err != nil {
+				log.Warn().Err(err).Str("tunnel", name).Msg("Failed to close removed tunnel")
+			}
+			c.activeTunnelsMu.Lock()
+			delete(c.activeTunnels, name)
+			c.activeTunnelsMu.Unlock()
+		}
+	}
+
+	// Register tunnels that are new.
+	for name, def := range newSet {
+		if _, exists := current[name]; !exists {
+			log.Info().Str("tunnel", name).Msg("Registering new tunnel from config reload")
+			at, err := c.registerOneTunnel(ctx, def)
+			if err != nil {
+				log.Error().Err(err).Str("tunnel", name).Msg("Failed to register new tunnel")
+				continue
+			}
+			c.activeTunnelsMu.Lock()
+			c.activeTunnels[name] = at
+			c.activeTunnelsMu.Unlock()
+		}
+	}
+}
+
 // handleConnection handles an active connection.
 func (c *Client) handleConnection(ctx context.Context) {
 	c.closeWg.Add(2)
@@ -613,7 +829,7 @@ func (c *Client) forwardHTTPWithInspect(ctx context.Context, stream streamConn, 
 	atomic.AddUint64(&c.stats.BytesIn, uint64(len(reqBody)))
 
 	// 3. Prepare the request for forwarding to local service.
-	httpReq.URL.Scheme = "http"
+	httpReq.URL.Scheme = protocolHTTP
 	httpReq.URL.Host = localAddr
 	httpReq.Body = io.NopCloser(bytes.NewReader(reqBody))
 	httpReq.ContentLength = int64(len(reqBody))
@@ -1138,6 +1354,8 @@ func (c *Client) GetP2PManager() *p2p.Manager {
 // Close closes the client.
 // It performs graceful shutdown by sending a CloseRequest to the server
 // before tearing down the connection.
+//
+//nolint:gocyclo // shutdown must coordinate all subsystems in one place
 func (c *Client) Close() error {
 	if !atomic.CompareAndSwapUint32(&c.closed, 0, 1) {
 		return nil
@@ -1149,13 +1367,30 @@ func (c *Client) Close() error {
 	tunnelID := c.tunnelID
 	c.mu.Unlock()
 
-	if mux != nil && !mux.IsClosed() && tunnelID != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		closeErr := c.CloseTunnel(ctx, tunnelID, "client shutting down")
-		cancel()
-		if closeErr != nil {
-			log.Debug().Err(closeErr).Msg("Graceful tunnel close failed (proceeding with shutdown)")
+	if mux != nil && !mux.IsClosed() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// In multi-tunnel mode, close all active tunnels.
+		c.activeTunnelsMu.RLock()
+		for _, at := range c.activeTunnels {
+			if err := c.CloseTunnel(ctx, at.TunnelID, "client shutting down"); err != nil {
+				log.Debug().Err(err).Str("tunnel", at.Def.Name).Msg("Graceful tunnel close failed")
+			}
 		}
+		c.activeTunnelsMu.RUnlock()
+		// Single-tunnel mode fallback.
+		if tunnelID != "" {
+			if err := c.CloseTunnel(ctx, tunnelID, "client shutting down"); err != nil {
+				log.Debug().Err(err).Msg("Graceful tunnel close failed (proceeding with shutdown)")
+			}
+		}
+		cancel()
+	}
+
+	// Stop control server.
+	if c.ctrlServer != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = c.ctrlServer.Shutdown(shutdownCtx)
+		cancel()
 	}
 
 	close(c.closeCh)

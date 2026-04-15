@@ -87,18 +87,22 @@ Wormhole is a Client-Server architecture tunneling tool. The core idea is:
 
 | Component | Location | Responsibility |
 |-----------|----------|----------------|
-| `Server` | `pkg/server/server.go` | Core controller; manages client sessions, coordinates components |
-| `HTTPHandler` | `pkg/server/handler.go` | HTTP reverse proxy; forwards requests through tunnel to Client |
-| `Router` | `pkg/server/router.go` | Host/Path routing table; supports subdomain, custom domains, path prefixes |
+| `Server` | `pkg/server/server.go` | Core controller; manages client sessions, coordinates all components |
+| `HTTPHandler` | `pkg/server/handler.go` | HTTP reverse proxy; forwards requests through tunnel; cross-node proxy fallback |
+| `Router` | `pkg/server/router.go` | Host/Path routing table; subdomain, custom domains, path prefixes |
 | `TLSManager` | `pkg/server/tls.go` | TLS termination; Let's Encrypt auto-certs and manual certificates |
-| `AdminAPI` | `pkg/server/admin.go` | RESTful admin API |
+| `AdminAPI` | `pkg/server/admin.go` | RESTful admin API including `/audit` and `/audit/export` |
 | `TCPPortAllocator` | `pkg/server/handler.go` | Allocates ports for TCP tunnels |
+| `StateStore` | `pkg/server/state*.go` | Cluster shared state (routes + nodes); Memory or Redis backend |
+| Cluster heartbeat | `pkg/server/cluster.go` | Periodic heartbeat, dead-node eviction, cross-node HTTP proxying |
 
 ### Client-Side Components
 
 | Component | Location | Responsibility |
 |-----------|----------|----------------|
-| `Client` | `pkg/client/client.go` | Core controller; manages connection, forwarding, reconnection |
+| `Client` | `pkg/client/client.go` | Core controller; connection, multi-tunnel, hot-reload, reconnection |
+| `FileConfig` | `pkg/client/config_file.go` | YAML config file loader + validator |
+| Control API | `pkg/client/control.go` | Local HTTP server (`/tunnels`) for `wormhole tunnels list` |
 | `Inspector` | `pkg/inspector/inspector.go` | HTTP traffic capture and recording |
 | `Handler` | `pkg/inspector/handler.go` | Inspector HTTP API + WebSocket push |
 | `Storage` | `pkg/inspector/storage.go` | Request record ring-buffer storage |
@@ -110,9 +114,9 @@ Wormhole is a Client-Server architecture tunneling tool. The core idea is:
 | Package | Location | Responsibility |
 |---------|----------|----------------|
 | `tunnel` | `pkg/tunnel/` | Multiplexer, frame codec, stream management, connection pool |
-| `proto` | `pkg/proto/` | Control protocol message definitions (JSON encoding) |
-| `auth` | `pkg/auth/` | Authentication & authorization (HMAC tokens, roles, permissions, rate limiting, audit logging, SQLite persistence) |
-| `p2p` | `pkg/p2p/` | STUN client (IPv4/IPv6), NAT discovery, UDP hole punching, port prediction, reliable UDP transport, E2E encryption (X25519 + AES-256-GCM) |
+| `proto` | `pkg/proto/` | Control protocol (Protobuf encoding + JSON fallback) |
+| `auth` | `pkg/auth/` | HMAC tokens, OIDC/JWT, OAuth Device Flow, credentials, RBAC, rate limiting, audit logging + store |
+| `p2p` | `pkg/p2p/` | STUN (IPv4/IPv6), NAT discovery, UDP hole punching, port prediction, reliable UDP (UDPMux + UDPStream + ARQ), E2E encryption (X25519 + AES-256-GCM) |
 | `version` | `pkg/version/` | Build version information |
 
 ---
@@ -760,7 +764,9 @@ Default Configuration:
 
 ### Audit Logging
 
-The audit logger (`audit.go`) records security events for compliance and debugging:
+The audit logger (`audit.go`) records security and lifecycle events for compliance and debugging.
+
+#### Event Types
 
 | Event Type | Description |
 |------------|-------------|
@@ -769,20 +775,31 @@ The audit logger (`audit.go`) records security events for compliance and debuggi
 | `ip_blocked` | IP blocked due to rate limit |
 | `ip_unblocked` | IP manually unblocked |
 | `token_generated` | New token created |
+| `token_revoked` | Token explicitly revoked |
+| `team_tokens_revoked` | All tokens for a team revoked |
 | `client_connected` | Client established tunnel |
 | `client_disconnected` | Client disconnected |
+| `tunnel_created` | Tunnel registered by client |
+| `tunnel_closed` | Tunnel closed gracefully |
+| `p2p_established` | P2P direct connection established |
+| `p2p_fallback` | P2P failed, using relay |
 
-Log format (JSON):
-```json
-{
-  "timestamp": "2024-03-31T12:00:00Z",
-  "type": "auth_success",
-  "ip": "192.168.1.100",
-  "team": "team-alpha",
-  "role": "member",
-  "session_id": "abc123",
-  "subdomain": "myapp"
-}
+#### AuditStore Backends
+
+```
+AuditLogger
+    └── AuditStore (interface)
+          ├── MemoryAuditStore  — ring buffer (default; configurable capacity)
+          └── SQLiteAuditStore  — persistent SQLite database
+```
+
+The `AuditStore` interface provides `Store(event)` and `Query(AuditQuery)`. `AuditQuery` supports filtering by event type, session ID, IP, time range, and pagination (`Offset`, `Limit`).
+
+#### Admin Query API
+
+```
+GET  /audit?type=auth_failure&from=<RFC3339>&to=<RFC3339>&limit=50  → JSON array
+GET  /audit/export?format=csv|json                                   → file download
 ```
 
 ### Persistent Storage
@@ -919,12 +936,45 @@ Key components:
 
 ### Authentication
 
-- Dual-mode token authentication: HMAC-SHA256 signed tokens (team management) + simple pre-shared tokens (quick deployment)
-- HMAC-SHA256 based token generation/verification with nonce for replay prevention
+- **Multi-mode token authentication**:
+  1. Simple pre-shared tokens (quick deployment)
+  2. HMAC-SHA256 signed team tokens (with expiry + revocation)
+  3. OIDC JWT tokens — `ValidateToken` tries OIDC if an `OIDCValidator` is configured and the token is JWT-shaped
 - Role-based access control (RBAC): admin, member, viewer roles
-- Mandatory authentication on connection handshake (`--require-auth`), viewer role cannot establish tunnel connections
-- Admin API protected by separate token, using constant-time comparison to prevent timing attacks
+- Mandatory authentication on connection handshake (`--require-auth`); viewer role cannot establish tunnels
+- Admin API protected by separate token using `crypto/subtle.ConstantTimeCompare`
 - Token revocation support with persistent blacklist (SQLite backend)
+
+#### OIDC / SSO Integration
+
+```
+Auth.ValidateToken(token)
+  ├── 1. Simple pre-shared token match
+  ├── 2. isJWT? + OIDCValidator configured?
+  │       └── OIDCValidator.ValidateToken(jwt)
+  │               ├── OIDC Discovery (issuer/.well-known/openid-configuration)
+  │               ├── JWKS key fetch + cache (TTL 1h)
+  │               ├── JWT signature verification (RS256 / ES256)
+  │               ├── Claims: iss, aud, exp validation
+  │               └── OIDCClaimMapping → Claims{TeamName, Role}
+  └── 3. HMAC-SHA256 signed token verification
+```
+
+The `OIDCValidator` caches JWKS keys with a 1-hour TTL and auto-refreshes on unknown `kid`. Supported algorithms: `RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `ES512`.
+
+#### OAuth2 Device Code Flow (`wormhole login`)
+
+```
+wormhole login --issuer <url> --client-id <id>
+  │
+  ├── 1. OIDC Discovery → device_authorization_endpoint, token_endpoint
+  ├── 2. POST /device/auth → { device_code, user_code, verification_uri, interval }
+  ├── 3. Print: "Open <url> and enter code: XXXX-YYYY"
+  ├── 4. Poll token endpoint every <interval> seconds
+  └── 5. On success: SaveCredentials(~/.wormhole/credentials.json, server, token, expiry)
+```
+
+Saved tokens are automatically used by `wormhole client --server <url>`.
 
 ### Rate Limiting
 
@@ -936,16 +986,136 @@ Key components:
 
 ### Audit Logging
 
-- Structured JSON logging of security events
-- Events: auth success/failure, IP blocked/unblocked, token generated, client connect/disconnect
-- Configurable output destination (stdout, file)
-- Compliance-ready event format with timestamps and session tracking
+- Structured JSON logging of security and lifecycle events
+- Events: auth success/failure, IP blocked/unblocked, token generated/revoked, tunnel created/closed, P2P established/fallback, client connect/disconnect
+- Pluggable `AuditStore`: in-memory ring buffer (default) or SQLite (persistent)
+- Admin API: `GET /audit` with filters + `GET /audit/export` for CSV/JSON bulk export
 
 ### Input Validation
 
 - HTML escaping on Host header routing (XSS prevention)
 - Subdomain restricted to single-level labels (no dots)
 - Path prefix normalization (leading/trailing `/`)
+
+---
+
+## Multi-Tunnel Configuration & Hot-Reload
+
+### Config File (`pkg/client/config_file.go`)
+
+YAML-based client configuration enables declaring multiple tunnels declaratively:
+
+```yaml
+server: tunnel.example.com:7000
+tls: true
+token: my-team-token
+
+tunnels:
+  - name: web
+    local_port: 3000
+    protocol: http
+  - name: api
+    local_port: 8080
+    subdomain: myapi
+  - name: db
+    local_port: 5432
+    protocol: tcp
+```
+
+### Multi-Tunnel Startup Flow
+
+```
+Client.connect()
+  └── config.Tunnels non-empty?
+        ├── Yes → registerAllTunnels()
+        │           └── for each TunnelDef → registerOneTunnel() → activeTunnels[name]
+        └── No  → registerTunnel() (legacy single-tunnel mode)
+```
+
+### SIGHUP Hot-Reload
+
+```
+SIGHUP received
+  └── LoadFileConfig(path) → new FileConfig
+        └── c.ReloadTunnels(newDefs)
+              ├── diff: find removed tunnels → CloseTunnel() each
+              └── diff: find added tunnels   → registerOneTunnel() each
+```
+
+No restart needed; the tunnel connection remains open.
+
+### Local Control API (`pkg/client/control.go`)
+
+```
+GET http://localhost:<ctrl-port>/tunnels
+→ JSON array of TunnelInfo { Name, LocalPort, Protocol, PublicURL, CreatedAt }
+```
+
+Used by `wormhole tunnels list` to display active tunnels.
+
+---
+
+## HA / Multi-Node Control Plane
+
+### StateStore Interface (`pkg/server/state.go`)
+
+```go
+type StateStore interface {
+    RegisterRoute(entry RouteEntry) error
+    UnregisterRoute(clientID string) error
+    LookupBySubdomain(subdomain string) (*RouteEntry, error)
+    ListRoutes() ([]RouteEntry, error)
+    NodeHeartbeat(info NodeInfo) error
+    GetNodes() ([]NodeInfo, error)
+    EvictDeadNodes(olderThan time.Duration) error
+    Close() error
+}
+```
+
+`RouteEntry` carries `{ClientID, Subdomain, NodeID, NodeAddr}`. `NodeInfo` carries `{NodeID, NodeAddr, LastHeartbeat}`.
+
+### Backends
+
+| Backend | Class | Use Case |
+|---------|-------|----------|
+| `nil` (default) | — | Single-node; no distributed state |
+| `MemoryStateStore` | `state_memory.go` | Single-node; validates cluster logic without Redis |
+| `RedisStateStore` | `state_redis.go` | Multi-node; production clustering |
+
+Redis key schema:
+
+| Key | TTL | Content |
+|-----|-----|---------|
+| `wormhole:route:<clientID>` | 5 min | `RouteEntry` JSON |
+| `wormhole:sub:<subdomain>` | 5 min | `clientID` pointer |
+| `wormhole:node:<nodeID>` | 90 s | `NodeInfo` JSON |
+
+TTLs are refreshed on each heartbeat / tunnel register, and Redis auto-expires stale entries.
+
+### Cluster Heartbeat (`pkg/server/cluster.go`)
+
+```
+startClusterHeartbeat(ctx)
+  ├── tick every 30s → NodeHeartbeat(NodeInfo{NodeID, NodeAddr})
+  └── tick every 60s → EvictDeadNodes(90s threshold)
+                           └── MemoryStateStore: scan + delete dead nodes + owned routes
+                               RedisStateStore: no-op (Redis TTL handles eviction)
+```
+
+### Cross-Node HTTP Routing
+
+```
+HTTPHandler.ServeHTTP(r)
+  ├── router.Route(host, path) → local ClientSession?
+  │     └── Yes → forwardHTTP / handleWebSocket (normal path)
+  └── No → server.lookupRemoteClient(subdomain)
+              └── found remote RouteEntry?
+                    ├── isLocalNode? → continue to 404 (stale entry)
+                    └── No  → proxyToNode(route.NodeAddr, w, r)
+                                  └── httputil.ReverseProxy → target node
+```
+
+Dead node cleanup ensures stale routes are eventually removed so cross-node lookups don't cause persistent proxy errors.
 
 ### Connection Limits
 

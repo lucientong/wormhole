@@ -56,7 +56,7 @@ Examples:
 		if len(args) == 1 {
 			port, _ := strconv.Atoi(args[0])
 			log.Info().Int("port", port).Msg("Quick mode - exposing local port")
-			startClient(port, "localhost:7000", "127.0.0.1", "", "", 0, "127.0.0.1", true, false, false, "", "http", "", "")
+			startClient(port, "localhost:7000", "127.0.0.1", "", "", 0, "127.0.0.1", true, false, false, "", "http", "", "", 0)
 			return
 		}
 		// No args, show help.
@@ -78,6 +78,8 @@ func init() {
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(serverCmd)
 	rootCmd.AddCommand(clientCmd)
+	rootCmd.AddCommand(tunnelsCmd)
+	rootCmd.AddCommand(loginCmd)
 }
 
 // configureLogging sets up the zerolog logger.

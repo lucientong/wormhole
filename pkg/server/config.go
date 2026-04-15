@@ -114,6 +114,62 @@ type Config struct {
 
 	// EnableMetrics enables Prometheus metrics collection and the /metrics endpoint.
 	EnableMetrics bool
+
+	// OIDCIssuer enables OIDC JWT token validation.
+	// When set, JWT tokens signed by the given issuer are accepted in addition to
+	// the HMAC tokens.  Example: "https://accounts.google.com"
+	OIDCIssuer string
+
+	// OIDCClientID is the OAuth2 client ID to validate the audience claim.
+	OIDCClientID string
+
+	// OIDCTeamClaim is the JWT claim used as the Wormhole team name (default: "email").
+	OIDCTeamClaim string
+
+	// OIDCRoleClaim is an optional JWT claim for the Wormhole role.
+	OIDCRoleClaim string
+
+	// AuditEnabled enables structured audit logging.
+	// When false, no audit events are recorded.
+	AuditEnabled bool
+
+	// AuditPersistence controls the storage backend for audit logs.
+	// Options: "memory" (default ring buffer) or "sqlite".
+	AuditPersistence PersistenceType
+
+	// AuditPath is the path to the SQLite audit database file.
+	// Only used when AuditPersistence is "sqlite".
+	// If empty, defaults to ~/.wormhole/audit.db.
+	AuditPath string
+
+	// AuditBufferSize is the number of events to keep in memory.
+	// Only used when AuditPersistence is "memory". Defaults to 10 000.
+	AuditBufferSize int
+
+	// ─── Cluster / HA settings ────────────────────────────────────────────────
+
+	// ClusterNodeID is a unique identifier for this node in the cluster.
+	// Defaults to the hostname when empty and clustering is enabled.
+	ClusterNodeID string
+
+	// ClusterNodeAddr is the address (host:port) other nodes use to reach this
+	// node's HTTP listener for cross-node tunnel proxying.
+	// Example: "10.0.0.1:7002"
+	ClusterNodeAddr string
+
+	// ClusterStateBackend selects the shared-state backend.
+	// Options: "memory" (default, single-node) or "redis".
+	ClusterStateBackend string
+
+	// ClusterRedisAddr is the Redis server address for the Redis state backend.
+	// Required when ClusterStateBackend is "redis".
+	ClusterRedisAddr string
+
+	// ClusterRedisPassword is the optional Redis AUTH password.
+	ClusterRedisPassword string
+
+	// ClusterRedisDB is the Redis database number (default 0).
+	ClusterRedisDB int
 }
 
 // DefaultConfig returns the default server configuration.
@@ -140,5 +196,8 @@ func DefaultConfig() Config {
 		RateLimitBlockDuration: 15 * time.Minute,
 		Persistence:            PersistenceMemory,
 		EnableMetrics:          true,
+		AuditEnabled:           false,
+		AuditPersistence:       PersistenceMemory,
+		AuditBufferSize:        10_000,
 	}
 }

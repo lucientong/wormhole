@@ -116,6 +116,11 @@ type Auth struct {
 	// store is the storage backend for teams and revoked tokens.
 	store Store
 
+	// oidc is an optional OIDC JWT validator.  When set, JWT-shaped tokens
+	// (three dot-separated segments) are validated via OIDC before falling
+	// back to the HMAC path.
+	oidc *OIDCValidator
+
 	mu sync.RWMutex
 }
 
@@ -235,8 +240,25 @@ func (a *Auth) GenerateTeamToken(teamName string, role Role) (string, error) {
 	return token, nil
 }
 
+// SetOIDCValidator configures an OIDC JWT validator.  When set, JWT-shaped
+// tokens are validated via OIDC before trying the HMAC path.
+func (a *Auth) SetOIDCValidator(v *OIDCValidator) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.oidc = v
+}
+
+// isJWT returns true if s looks like a three-part dot-separated JWT.
+func isJWT(s string) bool {
+	parts := strings.SplitN(s, ".", 4)
+	return len(parts) == 3
+}
+
 // ValidateToken validates a token and returns its claims.
-// It supports both HMAC-signed tokens and simple pre-shared tokens.
+// Validation order:
+//  1. Pre-shared simple tokens (exact match).
+//  2. OIDC JWT validation (when an OIDCValidator is configured and token is a JWT).
+//  3. HMAC-signed token validation.
 func (a *Auth) ValidateToken(token string) (*Claims, error) {
 	if token == "" {
 		return nil, ErrInvalidToken
@@ -250,6 +272,22 @@ func (a *Auth) ValidateToken(token string) (*Claims, error) {
 	// If only simple mode is configured (no HMAC secret), reject unmatched tokens.
 	if len(a.config.AllowedTokens) > 0 && len(a.config.Secret) < 16 {
 		return nil, ErrInvalidToken
+	}
+
+	// OIDC JWT validation when configured and token looks like a JWT.
+	a.mu.RLock()
+	oidcValidator := a.oidc
+	a.mu.RUnlock()
+
+	if oidcValidator != nil && isJWT(token) {
+		claims, err := oidcValidator.ValidateToken(token)
+		if err == nil {
+			return claims, nil
+		}
+		// If the JWT is clearly invalid (not just an unknown token type), propagate the error.
+		if !errors.Is(err, ErrInvalidToken) {
+			return nil, err
+		}
 	}
 
 	// HMAC-signed token validation.

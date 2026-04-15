@@ -51,6 +51,12 @@ type Server struct {
 	// Prometheus metrics (nil when EnableMetrics is false).
 	metrics *Metrics
 
+	// Audit logger (nil when AuditEnabled is false).
+	auditLogger *auth.AuditLogger
+
+	// Cluster state store (nil for single-node mode).
+	stateStore StateStore
+
 	// Shutdown.
 	closed  uint32
 	closeCh chan struct{}
@@ -126,6 +132,43 @@ func NewServer(config Config) *Server {
 		s.metrics = NewMetrics()
 		log.Info().Msg("Prometheus metrics enabled")
 	}
+
+	// Initialize OIDC validator (if configured).
+	if config.OIDCIssuer != "" && s.authenticator != nil {
+		oidcCfg := auth.OIDCConfig{
+			Issuer:   config.OIDCIssuer,
+			ClientID: config.OIDCClientID,
+			ClaimMapping: auth.OIDCClaimMapping{
+				TeamClaim:   config.OIDCTeamClaim,
+				RoleClaim:   config.OIDCRoleClaim,
+				DefaultRole: auth.RoleMember,
+			},
+		}
+		if v, err := auth.NewOIDCValidator(oidcCfg); err != nil {
+			log.Fatal().Err(err).Msg("Failed to initialize OIDC validator")
+		} else {
+			s.authenticator.SetOIDCValidator(v)
+			log.Info().
+				Str("issuer", config.OIDCIssuer).
+				Str("client_id", config.OIDCClientID).
+				Msg("OIDC JWT validation enabled")
+		}
+	}
+
+	// Initialize audit logger.
+	if config.AuditEnabled {
+		auditStore := initAuditStore(config)
+		s.auditLogger = auth.NewAuditLogger(auth.AuditLoggerConfig{
+			Enabled: true,
+			Store:   auditStore,
+		})
+		log.Info().
+			Str("persistence", string(config.AuditPersistence)).
+			Msg("Audit logging enabled")
+	}
+
+	// Initialize cluster state store.
+	s.stateStore = initStateStore(config)
 
 	// Initialize authentication.
 	if config.RequireAuth {
@@ -234,6 +277,9 @@ func (s *Server) Start(ctx context.Context) error {
 		go s.serveACMEChallenge()
 	}
 
+	// Start cluster heartbeat (no-op for single-node / nil store).
+	s.startClusterHeartbeat(ctx)
+
 	// Start accept loops.
 	s.closeWg.Add(3)
 	go s.acceptTunnelLoop() //nolint:contextcheck // tunnel accept loop runs as background goroutine
@@ -280,6 +326,18 @@ func (s *Server) Shutdown() error {
 	// Close authenticator (and its store).
 	if s.authenticator != nil {
 		_ = s.authenticator.Close()
+	}
+
+	// Close audit store.
+	if s.auditLogger != nil {
+		if store := s.auditLogger.Store(); store != nil {
+			_ = store.Close()
+		}
+	}
+
+	// Close cluster state store.
+	if s.stateStore != nil {
+		_ = s.stateStore.Close()
 	}
 
 	// Close all clients.
@@ -387,6 +445,18 @@ func (s *Server) handleClient(conn net.Conn) {
 		log.Error().Err(err).Str("subdomain", subdomain).Msg("Failed to register subdomain")
 	}
 
+	// Register route in cluster state store (for cross-node routing).
+	if s.stateStore != nil {
+		if err := s.stateStore.RegisterRoute(RouteEntry{
+			ClientID:  sessionID,
+			Subdomain: subdomain,
+			NodeID:    s.config.ClusterNodeID,
+			NodeAddr:  s.config.ClusterNodeAddr,
+		}); err != nil {
+			log.Warn().Err(err).Str("subdomain", subdomain).Msg("Cluster: failed to register route in state store")
+		}
+	}
+
 	atomic.AddUint64(&s.stats.ActiveClients, 1)
 	atomic.AddUint64(&s.stats.TotalClients, 1)
 	if s.metrics != nil {
@@ -400,11 +470,22 @@ func (s *Server) handleClient(conn net.Conn) {
 		Str("remote", remoteAddr).
 		Msg("Client registered")
 
+	if s.auditLogger != nil {
+		s.auditLogger.LogClientConnected(clientIP, sessionID, subdomain, teamName, role)
+	}
+
+	connectedAt := time.Now()
+
 	// Handle client streams.
 	s.handleClientStreams(client)
 
 	// Client disconnected — clean up.
 	s.removeClient(client)
+
+	if s.auditLogger != nil {
+		s.auditLogger.LogClientDisconnected(sessionID, subdomain, time.Since(connectedAt))
+	}
+
 	log.Info().
 		Str("session_id", sessionID).
 		Str("subdomain", subdomain).
@@ -433,6 +514,10 @@ func (s *Server) handleClientAuth(mux *tunnel.Mux, sessionID, clientIP, remoteAd
 		// Record auth failure metric.
 		if s.metrics != nil {
 			s.metrics.AuthAttemptsTotal.WithLabelValues("failure").Inc()
+		}
+
+		if s.auditLogger != nil {
+			s.auditLogger.LogAuthFailure(clientIP, authErr.Error())
 		}
 
 		return "", "", "", false
@@ -601,6 +686,8 @@ func (s *Server) handleClientStream(client *ClientSession, stream *tunnel.Stream
 }
 
 // handleRegister handles a tunnel registration request.
+//
+//nolint:gocyclo // registration coordinates TLS, TCP, routing and audit in one flow
 func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, req *proto.RegisterRequest) {
 	// Check per-client tunnel limit.
 	if s.config.MaxTunnelsPerClient > 0 {
@@ -696,6 +783,10 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 		Uint32("local_port", req.LocalPort).
 		Uint32("tcp_port", tcpPort).
 		Msg("Tunnel registered")
+
+	if s.auditLogger != nil {
+		s.auditLogger.LogTunnelCreated(client.ID, tunnelID, req.Protocol.String(), publicURL)
+	}
 }
 
 // handlePing handles a ping request.
@@ -812,6 +903,10 @@ func (s *Server) handleClose(client *ClientSession, stream *tunnel.Stream, req *
 		Str("tunnel_id", req.TunnelID).
 		Str("public_url", removed.PublicURL).
 		Msg("Tunnel closed successfully")
+
+	if s.auditLogger != nil {
+		s.auditLogger.LogTunnelClosed(client.ID, removed.ID, removed.Protocol.String(), req.Reason)
+	}
 
 	// Send success response.
 	resp := proto.NewCloseResponse(true)
@@ -1044,6 +1139,9 @@ func (s *Server) handleP2PResult(client *ClientSession, result *proto.P2PResult)
 		if s.metrics != nil {
 			s.metrics.P2PConnectionsTotal.WithLabelValues("success").Inc()
 		}
+		if s.auditLogger != nil {
+			s.auditLogger.LogP2PEstablished(client.ID, result.PeerAddr)
+		}
 	} else {
 		log.Info().
 			Str("client", client.ID).
@@ -1051,6 +1149,9 @@ func (s *Server) handleP2PResult(client *ClientSession, result *proto.P2PResult)
 			Msg("P2P connection failed, using relay")
 		if s.metrics != nil {
 			s.metrics.P2PConnectionsTotal.WithLabelValues("fallback").Inc()
+		}
+		if s.auditLogger != nil {
+			s.auditLogger.LogP2PFallback(client.ID, result.Error)
 		}
 	}
 }
@@ -1224,6 +1325,13 @@ func (s *Server) removeClient(client *ClientSession) {
 	// Remove all routes via Router.
 	s.router.Unregister(client)
 
+	// Remove route from cluster state store.
+	if s.stateStore != nil {
+		if err := s.stateStore.UnregisterRoute(client.ID); err != nil {
+			log.Warn().Err(err).Str("client", client.ID).Msg("Cluster: failed to unregister route from state store")
+		}
+	}
+
 	// Release allocated TCP ports.
 	client.mu.Lock()
 	for _, t := range client.Tunnels {
@@ -1286,4 +1394,49 @@ func extractIP(remoteAddr string) string {
 		return remoteAddr
 	}
 	return host
+}
+
+// initStateStore creates the appropriate StateStore based on config.
+// Returns nil (single-node) when no cluster backend is configured.
+func initStateStore(config Config) StateStore {
+	switch config.ClusterStateBackend {
+	case "redis":
+		if config.ClusterRedisAddr == "" {
+			log.Fatal().Msg("Cluster: ClusterRedisAddr must be set when using redis state backend")
+		}
+		store, err := NewRedisStateStore(RedisStateStoreConfig{
+			Addr:     config.ClusterRedisAddr,
+			Password: config.ClusterRedisPassword,
+			DB:       config.ClusterRedisDB,
+		})
+		if err != nil {
+			log.Fatal().Err(err).Msg("Cluster: failed to connect to Redis state store")
+		}
+		log.Info().Str("addr", config.ClusterRedisAddr).Msg("Cluster: using Redis state store")
+		return store
+	case "memory":
+		log.Info().Msg("Cluster: using in-memory state store (single-node)")
+		return NewMemoryStateStore()
+	default:
+		// No clustering — operate as a single-node server.
+		return nil
+	}
+}
+
+// initAuditStore creates the appropriate AuditStore based on config.
+func initAuditStore(config Config) auth.AuditStore {
+	switch config.AuditPersistence {
+	case PersistenceSQLite:
+		store, err := auth.NewSQLiteAuditStore(auth.SQLiteAuditStoreConfig{
+			Path:      config.AuditPath,
+			CreateDir: true,
+		})
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to initialize SQLite audit store")
+		}
+		log.Info().Str("path", config.AuditPath).Msg("Using SQLite persistence for audit logs")
+		return store
+	default:
+		return auth.NewMemoryAuditStore(config.AuditBufferSize)
+	}
 }

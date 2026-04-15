@@ -1,11 +1,15 @@
 package server
 
 import (
+	"bytes"
 	"crypto/subtle"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -41,6 +45,10 @@ func (a *AdminAPI) Handler() http.Handler {
 	mux.HandleFunc("/tokens/revoke", a.requireAdminAuth(a.handleRevokeToken))
 	mux.HandleFunc("/tokens/revoke-team", a.requireAdminAuth(a.handleRevokeTeamTokens))
 	mux.HandleFunc("/tokens/refresh", a.requireAdminAuth(a.handleRefreshToken))
+
+	// Audit log endpoints.
+	mux.HandleFunc("/audit", a.requireAdminAuth(a.handleAudit))
+	mux.HandleFunc("/audit/export", a.requireAdminAuth(a.handleAuditExport))
 
 	// Expose Prometheus metrics endpoint (no auth required for scraping).
 	if a.server.metrics != nil {
@@ -521,7 +529,7 @@ func (a *AdminAPI) handleGenerateToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate to get expiry.
-	claims, _ := a.server.authenticator.ValidateToken(token)
+	claims, _ := a.server.authenticator.ValidateToken(token) //nolint:contextcheck
 	expires := ""
 	if claims != nil && !claims.ExpiresAt.IsZero() {
 		expires = claims.ExpiresAt.Format(time.RFC3339)
@@ -570,12 +578,12 @@ func (a *AdminAPI) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 
 	if req.Token != "" {
 		// Revoke by token string.
-		if err := a.server.authenticator.RevokeTokenByString(req.Token); err != nil {
+		if err := a.server.authenticator.RevokeTokenByString(req.Token); err != nil { //nolint:contextcheck
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error()})
 			return
 		}
 		// Extract token ID for logging.
-		claims, _ := a.server.authenticator.ValidateToken(req.Token)
+		claims, _ := a.server.authenticator.ValidateToken(req.Token) //nolint:contextcheck
 		if claims != nil {
 			tokenID = claims.TokenID
 		}
@@ -589,6 +597,10 @@ func (a *AdminAPI) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Info().Str("token_id", tokenID).Msg("Token revoked via admin API")
+
+	if a.server.auditLogger != nil {
+		a.server.auditLogger.LogTokenRevoked(tokenID, "")
+	}
 
 	writeJSON(w, http.StatusOK, map[string]string{
 		"message":  "token revoked successfully",
@@ -635,11 +647,197 @@ func (a *AdminAPI) handleRevokeTeamTokens(w http.ResponseWriter, r *http.Request
 
 	log.Info().Str("team", req.Team).Msg("All team tokens revoked via admin API")
 
+	if a.server.auditLogger != nil {
+		a.server.auditLogger.LogTeamTokensRevoked(req.Team)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]string{
 		"message": "all team tokens revoked successfully",
 		"team":    req.Team,
 	})
 }
+
+// ─── Audit log handlers ───────────────────────────────────────────────────────
+
+// handleAudit handles GET /audit — queries audit events with optional filters.
+//
+// Query parameters:
+//
+//	type       - filter by event type (e.g. "tunnel_created")
+//	from       - ISO-8601 start time (inclusive)
+//	to         - ISO-8601 end time (inclusive)
+//	team       - filter by team name
+//	session_id - filter by session ID
+//	ip         - filter by client IP
+//	limit      - max results (default 100, max 1000)
+//	offset     - pagination offset
+func (a *AdminAPI) handleAudit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		return
+	}
+
+	if a.server.auditLogger == nil || a.server.auditLogger.Store() == nil {
+		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error: "audit logging is not enabled; start the server with --audit",
+		})
+		return
+	}
+
+	q, err := parseAuditQuery(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+		return
+	}
+
+	events, err := a.server.auditLogger.Store().Query(q)
+	if err != nil {
+		log.Error().Err(err).Msg("Audit store query failed")
+		writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "query failed"})
+		return
+	}
+
+	if events == nil {
+		events = []auth.AuditEvent{}
+	}
+	writeJSON(w, http.StatusOK, events)
+}
+
+// handleAuditExport handles GET /audit/export — exports audit events as JSON
+// or CSV.  Accepts the same query parameters as /audit, plus:
+//
+//	format - "json" (default) or "csv"
+func (a *AdminAPI) handleAuditExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		return
+	}
+
+	if a.server.auditLogger == nil || a.server.auditLogger.Store() == nil {
+		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error: "audit logging is not enabled; start the server with --audit",
+		})
+		return
+	}
+
+	q, err := parseAuditQuery(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+		return
+	}
+	// Export endpoints should default to a higher limit.
+	if q.Limit == 0 {
+		q.Limit = 10_000
+	}
+
+	events, err := a.server.auditLogger.Store().Query(q)
+	if err != nil {
+		log.Error().Err(err).Msg("Audit store query failed for export")
+		writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: "query failed"})
+		return
+	}
+
+	format := r.URL.Query().Get("format")
+	switch format {
+	case "csv":
+		writeAuditCSV(w, events)
+	default:
+		if events == nil {
+			events = []auth.AuditEvent{}
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Content-Disposition", `attachment; filename="audit.json"`)
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(events)
+	}
+}
+
+// parseAuditQuery parses query parameters into an auth.AuditQuery.
+func parseAuditQuery(r *http.Request) (auth.AuditQuery, error) {
+	q := auth.AuditQuery{}
+	params := r.URL.Query()
+
+	q.Type = auth.AuditEventType(params.Get("type"))
+
+	if s := params.Get("from"); s != "" {
+		t, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			return q, fmt.Errorf("invalid 'from' time (use RFC3339, e.g. 2026-04-01T00:00:00Z): %w", err)
+		}
+		q.From = t
+	}
+
+	if s := params.Get("to"); s != "" {
+		t, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			return q, fmt.Errorf("invalid 'to' time (use RFC3339): %w", err)
+		}
+		q.To = t
+	}
+
+	q.TeamName = params.Get("team")
+	q.SessionID = params.Get("session_id")
+	q.IP = params.Get("ip")
+
+	if s := params.Get("limit"); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil || n < 0 {
+			return q, fmt.Errorf("invalid 'limit' value")
+		}
+		if n > 1000 {
+			n = 1000
+		}
+		q.Limit = n
+	}
+	if q.Limit == 0 {
+		q.Limit = 100
+	}
+
+	if s := params.Get("offset"); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil || n < 0 {
+			return q, fmt.Errorf("invalid 'offset' value")
+		}
+		q.Offset = n
+	}
+
+	return q, nil
+}
+
+// writeAuditCSV writes audit events as a CSV attachment.
+func writeAuditCSV(w http.ResponseWriter, events []auth.AuditEvent) {
+	var buf bytes.Buffer
+	cw := csv.NewWriter(&buf)
+
+	// Header row.
+	_ = cw.Write([]string{
+		"timestamp", "type", "ip", "team", "role",
+		"session_id", "subdomain", "tunnel_id", "protocol", "error",
+	})
+
+	for _, ev := range events {
+		_ = cw.Write([]string{
+			ev.Timestamp.Format(time.RFC3339),
+			string(ev.Type),
+			ev.IP,
+			ev.TeamName,
+			ev.Role,
+			ev.SessionID,
+			ev.Subdomain,
+			ev.TunnelID,
+			ev.Protocol,
+			ev.Error,
+		})
+	}
+	cw.Flush()
+
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="audit.csv"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(buf.Bytes())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 type RefreshTokenRequest struct {
 	Token     string `json:"token"`
@@ -681,13 +879,13 @@ func (a *AdminAPI) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid extend_by duration"})
 			return
 		}
-		newToken, err = a.server.authenticator.ExtendTokenExpiry(req.Token, duration)
+		newToken, err = a.server.authenticator.ExtendTokenExpiry(req.Token, duration) //nolint:contextcheck
 	case req.RevokeOld:
 		// Refresh and revoke old token.
-		newToken, err = a.server.authenticator.RefreshAndRevokeToken(req.Token)
+		newToken, err = a.server.authenticator.RefreshAndRevokeToken(req.Token) //nolint:contextcheck
 	default:
 		// Simple refresh.
-		newToken, err = a.server.authenticator.RefreshToken(req.Token)
+		newToken, err = a.server.authenticator.RefreshToken(req.Token) //nolint:contextcheck
 	}
 
 	if err != nil {
@@ -696,7 +894,7 @@ func (a *AdminAPI) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate new token to get claims.
-	claims, _ := a.server.authenticator.ValidateToken(newToken)
+	claims, _ := a.server.authenticator.ValidateToken(newToken) //nolint:contextcheck
 	expires := ""
 	if claims != nil && !claims.ExpiresAt.IsZero() {
 		expires = claims.ExpiresAt.Format(time.RFC3339)

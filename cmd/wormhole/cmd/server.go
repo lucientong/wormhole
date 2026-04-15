@@ -35,6 +35,22 @@ var (
 	serverAdminHost        string
 	serverMaxClients       int
 	serverMaxTunnelsPerCli int
+	serverAuditEnabled     bool
+	serverAuditPersistence string
+	serverAuditPath        string
+	serverAuditBufferSize  int
+	serverOIDCIssuer       string
+	serverOIDCClientID     string
+	serverOIDCTeamClaim    string
+	serverOIDCRoleClaim    string
+
+	// Cluster / HA flags.
+	serverClusterNodeID        string
+	serverClusterNodeAddr      string
+	serverClusterStateBackend  string
+	serverClusterRedisAddr     string
+	serverClusterRedisPassword string
+	serverClusterRedisDB       int
 )
 
 // serverCmd represents the server command.
@@ -96,9 +112,26 @@ func init() {
 	serverCmd.Flags().StringVar(&serverAdminHost, "admin-host", "127.0.0.1", "Host for admin API (default: 127.0.0.1 for safety)")
 	serverCmd.Flags().IntVar(&serverMaxClients, "max-clients", 1000, "Maximum concurrent clients (0 = unlimited)")
 	serverCmd.Flags().IntVar(&serverMaxTunnelsPerCli, "max-tunnels-per-client", 0, "Maximum tunnels per client (0 = unlimited)")
+	serverCmd.Flags().BoolVar(&serverAuditEnabled, "audit", false, "Enable structured audit logging")
+	serverCmd.Flags().StringVar(&serverAuditPersistence, "audit-persistence", "memory", "Audit storage backend: memory (default) or sqlite")
+	serverCmd.Flags().StringVar(&serverAuditPath, "audit-path", "", "Path to SQLite audit database (default: ~/.wormhole/audit.db)")
+	serverCmd.Flags().IntVar(&serverAuditBufferSize, "audit-buffer-size", 10_000, "In-memory audit ring buffer size (events)")
+	serverCmd.Flags().StringVar(&serverOIDCIssuer, "oidc-issuer", "", "OIDC issuer URL for JWT validation (e.g. https://accounts.google.com)")
+	serverCmd.Flags().StringVar(&serverOIDCClientID, "oidc-client-id", "", "OAuth2 client ID for OIDC audience validation")
+	serverCmd.Flags().StringVar(&serverOIDCTeamClaim, "oidc-team-claim", "email", "JWT claim to use as team name (default: email)")
+	serverCmd.Flags().StringVar(&serverOIDCRoleClaim, "oidc-role-claim", "", "JWT claim to use as Wormhole role (optional)")
+
+	// Cluster / HA flags.
+	serverCmd.Flags().StringVar(&serverClusterNodeID, "cluster-node-id", "", "Unique ID for this node in the cluster (default: hostname)")
+	serverCmd.Flags().StringVar(&serverClusterNodeAddr, "cluster-node-addr", "", "Address other nodes use to reach this node (host:port)")
+	serverCmd.Flags().StringVar(&serverClusterStateBackend, "cluster-backend", "", "Cluster state backend: memory or redis (default: disabled)")
+	serverCmd.Flags().StringVar(&serverClusterRedisAddr, "cluster-redis-addr", "", "Redis address for cluster state (e.g. localhost:6379)")
+	serverCmd.Flags().StringVar(&serverClusterRedisPassword, "cluster-redis-password", "", "Redis AUTH password")
+	serverCmd.Flags().IntVar(&serverClusterRedisDB, "cluster-redis-db", 0, "Redis database number")
 }
 
-func runServer(cmd *cobra.Command, _ []string) {
+// buildServerConfig assembles a server.Config from CLI flags.
+func buildServerConfig(cmd *cobra.Command) server.Config {
 	// Support WORMHOLE_DOMAIN environment variable as default for --domain.
 	if serverDomain == "" {
 		if envDomain := os.Getenv("WORMHOLE_DOMAIN"); envDomain != "" {
@@ -136,12 +169,34 @@ func runServer(cmd *cobra.Command, _ []string) {
 		config.AutoTLS = true
 	}
 
-	switch serverPersistence {
-	case "sqlite":
+	if serverPersistence == "sqlite" {
 		config.Persistence = server.PersistenceSQLite
-	default:
-		config.Persistence = server.PersistenceMemory
 	}
+
+	config.AuditEnabled = serverAuditEnabled
+	config.AuditPath = serverAuditPath
+	config.AuditBufferSize = serverAuditBufferSize
+	if serverAuditPersistence == "sqlite" {
+		config.AuditPersistence = server.PersistenceSQLite
+	}
+
+	config.OIDCIssuer = serverOIDCIssuer
+	config.OIDCClientID = serverOIDCClientID
+	config.OIDCTeamClaim = serverOIDCTeamClaim
+	config.OIDCRoleClaim = serverOIDCRoleClaim
+
+	config.ClusterNodeID = serverClusterNodeID
+	config.ClusterNodeAddr = serverClusterNodeAddr
+	config.ClusterStateBackend = serverClusterStateBackend
+	config.ClusterRedisAddr = serverClusterRedisAddr
+	config.ClusterRedisPassword = serverClusterRedisPassword
+	config.ClusterRedisDB = serverClusterRedisDB
+
+	return config
+}
+
+func runServer(cmd *cobra.Command, _ []string) {
+	config := buildServerConfig(cmd)
 
 	// Warn if admin API is exposed on non-loopback without a token.
 	if config.AdminToken == "" && serverAdminHost != "127.0.0.1" && serverAdminHost != "::1" && serverAdminHost != "localhost" {

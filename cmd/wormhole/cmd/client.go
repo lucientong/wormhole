@@ -26,6 +26,8 @@ var (
 	clientProtocol      string
 	clientHostname      string
 	clientPathPrefix    string
+	clientConfigFile    string
+	clientCtrlPort      int
 )
 
 // clientCmd represents the client command.
@@ -70,19 +72,81 @@ func init() {
 	clientCmd.Flags().StringVarP(&clientProtocol, "protocol", "P", "http", "Tunnel protocol: http, https, tcp, udp, ws, grpc")
 	clientCmd.Flags().StringVar(&clientHostname, "hostname", "", "Custom hostname for routing")
 	clientCmd.Flags().StringVar(&clientPathPrefix, "path-prefix", "", "Path-based routing prefix")
-
-	_ = clientCmd.MarkFlagRequired("local")
+	clientCmd.Flags().StringVarP(&clientConfigFile, "config", "c", "", "Path to YAML config file (enables multi-tunnel mode)")
+	clientCmd.Flags().IntVar(&clientCtrlPort, "ctrl-port", 0, "Local control server port for 'wormhole tunnels list' (0 = disabled)")
+	// --local is required only in single-tunnel mode (not with --config).
+	clientCmd.MarkFlagsOneRequired("local", "config")
 }
 
-func runClient(_ *cobra.Command, _ []string) {
+func runClient(cmd *cobra.Command, _ []string) {
+	if clientConfigFile != "" {
+		runClientFromConfig(clientConfigFile, clientCtrlPort)
+		return
+	}
+	// --local is required when not using --config.
+	if !cmd.Flags().Changed("local") {
+		log.Fatal().Msg("required flag(s) \"local\" not set (or use --config for multi-tunnel mode)")
+	}
 	startClient(clientLocalPort, clientServer, clientLocalHost, clientSubdomain,
 		clientToken, clientInspectorPort, clientInspectorHost, clientP2PEnabled, clientTLS, clientTLSInsecure, clientTLSCA,
-		clientProtocol, clientHostname, clientPathPrefix)
+		clientProtocol, clientHostname, clientPathPrefix, clientCtrlPort)
+}
+
+// runClientFromConfig starts the client using a YAML config file.
+func runClientFromConfig(cfgPath string, ctrlPort int) {
+	fc, err := client.LoadFileConfig(cfgPath)
+	if err != nil {
+		log.Fatal().Err(err).Str("path", cfgPath).Msg("Failed to load config file")
+	}
+
+	cfg := fc.ToClientConfig(client.DefaultConfig())
+	if ctrlPort > 0 {
+		cfg.CtrlPort = ctrlPort
+	}
+
+	c := client.NewClient(cfg)
+
+	if err := c.StartControlServer(cfg.CtrlHost, cfg.CtrlPort); err != nil {
+		log.Fatal().Err(err).Msg("Failed to start control server")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+
+	go func() {
+		for sig := range sigCh {
+			switch sig {
+			case syscall.SIGHUP:
+				log.Info().Msg("SIGHUP received — reloading config file")
+				newFC, loadErr := client.LoadFileConfig(cfgPath)
+				if loadErr != nil {
+					log.Error().Err(loadErr).Msg("Failed to reload config file; keeping current config")
+					continue
+				}
+				newCfg := newFC.ToClientConfig(client.DefaultConfig())
+				c.ReloadTunnels(ctx, newCfg.Tunnels)
+			default:
+				log.Info().Str("signal", sig.String()).Msg("Received shutdown signal")
+				cancel()
+				return
+			}
+		}
+	}()
+
+	if err := c.Start(ctx); err != nil {
+		cancel()
+		_ = c.Close()
+		log.Fatal().Err(err).Msg("Client failed")
+	}
+	cancel()
+	_ = c.Close()
 }
 
 // startClient creates and starts a Wormhole client with the given parameters.
 // It is shared by both the client subcommand and the root quick-mode handler.
-func startClient(localPort int, serverAddr, localHost, subdomain, token string, inspectorPort int, inspectorHost string, p2pEnabled, tlsEnabled, tlsInsecure bool, tlsCA, protocol, hostname, pathPrefix string) {
+func startClient(localPort int, serverAddr, localHost, subdomain, token string, inspectorPort int, inspectorHost string, p2pEnabled, tlsEnabled, tlsInsecure bool, tlsCA, protocol, hostname, pathPrefix string, ctrlPort int) {
 	config := client.DefaultConfig()
 	config.ServerAddr = serverAddr
 	config.LocalPort = localPort
@@ -98,12 +162,18 @@ func startClient(localPort int, serverAddr, localHost, subdomain, token string, 
 	config.Protocol = protocol
 	config.Hostname = hostname
 	config.PathPrefix = pathPrefix
+	config.CtrlPort = ctrlPort
 
 	c := client.NewClient(config)
 
 	// Start inspector if enabled.
 	if err := c.StartInspector(config.InspectorPort); err != nil {
 		log.Fatal().Err(err).Msg("Failed to start inspector")
+	}
+
+	// Start control server if enabled.
+	if err := c.StartControlServer(config.CtrlHost, config.CtrlPort); err != nil {
+		log.Fatal().Err(err).Msg("Failed to start control server")
 	}
 
 	// Handle shutdown signals.
