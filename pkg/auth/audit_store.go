@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -224,6 +223,22 @@ func (s *SQLiteAuditStore) Store(event AuditEvent) error {
 	return err
 }
 
+// staticQuery is the fully-parameterised audit query. Optional filters use
+// the (? = ” OR col = ?) idiom: when the placeholder value is an empty
+// string the condition is a tautology and the filter is skipped, so no
+// dynamic SQL construction is ever needed.
+const staticQuery = `
+	SELECT timestamp, type, ip, team_name, role, session_id, subdomain, tunnel_id, protocol, error, details
+	FROM audit_events
+	WHERE (? = '' OR type       = ?)
+	  AND (? = '' OR team_name  = ?)
+	  AND (? = '' OR session_id = ?)
+	  AND (? = '' OR ip         = ?)
+	  AND (? = '' OR timestamp  >= ?)
+	  AND (? = '' OR timestamp  <= ?)
+	ORDER BY timestamp DESC, id DESC
+	LIMIT ? OFFSET ?`
+
 // Query retrieves audit events matching the given filter (newest first).
 func (s *SQLiteAuditStore) Query(q AuditQuery) ([]AuditEvent, error) {
 	limit := q.Limit
@@ -231,17 +246,24 @@ func (s *SQLiteAuditStore) Query(q AuditQuery) ([]AuditEvent, error) {
 		limit = defaultQueryLimit
 	}
 
-	where, args := buildWhereClause(q)
-	query := fmt.Sprintf( //nolint:gosec // #nosec G201 -- where clause is built by buildWhereClause using only safe placeholder values
-		`SELECT timestamp, type, ip, team_name, role, session_id, subdomain, tunnel_id, protocol, error, details
-		 FROM audit_events %s
-		 ORDER BY timestamp DESC, id DESC
-		 LIMIT ? OFFSET ?`,
-		where,
-	)
-	args = append(args, limit, q.Offset)
+	fromStr := ""
+	if !q.From.IsZero() {
+		fromStr = q.From.UTC().Format(time.RFC3339Nano)
+	}
+	toStr := ""
+	if !q.To.IsZero() {
+		toStr = q.To.UTC().Format(time.RFC3339Nano)
+	}
 
-	rows, err := s.db.QueryContext(context.Background(), query, args...)
+	rows, err := s.db.QueryContext(context.Background(), staticQuery,
+		string(q.Type), string(q.Type),
+		q.TeamName, q.TeamName,
+		q.SessionID, q.SessionID,
+		q.IP, q.IP,
+		fromStr, fromStr,
+		toStr, toStr,
+		limit, q.Offset,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("query audit events: %w", err)
 	}
@@ -309,40 +331,4 @@ func matchesFilter(ev AuditEvent, q AuditQuery) bool {
 		return false
 	}
 	return true
-}
-
-// buildWhereClause constructs a SQL WHERE clause from a query filter.
-func buildWhereClause(q AuditQuery) (string, []interface{}) {
-	var clauses []string
-	var args []interface{}
-
-	if q.Type != "" {
-		clauses = append(clauses, "type = ?")
-		args = append(args, string(q.Type))
-	}
-	if !q.From.IsZero() {
-		clauses = append(clauses, "timestamp >= ?")
-		args = append(args, q.From.UTC().Format(time.RFC3339Nano))
-	}
-	if !q.To.IsZero() {
-		clauses = append(clauses, "timestamp <= ?")
-		args = append(args, q.To.UTC().Format(time.RFC3339Nano))
-	}
-	if q.TeamName != "" {
-		clauses = append(clauses, "team_name = ?")
-		args = append(args, q.TeamName)
-	}
-	if q.SessionID != "" {
-		clauses = append(clauses, "session_id = ?")
-		args = append(args, q.SessionID)
-	}
-	if q.IP != "" {
-		clauses = append(clauses, "ip = ?")
-		args = append(args, q.IP)
-	}
-
-	if len(clauses) == 0 {
-		return "", args
-	}
-	return "WHERE " + strings.Join(clauses, " AND "), args
 }
