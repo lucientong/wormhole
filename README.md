@@ -23,7 +23,7 @@ Wormhole folds network space like a wormhole, allowing developers to expose loca
 - 🌐 **HTTP/HTTPS** — Full HTTP support with Host-based routing
 - 🔌 **TCP Tunnels** — Support for any TCP protocol (gRPC, WebSocket, etc.)
 - 📊 **Inspector** — Built-in traffic inspection UI with real-time WebSocket streaming
-- 🤝 **P2P** — NAT traversal and direct peer-to-peer connections with end-to-end encryption (X25519 + AES-256-GCM)
+- 🤝 **P2P** — NAT traversal and direct peer-to-peer connections with end-to-end encryption (X25519 + AES-256-GCM); `wormhole connect` lets two clients exchange real traffic fully server-relay-free
 - 🔑 **Auth & RBAC** — HMAC-SHA256 team tokens with role-based access control
 - 🪪 **SSO / OIDC** — OAuth2 Device Code Flow + OIDC JWT validation; `wormhole login` for CLI-based SSO
 - 📋 **Audit Logs** — Structured audit event log with SQLite persistence and CSV/JSON export API
@@ -106,6 +106,12 @@ wormhole tunnels list
 
 # SSO login via OIDC Device Code Flow
 wormhole login --issuer https://accounts.google.com --client-id <id>
+
+# Direct client-to-client P2P (bypasses the relay entirely): peer A exposes,
+# peer B connects straight to peer A's subdomain over the hole-punched UDP
+# channel — the server only does signaling, no traffic ever touches it
+wormhole client --local 8080 --subdomain peer-a   # on peer A
+wormhole connect peer-a --local 9090               # on peer B
 ```
 
 That's it! Your local service is now accessible from the internet.
@@ -209,6 +215,20 @@ wormhole server \
 | `--path-prefix` | Path-based routing prefix | None |
 | `--config` | Path to YAML tunnel config file (multi-tunnel mode) | None |
 | `--ctrl-port` | Local control API port for `wormhole tunnels list` | 0 (disabled) |
+
+### `wormhole connect` Options
+
+`wormhole connect <target-subdomain>` reaches another `wormhole client`'s exposed service directly over P2P, entirely bypassing the server relay. It doesn't register a tunnel of its own — it just opens a local listener and forwards accepted connections straight to the peer over the hole-punched UDP channel. Since there is no relay fallback in this mode, a failed hole punch (e.g. incompatible NAT types) fails the command outright.
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--server` / `-s` | Server address to connect to | `localhost:7000` |
+| `--local` / `-l` | Local port to listen on (required) | — |
+| `--local-host` | Local host to bind the listener to | `127.0.0.1` |
+| `--token` / `-t` | Authentication token | None |
+| `--tls` | Enable TLS for the server control connection | false |
+| `--tls-insecure` | Skip TLS certificate verification (dev only) | false |
+| `--tls-ca` | Path to custom CA certificate for TLS verification | None |
 
 ### Server Options
 
@@ -467,6 +487,7 @@ wormhole/
 │   │   └── cmd/
 │   │       ├── client.go   # wormhole client
 │   │       ├── server.go   # wormhole server
+│   │       ├── connect.go  # wormhole connect (client-to-client P2P, no relay)
 │   │       ├── tunnels.go  # wormhole tunnels list
 │   │       └── login.go    # wormhole login (OIDC Device Flow)
 │   ├── server/           # Standalone server entry (thin wrapper)
@@ -552,11 +573,16 @@ P2P direct connections feature **end-to-end encryption** using X25519 ECDH key e
 - **HMAC-SHA256** authentication of hole-punch probes to prevent injection
 - **HKDF-SHA256** key derivation with separate keys for encryption and probe authentication
 
-If P2P hole punching fails, the client automatically falls back to the encrypted relay channel:
+**Two P2P scenarios, two different traffic paths.** Public visitors hitting your tunnel's hostname (a plain browser, curl, etc.) can never be hole-punched — the server physically cannot NAT-traverse with an arbitrary HTTP client — so that traffic always goes through the encrypted relay. What P2P actually accelerates is **`wormhole connect`**: when the peer on the other end is *also* a `wormhole client`, both sides hole-punch and all data flows directly over the encrypted UDP channel end-to-end, with the server used purely for signaling (it never sees a single byte of tunneled traffic). If the hole punch fails or the P2P channel later dies, `wormhole connect` closes its local listener rather than silently degrading to relay — there is no relay path for a connect-mode session (the server never registered a tunnel for it), so a lost P2P path really does mean the connection is gone until you retry.
+
+The reliable UDP transport (`UDPMux` + `UDPStream`) underneath both `wormhole connect` and the P2P-accelerated data plane uses RFC 6298-style adaptive retransmission (SRTT/RTTVAR/RTO estimation with per-segment exponential backoff) instead of a fixed timeout, so throughput degrades gracefully under real-world jitter and packet loss instead of retransmitting either too eagerly or too slowly.
 
 ```bash
 # Disable P2P to force all traffic through the encrypted relay
 wormhole client --local 8080 --p2p=false
+
+# Direct client-to-client connection, no relay fallback by design
+wormhole connect <peer-subdomain> --local 9090
 ```
 
 #### Inspector
@@ -596,6 +622,8 @@ Auto-generated subdomains use 64-bit cryptographic randomness (`crypto/rand`), p
 - [x] Phase 10 (v0.5.3): OIDC / OAuth SSO — OIDC Discovery, JWKS JWT validation, Device Code Flow, `wormhole login`
 - [x] Phase 11 (v0.6.0): HA / Multi-node control plane — `StateStore` interface, Redis backend, cluster heartbeat, cross-node HTTP routing
 - [x] Phase 12 (v0.6.1): Correctness closure — reliable reconnection detection (`Mux.CloseNotify()` + heartbeat-triggered force-close), true multi-tunnel routing (per-tunnel `TunnelID` dispatch end-to-end), fixed P2P signaling frame mismatch, P2P receive-buffer backpressure (bounded blocking delivery + RST on stuck consumers), TCP port-allocation-failure rejection, a reliable P2P stream handshake (SYN retransmission + SYN-ACK, previously a single lost SYN packet under packet loss would leave a connection silently half-open forever), and a WebSocket inspector data race fix
+- [x] Phase 13 (v0.6.1): End-to-end SSO — `wormhole login` credentials are now auto-loaded by `wormhole client` (no more manual `--token`/`jq`), expired access tokens are silently renewed via `refresh_token` (including mid-session, across reconnects), the device-flow token poll now includes `client_id` per RFC 8628, and `wormhole client` with no `--local`/`--config` falls back to `~/.wormhole/wormhole.yml`
+- [x] Phase 14 (v0.6.2): P2P data plane access + transport optimization — new `wormhole connect <subdomain>` command lets two `wormhole` clients hole-punch and exchange real traffic entirely peer-to-peer (server only signals, never relays a byte); `UDPStream` upgraded from a fixed 200ms retransmit timer to RFC 6298-style adaptive RTO with per-segment exponential backoff; send/receive path copies reduced (direct in-place encryption, no redundant buffer copies); removed the superseded `pkg/p2p/transport.go` ARQ implementation
 
 ## Contributing
 

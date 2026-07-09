@@ -80,6 +80,7 @@ func init() {
 	rootCmd.AddCommand(clientCmd)
 	rootCmd.AddCommand(tunnelsCmd)
 	rootCmd.AddCommand(loginCmd)
+	rootCmd.AddCommand(connectCmd)
 }
 
 // configureLogging sets up the zerolog logger.

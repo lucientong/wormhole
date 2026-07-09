@@ -44,6 +44,20 @@ func TestRouter_RegisterSubdomain(t *testing.T) {
 	assert.Equal(t, 2, r.ActiveRoutes())
 }
 
+func TestRouter_LookupSubdomain(t *testing.T) {
+	r := NewRouter("tunnel.example.com")
+	client := &ClientSession{ID: "test-client"}
+	require.NoError(t, r.RegisterSubdomain("myapp", client))
+
+	assert.Same(t, client, r.LookupSubdomain("myapp"))
+	// Case insensitive, matching RegisterSubdomain's normalization.
+	assert.Same(t, client, r.LookupSubdomain("MyApp"))
+	assert.Nil(t, r.LookupSubdomain("nonexistent"))
+
+	r.UnregisterSubdomain("myapp")
+	assert.Nil(t, r.LookupSubdomain("myapp"))
+}
+
 func TestRouter_RegisterHostname(t *testing.T) {
 	r := NewRouter("tunnel.example.com")
 	client := &ClientSession{ID: "test-client"}

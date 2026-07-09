@@ -126,6 +126,17 @@ func (r *Router) Unregister(client *ClientSession) {
 	}
 }
 
+// LookupSubdomain returns the client session registered for the given
+// subdomain, or nil if no client currently owns it. Unlike Route, this
+// matches on the subdomain label itself rather than a full host header —
+// used by P2P target matching (`wormhole connect <subdomain>`), which
+// addresses peers by subdomain regardless of the public base domain.
+func (r *Router) LookupSubdomain(subdomain string) *ClientSession {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.subdomains[strings.ToLower(subdomain)]
+}
+
 // Route resolves a host and path to a client session.
 // It checks in order: custom hostname, subdomain, path prefix.
 func (r *Router) Route(host, path string) *ClientSession {

@@ -214,6 +214,13 @@ message P2POfferRequest {
   
   // Sender's ECDH X25519 public key (base64-encoded).
   string public_key = 5;
+
+  // TargetSubdomain, when set, requests a P2P match against the specific
+  // client that owns this subdomain (used by `wormhole connect`). When
+  // empty, this message only registers the sender's P2P reachability info
+  // with the server — no match is attempted (the normal case for a client
+  // that's just exposing a tunnel and isn't trying to reach a peer).
+  string target_subdomain = 6;
 }
 
 // P2POfferResponse is the server's response to a P2P offer.
@@ -232,6 +239,11 @@ message P2POfferResponse {
   
   // Peer's ECDH X25519 public key (base64-encoded).
   string peer_public_key = 5;
+
+  // PeerTunnelID is the specific tunnel ID on the peer that owns the
+  // requested TargetSubdomain, so the initiator can address outgoing P2P
+  // stream requests to the right tunnel when the peer serves more than one.
+  string peer_tunnel_id = 6;
 }
 
 // P2PCandidates carries additional candidate endpoints for hole punching.

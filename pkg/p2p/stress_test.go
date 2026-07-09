@@ -335,6 +335,229 @@ func BenchmarkUDPMux_MultiStream(b *testing.B) {
 	}
 }
 
+// BenchmarkUDPMux_Throughput_Encrypted is the encrypted counterpart to
+// BenchmarkUDPMux_Throughput, used to quantify the DP-14 send-path copy
+// reduction (SessionCipher.EncryptInto writing straight into the mux
+// frame buffer instead of via a standalone ciphertext buffer that then
+// gets copied again).
+func BenchmarkUDPMux_Throughput_Encrypted(b *testing.B) {
+	kpA, err := GenerateKeyPair()
+	if err != nil {
+		b.Fatal(err)
+	}
+	kpB, err := GenerateKeyPair()
+	if err != nil {
+		b.Fatal(err)
+	}
+	cipherA, err := DeriveSession(kpA.Private, kpB.Public)
+	if err != nil {
+		b.Fatal(err)
+	}
+	cipherB, err := DeriveSession(kpB.Private, kpA.Public)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	conn1, conn2, peer1, peer2 := newUDPPairBench(b)
+	cfg := DefaultTransportConfig()
+	cfg.RetransmitTimeout = 20 * time.Millisecond
+	initiator := NewUDPMux(conn1, peer1, cfg, cipherA, true)
+	acceptor := NewUDPMux(conn2, peer2, cfg, cipherB, false)
+	defer initiator.Close()
+	defer acceptor.Close()
+
+	const chunkSize = 1400
+
+	ready := make(chan *UDPStream, 1)
+	go func() {
+		s, _ := acceptor.AcceptStream()
+		ready <- s
+	}()
+
+	snd, err := initiator.OpenStream()
+	if err != nil {
+		b.Fatal(err)
+	}
+	rcv := <-ready
+
+	chunk := make([]byte, chunkSize)
+	_, _ = cryptorand.Read(chunk)
+
+	b.SetBytes(int64(chunkSize))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, chunkSize)
+		total := 0
+		for total < b.N*chunkSize {
+			n, readErr := rcv.Read(buf)
+			if readErr != nil {
+				return
+			}
+			total += n
+		}
+	}()
+
+	for i := 0; i < b.N; i++ {
+		if _, writeErr := snd.Write(chunk); writeErr != nil {
+			b.Fatal(writeErr)
+		}
+	}
+	wg.Wait()
+}
+
+// delayedLossyConn wraps a net.PacketConn to simulate a WAN-like link:
+// outgoing packets are dropped at dropRate and, if not dropped, delayed by
+// delay before actually being written — approximating a fixed one-way
+// latency plus random loss. Used by BenchmarkUDPMux_Throughput_SimulatedWAN
+// to validate DP-13 (adaptive RTO)/DP-14 (reduced copies) don't regress
+// throughput under realistic non-LAN conditions.
+type delayedLossyConn struct {
+	net.PacketConn
+	dropRate float64
+	delay    time.Duration
+}
+
+func (c *delayedLossyConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	if rand.Float64() < c.dropRate { // #nosec G404 -- non-security random for benchmark simulation
+		return len(p), nil
+	}
+	if c.delay <= 0 {
+		return c.PacketConn.WriteTo(p, addr)
+	}
+	// Delay delivery asynchronously rather than blocking the caller: real
+	// network latency delays when a packet *arrives*, not how long the
+	// local socket call to send it takes — blocking here would instead
+	// serialize every send at delay-per-call and defeat the whole point
+	// of the sliding window (each Write would cost a full RTT instead of
+	// only the tail segment once the window fills).
+	buf := make([]byte, len(p))
+	copy(buf, p)
+	go func() {
+		time.Sleep(c.delay)
+		_, _ = c.PacketConn.WriteTo(buf, addr)
+	}()
+	return len(p), nil
+}
+
+// BenchmarkUDPMux_Throughput_SimulatedWAN measures single-stream throughput
+// over a simulated ~50ms-RTT, 1%-loss link (25ms one-way delay each way),
+// the condition class DP-13's adaptive RTO/backoff targets — as opposed to
+// the near-zero-RTT loopback conditions of BenchmarkUDPMux_Throughput.
+func BenchmarkUDPMux_Throughput_SimulatedWAN(b *testing.B) {
+	conn1, conn2, peer1, peer2 := newUDPPairBench(b)
+	cfg := DefaultTransportConfig()
+
+	const oneWayDelay = 25 * time.Millisecond
+	const dropRate = 0.01
+
+	wan1 := &delayedLossyConn{PacketConn: conn1, dropRate: dropRate, delay: oneWayDelay}
+	wan2 := &delayedLossyConn{PacketConn: conn2, dropRate: dropRate, delay: oneWayDelay}
+
+	initiator := NewUDPMux(wan1, peer1, cfg, nil, true)
+	acceptor := NewUDPMux(wan2, peer2, cfg, nil, false)
+	defer initiator.Close()
+	defer acceptor.Close()
+
+	const chunkSize = 1400
+
+	ready := make(chan *UDPStream, 1)
+	go func() {
+		s, _ := acceptor.AcceptStream()
+		ready <- s
+	}()
+
+	snd, err := initiator.OpenStream()
+	if err != nil {
+		b.Fatal(err)
+	}
+	rcv := <-ready
+
+	chunk := make([]byte, chunkSize)
+	_, _ = cryptorand.Read(chunk)
+
+	b.SetBytes(int64(chunkSize))
+	b.ResetTimer()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, chunkSize)
+		total := 0
+		for total < b.N*chunkSize {
+			n, readErr := rcv.Read(buf)
+			if readErr != nil {
+				return
+			}
+			total += n
+		}
+	}()
+
+	for i := 0; i < b.N; i++ {
+		if _, writeErr := snd.Write(chunk); writeErr != nil {
+			b.Fatal(writeErr)
+		}
+	}
+	wg.Wait()
+}
+
+// BenchmarkMux_SendPacket isolates the allocation cost of a single
+// sendPacket call (DP-14: encryption now appends straight into the frame
+// buffer via SessionCipher.EncryptInto instead of encrypting into a
+// standalone buffer that then gets copied into the frame). No receiver
+// reads these packets — this benchmark only measures encode+write cost.
+func BenchmarkMux_SendPacket(b *testing.B) {
+	conn1, _, _, peer2 := newUDPPairBench(b)
+
+	cfg := DefaultTransportConfig()
+	plainMux := NewUDPMux(conn1, peer2, cfg, nil, true)
+	defer plainMux.Close()
+
+	kpA, err := GenerateKeyPair()
+	if err != nil {
+		b.Fatal(err)
+	}
+	kpB, err := GenerateKeyPair()
+	if err != nil {
+		b.Fatal(err)
+	}
+	sessionCipher, err := DeriveSession(kpA.Private, kpB.Public)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	conn3, _, _, peer4 := newUDPPairBench(b)
+	encMux := NewUDPMux(conn3, peer4, cfg, sessionCipher, true)
+	defer encMux.Close()
+
+	const payloadSize = 1200
+	payload := make([]byte, payloadSize)
+	_, _ = cryptorand.Read(payload)
+
+	b.Run("plain", func(b *testing.B) {
+		b.ReportAllocs()
+		seq := uint32(1)
+		for i := 0; i < b.N; i++ {
+			_ = plainMux.sendPacket(1, muxTypeData, seq, payload)
+			seq++
+		}
+	})
+
+	b.Run("encrypted", func(b *testing.B) {
+		b.ReportAllocs()
+		seq := uint32(1)
+		for i := 0; i < b.N; i++ {
+			_ = encMux.sendPacket(1, muxTypeData, seq, payload)
+			seq++
+		}
+	})
+}
+
 // newUDPPairBench is a testing.B-compatible version of newUDPPair.
 func newUDPPairBench(b *testing.B) (net.PacketConn, net.PacketConn, *net.UDPAddr, *net.UDPAddr) {
 	b.Helper()

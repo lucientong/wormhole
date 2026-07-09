@@ -13,62 +13,56 @@ import (
 )
 
 // TestP2PIntegration_DirectConnection tests P2P communication between
-// two endpoints without NAT (localhost simulation).
+// two endpoints without NAT (localhost simulation), via a UDPMux stream.
 func TestP2PIntegration_DirectConnection(t *testing.T) {
-	// Create two UDP sockets to simulate two peers.
-	conn1, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer conn1.Close()
-
-	conn2, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer conn2.Close()
-
-	addr1 := conn1.LocalAddr().(*net.UDPAddr)
-	addr2 := conn2.LocalAddr().(*net.UDPAddr)
-
-	// Create transports for bidirectional communication.
+	conn1, conn2, peer1, peer2 := newUDPPair(t)
 	config := DefaultTransportConfig()
 	config.RetransmitTimeout = 50 * time.Millisecond
 
-	t1 := NewTransport(conn1, addr2, config, nil)
-	defer t1.Close()
+	m1 := NewUDPMux(conn1, peer1, config, nil, true)
+	defer m1.Close()
+	m2 := NewUDPMux(conn2, peer2, config, nil, false)
+	defer m2.Close()
 
-	t2 := NewTransport(conn2, addr1, config, nil)
-	defer t2.Close()
+	s1, err := m1.OpenStream()
+	require.NoError(t, err)
+	defer s1.Close()
 
-	// Test bidirectional echo.
 	testData := []byte("Hello from peer 1!")
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Peer 1 sends, Peer 2 echoes back.
 	go func() {
 		defer wg.Done()
-		_, writeErr := t1.Write(testData)
+		_, writeErr := s1.Write(testData)
 		require.NoError(t, writeErr)
 	}()
 
+	var s2 *UDPStream
 	go func() {
 		defer wg.Done()
+		var acceptErr error
+		s2, acceptErr = m2.AcceptStream()
+		require.NoError(t, acceptErr)
+
 		buf := make([]byte, 1024)
-		n, readErr := t2.Read(buf)
+		n, readErr := s2.Read(buf)
 		require.NoError(t, readErr)
 		assert.Equal(t, testData, buf[:n])
 
 		// Echo back.
-		_, writeErr := t2.Write(buf[:n])
+		_, writeErr := s2.Write(buf[:n])
 		require.NoError(t, writeErr)
 	}()
 
 	wg.Wait()
+	defer s2.Close()
 
-	// Peer 1 receives echo.
 	buf := make([]byte, 1024)
 	done := make(chan struct{})
 	go func() {
-		n, readErr := t1.Read(buf)
+		n, readErr := s1.Read(buf)
 		if readErr == nil {
 			assert.Equal(t, testData, buf[:n])
 		}
@@ -84,41 +78,38 @@ func TestP2PIntegration_DirectConnection(t *testing.T) {
 }
 
 // TestP2PIntegration_ProtocolMessage tests sending and receiving
-// P2P protocol messages over the transport.
+// P2P protocol messages over a UDPMux stream.
 func TestP2PIntegration_ProtocolMessage(t *testing.T) {
-	conn1, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer conn1.Close()
-
-	conn2, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer conn2.Close()
-
-	addr1 := conn1.LocalAddr().(*net.UDPAddr)
-	addr2 := conn2.LocalAddr().(*net.UDPAddr)
-
+	conn1, conn2, peer1, peer2 := newUDPPair(t)
 	config := DefaultTransportConfig()
 	config.RetransmitTimeout = 50 * time.Millisecond
 
-	t1 := NewTransport(conn1, addr2, config, nil)
-	defer t1.Close()
+	m1 := NewUDPMux(conn1, peer1, config, nil, true)
+	defer m1.Close()
+	m2 := NewUDPMux(conn2, peer2, config, nil, false)
+	defer m2.Close()
 
-	t2 := NewTransport(conn2, addr1, config, nil)
-	defer t2.Close()
+	s1, err := m1.OpenStream()
+	require.NoError(t, err)
+	defer s1.Close()
 
 	// Simulate a P2P stream request as JSON.
 	// In real usage, this would be proto.ControlMessage.
 	streamRequest := `{"type":2,"sequence":1,"stream_request":{"request_id":"test-123","protocol":1}}`
 
-	_, err = t1.Write([]byte(streamRequest))
-	require.NoError(t, err)
+	go func() {
+		_, _ = s1.Write([]byte(streamRequest))
+	}()
 
-	// Read on receiver side.
+	s2, err := m2.AcceptStream()
+	require.NoError(t, err)
+	defer s2.Close()
+
 	buf := make([]byte, 4096)
 	done := make(chan []byte, 1)
 
 	go func() {
-		n, readErr := t2.Read(buf)
+		n, readErr := s2.Read(buf)
 		if readErr == nil {
 			result := make([]byte, n)
 			copy(result, buf[:n])
@@ -135,68 +126,58 @@ func TestP2PIntegration_ProtocolMessage(t *testing.T) {
 	}
 }
 
-// TestP2PIntegration_ConcurrentStreams tests multiple concurrent
-// data streams over a single P2P transport.
+// TestP2PIntegration_ConcurrentStreams tests multiple concurrent logical
+// streams multiplexed over a single UDPMux connection.
 func TestP2PIntegration_ConcurrentStreams(t *testing.T) {
-	conn1, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer conn1.Close()
-
-	conn2, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer conn2.Close()
-
-	addr1 := conn1.LocalAddr().(*net.UDPAddr)
-	addr2 := conn2.LocalAddr().(*net.UDPAddr)
-
+	conn1, conn2, peer1, peer2 := newUDPPair(t)
 	config := DefaultTransportConfig()
 	config.RetransmitTimeout = 50 * time.Millisecond
 
-	t1 := NewTransport(conn1, addr2, config, nil)
-	defer t1.Close()
+	m1 := NewUDPMux(conn1, peer1, config, nil, true)
+	defer m1.Close()
+	m2 := NewUDPMux(conn2, peer2, config, nil, false)
+	defer m2.Close()
 
-	t2 := NewTransport(conn2, addr1, config, nil)
-	defer t2.Close()
-
-	numMessages := 10
+	numStreams := 10
 	var wg sync.WaitGroup
-	wg.Add(numMessages)
+	wg.Add(numStreams)
 
-	// Send multiple messages concurrently.
-	for i := range numMessages {
+	for i := range numStreams {
 		go func(idx int) {
 			defer wg.Done()
-			msg := []byte{byte(idx)}
-			_, writeErr := t1.Write(msg)
+			s, openErr := m1.OpenStream()
+			require.NoError(t, openErr)
+			defer s.Close()
+			_, writeErr := s.Write([]byte{byte(idx)})
 			assert.NoError(t, writeErr)
 		}(i)
 	}
 
-	// Receive all messages.
 	received := make(map[byte]bool)
 	mu := sync.Mutex{}
 
 	done := make(chan struct{})
 	go func() {
-		buf := make([]byte, 1024)
-		for {
-			n, readErr := t2.Read(buf)
-			if readErr == io.EOF {
-				break
+		for range numStreams {
+			s, acceptErr := m2.AcceptStream()
+			if acceptErr != nil {
+				return
 			}
-			if readErr != nil {
-				continue
-			}
-			if n > 0 {
-				mu.Lock()
-				received[buf[0]] = true
-				if len(received) >= numMessages {
-					mu.Unlock()
-					close(done)
+			go func(stream *UDPStream) {
+				defer stream.Close()
+				buf := make([]byte, 1024)
+				n, readErr := stream.Read(buf)
+				if readErr != nil || n == 0 {
 					return
 				}
+				mu.Lock()
+				received[buf[0]] = true
+				count := len(received)
 				mu.Unlock()
-			}
+				if count >= numStreams {
+					close(done)
+				}
+			}(s)
 		}
 	}()
 
@@ -205,109 +186,94 @@ func TestP2PIntegration_ConcurrentStreams(t *testing.T) {
 	select {
 	case <-done:
 		mu.Lock()
-		assert.Len(t, received, numMessages)
+		assert.Len(t, received, numStreams)
 		mu.Unlock()
 	case <-time.After(10 * time.Second):
 		mu.Lock()
-		t.Fatalf("Only received %d/%d messages", len(received), numMessages)
+		t.Fatalf("Only received %d/%d messages", len(received), numStreams)
 		mu.Unlock()
 	}
 }
 
-// TestP2PIntegration_GracefulClose tests that closing one side
-// properly notifies the other side.
+// TestP2PIntegration_GracefulClose tests that closing one stream
+// properly notifies the peer (FIN -> EOF).
 func TestP2PIntegration_GracefulClose(t *testing.T) {
-	conn1, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	require.NoError(t, err)
-
-	conn2, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	require.NoError(t, err)
-
-	addr1 := conn1.LocalAddr().(*net.UDPAddr)
-	addr2 := conn2.LocalAddr().(*net.UDPAddr)
-
+	conn1, conn2, peer1, peer2 := newUDPPair(t)
 	config := DefaultTransportConfig()
 	config.RetransmitTimeout = 50 * time.Millisecond
 
-	t1 := NewTransport(conn1, addr2, config, nil)
-	t2 := NewTransport(conn2, addr1, config, nil)
+	m1 := NewUDPMux(conn1, peer1, config, nil, true)
+	defer m1.Close()
+	m2 := NewUDPMux(conn2, peer2, config, nil, false)
+	defer m2.Close()
 
-	// Send some data first.
-	_, err = t1.Write([]byte("test"))
+	s1, err := m1.OpenStream()
 	require.NoError(t, err)
 
-	// Read on t2.
+	go func() {
+		_, _ = s1.Write([]byte("test"))
+	}()
+
+	s2, err := m2.AcceptStream()
+	require.NoError(t, err)
+
 	buf := make([]byte, 1024)
-	_, err = t2.Read(buf)
+	_, err = s2.Read(buf)
 	require.NoError(t, err)
 
-	// Close t1 gracefully.
-	err = t1.Close()
-	require.NoError(t, err)
+	require.NoError(t, s1.Close())
 
-	// t2 should eventually get EOF or error on read.
 	done := make(chan error, 1)
 	go func() {
-		_, readErr := t2.Read(buf)
+		_, readErr := s2.Read(buf)
 		done <- readErr
 	}()
 
 	select {
 	case readErr := <-done:
-		// EOF or other error is expected after FIN.
 		assert.True(t, readErr == io.EOF || readErr != nil)
 	case <-time.After(3 * time.Second):
 		// FIN packet might not always be received - acceptable.
 	}
 
-	// Cleanup.
-	_ = t2.Close()
-	_ = conn1.Close()
-	_ = conn2.Close()
+	_ = s2.Close()
 }
 
 // TestP2PIntegration_ReconnectScenario tests the fallback-to-relay
-// scenario by simulating a transport failure.
+// scenario by simulating a peer disappearing mid-session: the mux/stream
+// on the surviving side must remain safe to use (no panic) even though
+// its writes are now going nowhere.
 func TestP2PIntegration_ReconnectScenario(t *testing.T) {
-	conn1, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	require.NoError(t, err)
-
-	conn2, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	require.NoError(t, err)
-
-	addr1 := conn1.LocalAddr().(*net.UDPAddr)
-	addr2 := conn2.LocalAddr().(*net.UDPAddr)
-
+	conn1, conn2, peer1, peer2 := newUDPPair(t)
 	config := DefaultTransportConfig()
 	config.RetransmitTimeout = 50 * time.Millisecond
 
-	t1 := NewTransport(conn1, addr2, config, nil)
-	t2 := NewTransport(conn2, addr1, config, nil)
+	m1 := NewUDPMux(conn1, peer1, config, nil, true)
+	m2 := NewUDPMux(conn2, peer2, config, nil, false)
 
-	// Initial communication works.
-	_, err = t1.Write([]byte("hello"))
+	s1, err := m1.OpenStream()
+	require.NoError(t, err)
+
+	go func() {
+		_, _ = s1.Write([]byte("hello"))
+	}()
+
+	s2, err := m2.AcceptStream()
 	require.NoError(t, err)
 
 	buf := make([]byte, 1024)
-	_, err = t2.Read(buf)
+	_, err = s2.Read(buf)
 	require.NoError(t, err)
 
-	// Simulate transport failure by closing t2 first (gracefully).
-	_ = t2.Close()
-	_ = conn2.Close()
+	// Simulate transport failure: the peer disappears entirely.
+	_ = m2.Close()
 
-	// Attempt to write after peer is gone - write to closed transport should error.
-	_, _ = t1.Write([]byte("test"))
-	// This may succeed (UDP is connectionless) or fail if transport detects closure.
-	// The key is that no panic occurs and behavior is predictable.
+	// Writing after the peer is gone should not panic — the RST sent by
+	// Close on m2's side is delivered best-effort, and s1 either observes
+	// it (force-close) or simply times out retransmitting into the void.
+	_, _ = s1.Write([]byte("test"))
 
-	// In real scenario, manager would detect failure and fallback to relay.
-	// The transport should handle this gracefully without panicking.
-
-	// Cleanup.
-	_ = t1.Close()
-	_ = conn1.Close()
-
+	_ = m1.Close()
 	// Test passes if no panic occurred during the failure scenario.
 }
 
@@ -333,31 +299,38 @@ func TestP2PManager_ModeSwitch(t *testing.T) {
 	assert.Equal(t, ModeRelay, m.Mode())
 }
 
-// TestP2PIntegration_Timeout tests transport timeout behavior.
+// TestP2PIntegration_Timeout tests that a stream to a non-existent peer
+// gives up and force-closes after exhausting its retransmit budget,
+// instead of retrying forever (see also TestUDPStream_Retransmit_
+// GivesUpAfterMaxRetransmits for the lower-level unit test).
 func TestP2PIntegration_Timeout(t *testing.T) {
 	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer conn.Close()
 
-	// Create transport to a non-existent peer.
+	// A non-existent peer — same idea as before, just driven through the
+	// public UDPMux/UDPStream API instead of the removed Transport type.
 	fakePeer := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 65000}
 
 	config := DefaultTransportConfig()
-	config.RetransmitTimeout = 50 * time.Millisecond
+	config.RetransmitTimeout = 20 * time.Millisecond
 	config.MaxRetransmits = 2 // Quick timeout.
 
-	tr := NewTransport(conn, fakePeer, config, nil)
-	defer tr.Close()
+	m := NewUDPMux(conn, fakePeer, config, nil, true)
+	defer m.Close()
 
-	// Send data - should succeed (local operation).
-	_, err = tr.Write([]byte("test"))
+	s, err := m.OpenStream()
+	require.NoError(t, err)
+
+	_, err = s.Write([]byte("test"))
 	assert.NoError(t, err)
 
-	// After some time, the unacknowledged packet should be cleaned up.
-	time.Sleep(300 * time.Millisecond)
-
-	stats := tr.Stats()
-	assert.Equal(t, 0, stats.PendingAcks) // Should be cleaned up after max retransmits.
+	select {
+	case <-s.closeCh:
+		// Expected: the stream gives up after exhausting maxRetransmits.
+	case <-time.After(3 * time.Second):
+		t.Fatal("stream should have force-closed after exceeding maxRetransmits")
+	}
 }
 
 // TestEndpoint tests the Endpoint type.

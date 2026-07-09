@@ -99,69 +99,88 @@ func TestServer_IsP2PCompatible(t *testing.T) {
 	}
 }
 
-func TestServer_FindPeerForP2P(t *testing.T) {
+func TestServer_FindPeerBySubdomain_NotFound(t *testing.T) {
+	cfg := DefaultConfig()
+	s := NewServer(cfg)
+	initiator := &ClientSession{ID: "client-1"}
+
+	peer, tunnelID, reason := s.findPeerBySubdomain("myapp", initiator)
+	assert.Nil(t, peer)
+	assert.Empty(t, tunnelID)
+	assert.Equal(t, errP2PTargetNotFound, reason)
+}
+
+func TestServer_FindPeerBySubdomain_Success(t *testing.T) {
 	cfg := DefaultConfig()
 	s := NewServer(cfg)
 
-	// No clients — should return nil.
-	peer := s.FindPeerForP2P("client-1")
-	assert.Nil(t, peer)
+	target := &ClientSession{
+		ID:            "client-2",
+		P2PPublicAddr: "1.2.3.4:5000",
+		Tunnels:       []*TunnelInfo{{ID: "tunnel-2", Subdomain: "myapp"}},
+	}
+	require.NoError(t, s.router.RegisterSubdomain("myapp", target))
 
-	// Add a client with P2P info.
-	s.clients["client-2"] = &ClientSession{
+	initiator := &ClientSession{ID: "client-1"}
+	peer, tunnelID, reason := s.findPeerBySubdomain("myapp", initiator)
+	require.NotNil(t, peer)
+	assert.Equal(t, "client-2", peer.ID)
+	assert.Equal(t, "tunnel-2", tunnelID)
+	assert.Empty(t, reason)
+}
+
+func TestServer_FindPeerBySubdomain_RejectsSelf(t *testing.T) {
+	cfg := DefaultConfig()
+	s := NewServer(cfg)
+
+	initiator := &ClientSession{
+		ID:            "client-1",
+		P2PPublicAddr: "1.2.3.4:5000",
+		Tunnels:       []*TunnelInfo{{ID: "tunnel-1", Subdomain: "myapp"}},
+	}
+	require.NoError(t, s.router.RegisterSubdomain("myapp", initiator))
+
+	peer, tunnelID, reason := s.findPeerBySubdomain("myapp", initiator)
+	assert.Nil(t, peer)
+	assert.Empty(t, tunnelID)
+	assert.Equal(t, errP2PTargetIsSelf, reason)
+}
+
+func TestServer_FindPeerBySubdomain_NoP2PInfo(t *testing.T) {
+	cfg := DefaultConfig()
+	s := NewServer(cfg)
+
+	// Registered but never sent a P2P offer, so it has no reachability info.
+	target := &ClientSession{
+		ID:      "client-2",
+		Tunnels: []*TunnelInfo{{ID: "tunnel-2", Subdomain: "myapp"}},
+	}
+	require.NoError(t, s.router.RegisterSubdomain("myapp", target))
+
+	initiator := &ClientSession{ID: "client-1"}
+	peer, _, reason := s.findPeerBySubdomain("myapp", initiator)
+	assert.Nil(t, peer)
+	assert.Equal(t, errP2PTargetNotFound, reason)
+}
+
+func TestServer_FindPeerBySubdomain_MissingTunnelMetadata(t *testing.T) {
+	cfg := DefaultConfig()
+	s := NewServer(cfg)
+
+	// Registered and reachable, but its Tunnels slice doesn't (yet) carry
+	// an entry for this subdomain — a transient state that shouldn't happen
+	// in practice, but must fail cleanly rather than returning a blank ID.
+	target := &ClientSession{
 		ID:            "client-2",
 		P2PPublicAddr: "1.2.3.4:5000",
 	}
+	require.NoError(t, s.router.RegisterSubdomain("myapp", target))
 
-	// Should find client-2.
-	peer = s.FindPeerForP2P("client-1")
-	require.NotNil(t, peer)
-	assert.Equal(t, "client-2", peer.ID)
-
-	// Should not find self.
-	peer = s.FindPeerForP2P("client-2")
+	initiator := &ClientSession{ID: "client-1"}
+	peer, tunnelID, reason := s.findPeerBySubdomain("myapp", initiator)
 	assert.Nil(t, peer)
-}
-
-func TestServer_FindPeerForP2P_ExcludesNonP2P(t *testing.T) {
-	cfg := DefaultConfig()
-	s := NewServer(cfg)
-
-	// Add client without P2P info.
-	s.clients["client-2"] = &ClientSession{
-		ID: "client-2",
-		// P2PPublicAddr is empty.
-	}
-
-	peer := s.FindPeerForP2P("client-1")
-	assert.Nil(t, peer)
-}
-
-func TestServer_FindPeerForP2P_SelectsBestNATType(t *testing.T) {
-	cfg := DefaultConfig()
-	s := NewServer(cfg)
-
-	// Add multiple peers with different NAT types.
-	s.clients["sym-peer"] = &ClientSession{
-		ID:            "sym-peer",
-		P2PPublicAddr: "1.2.3.4:5000",
-		P2PNATType:    natTypeSymmetric,
-	}
-	s.clients["rc-peer"] = &ClientSession{
-		ID:            "rc-peer",
-		P2PPublicAddr: "2.3.4.5:5000",
-		P2PNATType:    natTypeRestrictedCone,
-	}
-	s.clients["fc-peer"] = &ClientSession{
-		ID:            "fc-peer",
-		P2PPublicAddr: "3.4.5.6:5000",
-		P2PNATType:    natTypeFullCone,
-	}
-
-	// Should prefer Full Cone (highest priority).
-	peer := s.FindPeerForP2P("initiator")
-	require.NotNil(t, peer)
-	assert.Equal(t, "fc-peer", peer.ID)
+	assert.Empty(t, tunnelID)
+	assert.Equal(t, errP2PTargetTunnelMeta, reason)
 }
 
 func TestServer_GetStats(t *testing.T) {
@@ -776,7 +795,7 @@ func TestServer_HandleClientStream_Ping(t *testing.T) {
 	client.mu.Unlock()
 }
 
-func TestServer_HandleP2POffer_NoPeer(t *testing.T) {
+func TestServer_HandleP2POffer_NoTarget(t *testing.T) {
 	s := newTestServerForIntegration()
 
 	clientMux, serverMux := newMuxPair(t)
@@ -789,7 +808,9 @@ func TestServer_HandleP2POffer_NoPeer(t *testing.T) {
 	s.clients[client.ID] = client
 	s.clientLock.Unlock()
 
-	// Client sends P2P offer with no peer available.
+	// Client sends a P2P offer with no TargetSubdomain — this is the
+	// normal case for a client that's only exposing a tunnel: the server
+	// records its reachability info but doesn't search for a match.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -799,7 +820,7 @@ func TestServer_HandleP2POffer_NoPeer(t *testing.T) {
 		}
 		defer stream.Close()
 
-		req := proto.NewP2POfferRequest("tunnel-1", natTypeFullCone, "1.2.3.4:5000", "192.168.1.1:5000", "")
+		req := proto.NewP2POfferRequest("tunnel-1", natTypeFullCone, "1.2.3.4:5000", "192.168.1.1:5000", "", "")
 		data, _ := req.Encode()
 		_, _ = stream.Write(data)
 
@@ -810,7 +831,66 @@ func TestServer_HandleP2POffer_NoPeer(t *testing.T) {
 
 		if msg != nil && msg.P2POfferResponse != nil {
 			assert.False(t, msg.P2POfferResponse.Success)
-			assert.Contains(t, msg.P2POfferResponse.Error, "no peer available")
+			assert.Equal(t, errP2PNoTarget, msg.P2POfferResponse.Error)
+		}
+	}()
+
+	stream, err := serverMux.AcceptStream()
+	require.NoError(t, err)
+
+	buf := make([]byte, 4096)
+	n, err := stream.Read(buf)
+	require.NoError(t, err)
+
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	require.NoError(t, err)
+	require.NotNil(t, msg.P2POfferRequest)
+
+	s.handleP2POffer(client, stream, msg.P2POfferRequest)
+	<-done
+
+	// The offer still registered the client's reachability info even
+	// though no match was requested.
+	client.mu.Lock()
+	assert.Equal(t, "1.2.3.4:5000", client.P2PPublicAddr)
+	client.mu.Unlock()
+}
+
+func TestServer_HandleP2POffer_TargetNotFound(t *testing.T) {
+	s := newTestServerForIntegration()
+
+	clientMux, serverMux := newMuxPair(t)
+
+	client := &ClientSession{
+		ID:  "initiator",
+		Mux: serverMux,
+	}
+	s.clientLock.Lock()
+	s.clients[client.ID] = client
+	s.clientLock.Unlock()
+
+	// Client requests a target subdomain that isn't currently connected.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		stream, err := clientMux.OpenStream()
+		if err != nil {
+			return
+		}
+		defer stream.Close()
+
+		req := proto.NewP2POfferRequest("tunnel-1", natTypeFullCone, "1.2.3.4:5000", "192.168.1.1:5000", "", "nonexistent")
+		data, _ := req.Encode()
+		_, _ = stream.Write(data)
+
+		msg, readErr := proto.ReadControlMessage(stream)
+		if readErr != nil {
+			return
+		}
+
+		if msg != nil && msg.P2POfferResponse != nil {
+			assert.False(t, msg.P2POfferResponse.Success)
+			assert.Equal(t, errP2PTargetNotFound, msg.P2POfferResponse.Error)
 		}
 	}()
 
@@ -1318,12 +1398,14 @@ func TestServer_HandleP2POffer_WithPeer(t *testing.T) {
 		P2PPublicAddr: "5.6.7.8:6000",
 		P2PNATType:    natTypeFullCone,
 		P2PPublicKey:  "peer-public-key-base64",
+		Tunnels:       []*TunnelInfo{{ID: "peer-tunnel-1", Subdomain: "peerapp"}},
 	}
 
 	s.clientLock.Lock()
 	s.clients[initiator.ID] = initiator
 	s.clients[peer.ID] = peer
 	s.clientLock.Unlock()
+	require.NoError(t, s.router.RegisterSubdomain("peerapp", peer))
 
 	// Peer goroutine: accept the notification stream from server.
 	peerNotified := make(chan bool, 1)
@@ -1355,7 +1437,7 @@ func TestServer_HandleP2POffer_WithPeer(t *testing.T) {
 		}
 		defer stream.Close()
 
-		req := proto.NewP2POfferRequest("tunnel-1", natTypeFullCone, "1.2.3.4:5000", "192.168.1.1:5000", "initiator-pub-key")
+		req := proto.NewP2POfferRequest("tunnel-1", natTypeFullCone, "1.2.3.4:5000", "192.168.1.1:5000", "initiator-pub-key", "peerapp")
 		data, _ := req.Encode()
 		_, _ = stream.Write(data)
 
@@ -1370,6 +1452,7 @@ func TestServer_HandleP2POffer_WithPeer(t *testing.T) {
 			assert.Equal(t, "5.6.7.8:6000", msg.P2POfferResponse.PeerAddr)
 			assert.Equal(t, natTypeFullCone, msg.P2POfferResponse.PeerNATType)
 			assert.Equal(t, "peer-public-key-base64", msg.P2POfferResponse.PeerPublicKey)
+			assert.Equal(t, "peer-tunnel-1", msg.P2POfferResponse.PeerTunnelID)
 		}
 	}()
 
@@ -1670,12 +1753,14 @@ func TestServer_HandleP2POffer_SymmetricSymmetric(t *testing.T) {
 		P2PNATType:    natTypeSymmetric,
 		P2PTunnelID:   "peer-tunnel-1",
 		Mux:           serverMux2,
+		Tunnels:       []*TunnelInfo{{ID: "peer-tunnel-1", Subdomain: "symapp"}},
 	}
 
 	s.clientLock.Lock()
 	s.clients[initiator.ID] = initiator
 	s.clients[peer.ID] = peer
 	s.clientLock.Unlock()
+	require.NoError(t, s.router.RegisterSubdomain("symapp", peer))
 
 	// Goroutine simulating the peer client — reads the notification stream
 	// opened by notifyPeerOfP2P and asserts that BOTH the P2PCandidates
@@ -1719,7 +1804,7 @@ func TestServer_HandleP2POffer_SymmetricSymmetric(t *testing.T) {
 		}
 		defer stream.Close()
 
-		req := proto.NewP2POfferRequest("tunnel-1", natTypeSymmetric, "1.2.3.4:5000", "192.168.1.1:5000", "key")
+		req := proto.NewP2POfferRequest("tunnel-1", natTypeSymmetric, "1.2.3.4:5000", "192.168.1.1:5000", "key", "symapp")
 		data, _ := req.Encode()
 		_, _ = stream.Write(data)
 
@@ -1779,12 +1864,14 @@ func TestServer_HandleP2POffer_IncompatibleNAT(t *testing.T) {
 		ID:            "unknown-peer",
 		P2PPublicAddr: "5.6.7.8:6000",
 		P2PNATType:    "", // unknown type — priority 0
+		Tunnels:       []*TunnelInfo{{ID: "peer-tunnel-1", Subdomain: "unknownapp"}},
 	}
 
 	s.clientLock.Lock()
 	s.clients[initiator.ID] = initiator
 	s.clients[peer.ID] = peer
 	s.clientLock.Unlock()
+	require.NoError(t, s.router.RegisterSubdomain("unknownapp", peer))
 
 	done := make(chan struct{})
 	go func() {
@@ -1795,7 +1882,7 @@ func TestServer_HandleP2POffer_IncompatibleNAT(t *testing.T) {
 		}
 		defer stream.Close()
 
-		req := proto.NewP2POfferRequest("tunnel-1", "", "1.2.3.4:5000", "192.168.1.1:5000", "key")
+		req := proto.NewP2POfferRequest("tunnel-1", "", "1.2.3.4:5000", "192.168.1.1:5000", "key", "unknownapp")
 		data, _ := req.Encode()
 		_, _ = stream.Write(data)
 

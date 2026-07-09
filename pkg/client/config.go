@@ -123,6 +123,15 @@ type Config struct {
 	// This keeps pkg/client decoupled from any specific OIDC/OAuth2 provider
 	// implementation — the CLI layer wires in the actual refresh logic.
 	OnAuthFailure func(ctx context.Context) (token string, ok bool)
+
+	// ConnectTarget switches the client into "connect" mode (`wormhole
+	// connect <target-subdomain>`): instead of registering a tunnel of its
+	// own, the client requests a P2P match against the peer client that
+	// owns this subdomain, and once hole-punched, listens on
+	// LocalHost:LocalPort so that anything dialing it is proxied directly
+	// to the peer's exposed service over the P2P channel (server relay
+	// bypassed entirely). Empty (the default) means normal "expose" mode.
+	ConnectTarget string
 }
 
 // DefaultConfig returns the default client configuration.

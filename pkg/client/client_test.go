@@ -1749,7 +1749,7 @@ func TestClient_HandleStream_P2POfferResponse(t *testing.T) {
 	serverStream, err := serverMux.OpenStream()
 	require.NoError(t, err)
 
-	resp := proto.NewP2POfferResponse(true, "", "10.0.0.1:5000", "Full Cone", peerPubB64)
+	resp := proto.NewP2POfferResponse(true, "", "10.0.0.1:5000", "Full Cone", peerPubB64, "")
 	err = proto.WriteControlMessage(serverStream, resp)
 	require.NoError(t, err)
 
@@ -1807,7 +1807,7 @@ func TestClient_HandleStream_P2PCandidatesThenOfferResponse(t *testing.T) {
 	candidatesMsg := proto.NewP2PCandidates("tunnel-1", candidates)
 	require.NoError(t, proto.WriteControlMessage(serverStream, candidatesMsg))
 
-	resp := proto.NewP2POfferResponse(true, "", "10.0.0.1:5000", "Symmetric", peerPubB64)
+	resp := proto.NewP2POfferResponse(true, "", "10.0.0.1:5000", "Symmetric", peerPubB64, "")
 	require.NoError(t, proto.WriteControlMessage(serverStream, resp))
 
 	clientStream, err := clientMux.AcceptStream()
@@ -1929,6 +1929,172 @@ func TestClient_AcceptP2PStreams_FallbackOnClose(t *testing.T) {
 		t.Fatal("acceptP2PStreams did not exit after mux close")
 	}
 	assert.False(t, c.IsP2PMode())
+}
+
+// TestClient_HandleP2POfferResponse_FailureDoesNotAttemptP2P verifies that
+// an unsuccessful offer response (no peer/target matched) never triggers a
+// hole-punch attempt, regardless of whether the client is in "connect" mode
+// or plain "expose" mode (which both take the early-return failure path,
+// just with different user-facing messaging).
+func TestClient_HandleP2POfferResponse_FailureDoesNotAttemptP2P(t *testing.T) {
+	for _, connectTarget := range []string{"", "myapp"} {
+		t.Run(fmt.Sprintf("ConnectTarget=%q", connectTarget), func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.ConnectTarget = connectTarget
+			c := NewClient(cfg)
+
+			resp := &proto.P2POfferResponse{Success: false, Error: "no target specified"}
+			c.handleP2POfferResponse(context.Background(), resp, nil)
+
+			// No hole-punch attempt means p2pMode stays 0 and no cipher/key
+			// pair gets derived from a (non-existent) peer key.
+			assert.False(t, c.IsP2PMode())
+			c.mu.Lock()
+			assert.Nil(t, c.p2pCipher)
+			c.mu.Unlock()
+		})
+	}
+}
+
+// TestClient_ProxyConnectConn_ForwardsStreamRequestAndBytes verifies that
+// proxyConnectConn (the `wormhole connect` initiator side) opens a P2P
+// stream, sends a StreamRequest addressed to the peer's tunnel, and proxies
+// bytes bidirectionally between the local connection and the stream.
+func TestClient_ProxyConnectConn_ForwardsStreamRequestAndBytes(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ConnectTarget = "myapp"
+	c := NewClient(cfg)
+
+	conn1, conn2, peer1Addr, peer2Addr := newUDPConnPair(t)
+
+	// Initiator mux (this client, opens the connect-mode stream).
+	initiatorMux := p2p.NewUDPMux(conn1, peer2Addr, p2p.DefaultTransportConfig(), nil, true)
+	defer initiatorMux.Close()
+
+	// Peer mux (the target being connected to; accepts and echoes).
+	peerMux := p2p.NewUDPMux(conn2, peer1Addr, p2p.DefaultTransportConfig(), nil, false)
+	defer peerMux.Close()
+
+	// Local TCP "client" that proxyConnectConn will forward.
+	localLn, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer localLn.Close()
+
+	localServerConnCh := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := localLn.Accept()
+		if acceptErr == nil {
+			localServerConnCh <- conn
+		}
+	}()
+
+	localClientConn, err := net.Dial(protocolTCP, localLn.Addr().String())
+	require.NoError(t, err)
+	defer localClientConn.Close()
+
+	localServerConn := <-localServerConnCh
+	defer localServerConn.Close()
+
+	go c.proxyConnectConn(context.Background(), initiatorMux, localServerConn, "peer-tunnel-42")
+
+	// Peer side: accept the stream, verify the StreamRequest, then echo.
+	peerStream, err := peerMux.AcceptStream()
+	require.NoError(t, err)
+	defer peerStream.Close()
+
+	msg, err := proto.ReadControlMessage(peerStream)
+	require.NoError(t, err)
+	require.NotNil(t, msg.StreamRequest)
+	assert.Equal(t, "peer-tunnel-42", msg.StreamRequest.TunnelID)
+	assert.Equal(t, proto.ProtocolTCP, msg.StreamRequest.Protocol)
+	assert.NotEmpty(t, msg.StreamRequest.RequestID)
+
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, readErr := peerStream.Read(buf)
+			if n > 0 {
+				_, _ = peerStream.Write(buf[:n])
+			}
+			if readErr != nil {
+				return
+			}
+		}
+	}()
+
+	_, err = localClientConn.Write([]byte("hello peer"))
+	require.NoError(t, err)
+
+	_ = localClientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 32)
+	n, err := localClientConn.Read(buf)
+	require.NoError(t, err)
+	assert.Equal(t, "hello peer", string(buf[:n]))
+}
+
+// TestClient_StartConnectListener_ProxiesLocalConnections verifies the
+// end-to-end `wormhole connect` local listener: a connection dialed to the
+// configured LocalHost:LocalPort is proxied over the P2P mux to the peer.
+func TestClient_StartConnectListener_ProxiesLocalConnections(t *testing.T) {
+	// Reserve a free port, then release it for startConnectListener to bind.
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	_, portStr, _ := net.SplitHostPort(probe.Addr().String())
+	require.NoError(t, probe.Close())
+	port := 0
+	_, err = fmt.Sscanf(portStr, "%d", &port)
+	require.NoError(t, err)
+
+	cfg := DefaultConfig()
+	cfg.LocalHost = "127.0.0.1"
+	cfg.LocalPort = port
+	cfg.ConnectTarget = "myapp"
+	c := NewClient(cfg)
+
+	conn1, conn2, peer1Addr, peer2Addr := newUDPConnPair(t)
+	initiatorMux := p2p.NewUDPMux(conn1, peer2Addr, p2p.DefaultTransportConfig(), nil, true)
+	defer initiatorMux.Close()
+	peerMux := p2p.NewUDPMux(conn2, peer1Addr, p2p.DefaultTransportConfig(), nil, false)
+	defer peerMux.Close()
+
+	closeCh := make(chan struct{})
+	defer close(closeCh)
+	go c.startConnectListener(context.Background(), initiatorMux, "peer-tunnel-1", closeCh)
+
+	// Give the listener a moment to bind before dialing.
+	time.Sleep(100 * time.Millisecond)
+
+	go func() {
+		peerStream, acceptErr := peerMux.AcceptStream()
+		if acceptErr != nil {
+			return
+		}
+		defer peerStream.Close()
+		_, _ = proto.ReadControlMessage(peerStream) // consume StreamRequest header
+		buf := make([]byte, 4096)
+		for {
+			n, readErr := peerStream.Read(buf)
+			if n > 0 {
+				_, _ = peerStream.Write(buf[:n])
+			}
+			if readErr != nil {
+				return
+			}
+		}
+	}()
+
+	localConn, err := net.Dial(protocolTCP, net.JoinHostPort(cfg.LocalHost, portStr))
+	require.NoError(t, err)
+	defer localConn.Close()
+
+	_, err = localConn.Write([]byte("ping"))
+	require.NoError(t, err)
+
+	_ = localConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 16)
+	n, err := localConn.Read(buf)
+	require.NoError(t, err)
+	assert.Equal(t, "ping", string(buf[:n]))
 }
 
 // TestClient_ForwardHTTPWithInspect_InvalidHTTP verifies the fallback to raw TCP

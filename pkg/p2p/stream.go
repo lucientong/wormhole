@@ -38,6 +38,47 @@ const (
 	maxConsecutiveDeliverFailures = 25 // ~5s at 200ms each
 )
 
+// Adaptive retransmission (DP-13): RFC 6298-style SRTT/RTTVAR/RTO estimation.
+// alpha/beta match the RFC's recommended gains; the RTO bounds are tuned
+// down from RFC 6298's 1s floor because P2P paths here are typically a
+// single hole-punched hop (tens to low hundreds of ms), not a general
+// Internet path — a 1s minimum would make loss recovery unacceptably slow.
+const (
+	rtoAlpha = 0.125 // SRTT gain
+	rtoBeta  = 0.25  // RTTVAR gain
+	rtoK     = 4     // RTO = SRTT + K*RTTVAR
+
+	minRTO = 100 * time.Millisecond
+	maxRTO = 3 * time.Second // ceiling for the SRTT-derived base estimate
+
+	// maxBackoffRTO bounds the *per-segment* exponential backoff applied on
+	// top of the base RTO (see backoffRTO) — deliberately higher than
+	// maxRTO so repeated losses of the same segment progressively slow
+	// down without the backoff being clamped back to a no-op by maxRTO.
+	maxBackoffRTO = 10 * time.Second
+
+	// maxBackoffShift caps the exponential backoff at 2^5 = 32x the base
+	// RTO, both to avoid absurd wait times and to avoid overflowing
+	// time.Duration for pathological retransmit counts.
+	maxBackoffShift = 5
+)
+
+const (
+	// closeDrainTimeout bounds how long a graceful Close() waits for
+	// already-sent-but-unacknowledged segments to be acked before giving
+	// up and closing anyway. Without this, Close() called right after
+	// Write() returns could send FIN and disable further retransmission
+	// (see the s.closed guard in retransmit()) while data sent in the
+	// final flow-control window is still legitimately in flight —
+	// silently truncating the stream even though Write() reported success
+	// for every byte.
+	closeDrainTimeout = 5 * time.Second
+
+	// drainPollInterval is how often drainSendBuffer polls the send
+	// buffer while waiting for it to empty.
+	drainPollInterval = 20 * time.Millisecond
+)
+
 // streamPacket represents a sent, unacknowledged data fragment.
 type streamPacket struct {
 	seq         uint32
@@ -60,6 +101,16 @@ type UDPStream struct {
 	// The channel is pre-filled with maxSendWindow tokens.
 	sendCreditCh chan struct{}
 
+	// Adaptive retransmission (DP-13): RFC 6298-style RTO estimator, fed by
+	// RTT samples from handleAck (Karn's algorithm: only from segments that
+	// were never retransmitted, since a retransmitted segment's ACK is
+	// ambiguous about which transmission it's acknowledging).
+	rtoMu  sync.Mutex
+	srtt   time.Duration
+	rttvar time.Duration
+	rto    time.Duration
+	hasRTT bool
+
 	// ARQ receive state.
 	recvSeq                    uint32
 	recvBuf                    map[uint32][]byte
@@ -73,7 +124,12 @@ type UDPStream struct {
 	// buffer was smaller than the received data segment.
 	readBuf []byte
 
-	// Finalization.
+	// Finalization. closing is set as soon as Close() is called (blocking
+	// further Writes immediately); closed is only set once any pending
+	// sends have drained (or closeDrainTimeout elapses) — see Close() and
+	// drainSendBuffer. Keeping these separate lets retransmit() (gated on
+	// closed) keep retrying not-yet-acked segments during the drain.
+	closing   uint32
 	closed    uint32
 	closeCh   chan struct{}
 	closeOnce sync.Once
@@ -108,7 +164,11 @@ func (s *UDPStream) StreamID() uint32 { return s.id }
 // Write blocks if the number of unacknowledged segments reaches maxSendWindow
 // (simple sliding-window flow control).
 func (s *UDPStream) Write(data []byte) (int, error) {
-	if atomic.LoadUint32(&s.closed) == 1 {
+	// closing is set immediately by Close() (before the drain that keeps
+	// retransmit() alive for already-sent data — see Close()); closed is
+	// set by forceClose() for abrupt shutdown. Either one must reject new
+	// writes.
+	if atomic.LoadUint32(&s.closing) == 1 || atomic.LoadUint32(&s.closed) == 1 {
 		return 0, io.ErrClosedPipe
 	}
 	if atomic.LoadUint32(&s.mux.closed) == 1 {
@@ -223,9 +283,25 @@ func (s *UDPStream) Read(buf []byte) (int, error) {
 	}
 }
 
-// Close sends a FIN to the peer and marks this stream as closed.
+// Close blocks new Writes immediately, then waits (up to
+// closeDrainTimeout) for any segments already handed to Write — and thus
+// already counted in its returned byte count — to actually be
+// acknowledged, before sending FIN and marking the stream closed. Skipping
+// the drain would let retransmit()'s closed-guard kill retransmission of
+// a still-in-flight tail segment the instant Close() is called, which a
+// caller that does `Write(all); Close()` (the common pattern) would have
+// no way to know about or guard against — Write() already told them every
+// byte succeeded.
 func (s *UDPStream) Close() error {
+	if !atomic.CompareAndSwapUint32(&s.closing, 0, 1) {
+		return nil
+	}
+
+	s.drainSendBuffer(closeDrainTimeout)
+
 	if !atomic.CompareAndSwapUint32(&s.closed, 0, 1) {
+		// Force-closed concurrently (e.g. peer RST) while draining —
+		// that path already ran closeOnce, nothing left to do here.
 		return nil
 	}
 	s.closeOnce.Do(func() {
@@ -236,6 +312,34 @@ func (s *UDPStream) Close() error {
 		log.Debug().Uint32("stream_id", s.id).Msg("P2P stream: closed (FIN sent)")
 	})
 	return nil
+}
+
+// drainSendBuffer blocks until the send buffer is empty (all segments
+// handed to Write have been acknowledged), the stream is force-closed
+// concurrently, the mux is closed, or timeout elapses — whichever first.
+func (s *UDPStream) drainSendBuffer(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for {
+		s.sendBufLock.Lock()
+		pending := len(s.sendBuf)
+		s.sendBufLock.Unlock()
+		if pending == 0 {
+			return
+		}
+		if atomic.LoadUint32(&s.closed) == 1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			log.Warn().Uint32("stream_id", s.id).Int("pending", pending).
+				Msg("P2P stream: graceful close timed out waiting for pending sends to ack")
+			return
+		}
+		select {
+		case <-s.mux.closeCh:
+			return
+		case <-time.After(drainPollInterval):
+		}
+	}
 }
 
 // forceClose closes the stream without sending FIN (used when RST is received
@@ -316,11 +420,12 @@ func (s *UDPStream) handleData(seq uint32, payload []byte) {
 			delete(s.recvBuf, next)
 		}
 	} else if seq > expected {
-		// Out-of-order: buffer.
+		// Out-of-order: buffer. payload is already a freshly-allocated
+		// slice owned by this call (see decryptPayload/dispatch in
+		// mux.go — it's never the read loop's reused scratch buffer), so
+		// it's safe to retain directly without another copy (DP-14).
 		if _, exists := s.recvBuf[seq]; !exists {
-			copied := make([]byte, len(payload))
-			copy(copied, payload)
-			s.recvBuf[seq] = copied
+			s.recvBuf[seq] = payload
 		}
 	}
 	// seq < expected: duplicate, already delivered — fall through to ACK
@@ -336,15 +441,20 @@ func (s *UDPStream) handleData(seq uint32, payload []byte) {
 // short to bound how long other streams sharing this mux are stalled.
 // Must be called with recvBufLock held. Returns false on timeout, in
 // which case recvSeq is deliberately left unadvanced (see handleData).
+//
+// data is always either the fresh, independently-allocated payload for a
+// just-arrived in-order segment, or a slice previously stored (and thus
+// already independently owned — see handleData's out-of-order branch) in
+// recvBuf; either way it's never aliased to the read loop's reused scratch
+// buffer, so it can be handed to recvCh directly without copying (DP-14).
+// On a failed send (timeout/close), the value is simply left untouched for
+// the caller to retry — channel sends only take effect when they succeed.
 func (s *UDPStream) deliverLocked(seq uint32, data []byte) bool {
-	copied := make([]byte, len(data))
-	copy(copied, data)
-
 	timer := time.NewTimer(recvDeliverTimeout)
 	defer timer.Stop()
 
 	select {
-	case s.recvCh <- copied:
+	case s.recvCh <- data:
 		atomic.StoreUint32(&s.recvSeq, seq)
 		atomic.StoreUint32(&s.consecutiveDeliverFailures, 0)
 		return true
@@ -361,18 +471,32 @@ func (s *UDPStream) deliverLocked(seq uint32, data []byte) bool {
 	}
 }
 
-// handleAck removes the acknowledged segment from the send buffer and,
-// for data segments, releases a flow-control credit to unblock a waiting
-// Write. seq 0 is reserved for the SYN handshake pseudo-segment (see
-// registerPendingSYN) — acknowledging it only clears the pending SYN retry
-// state and does not carry a flow-control credit.
+// handleAck removes the acknowledged segment from the send buffer, feeds an
+// RTT sample into the adaptive RTO estimator, and, for data segments,
+// releases a flow-control credit to unblock a waiting Write. seq 0 is
+// reserved for the SYN handshake pseudo-segment (see registerPendingSYN) —
+// acknowledging it only clears the pending SYN retry state and does not
+// carry a flow-control credit (but its RTT still seeds the estimator).
 func (s *UDPStream) handleAck(seq uint32) {
 	s.sendBufLock.Lock()
-	_, existed := s.sendBuf[seq]
+	pkt, existed := s.sendBuf[seq]
 	delete(s.sendBuf, seq)
 	s.sendBufLock.Unlock()
 
-	if existed && seq > 0 {
+	if !existed {
+		return
+	}
+
+	// Karn's algorithm: only sample RTT from segments acknowledged on their
+	// first transmission — an ACK for a retransmitted segment is ambiguous
+	// about which of the (re)transmissions it's actually acknowledging, so
+	// using it would poison the estimator with a misleadingly low or high
+	// sample.
+	if pkt.retransmits == 0 {
+		s.updateRTO(time.Since(pkt.sentAt))
+	}
+
+	if seq > 0 {
 		// Release one send credit so the window advances.
 		select {
 		case s.sendCreditCh <- struct{}{}:
@@ -380,6 +504,70 @@ func (s *UDPStream) handleAck(seq uint32) {
 			// Channel full — window already has maximum credits; ignore.
 		}
 	}
+}
+
+// updateRTO feeds a fresh RTT sample into the RFC 6298 SRTT/RTTVAR/RTO
+// estimator. The first sample seeds SRTT/RTTVAR directly; subsequent
+// samples use exponentially-weighted moving averages per the RFC.
+func (s *UDPStream) updateRTO(sample time.Duration) {
+	s.rtoMu.Lock()
+	defer s.rtoMu.Unlock()
+
+	if !s.hasRTT {
+		s.srtt = sample
+		s.rttvar = sample / 2
+		s.hasRTT = true
+	} else {
+		diff := sample - s.srtt
+		if diff < 0 {
+			diff = -diff
+		}
+		s.rttvar += time.Duration(rtoBeta * float64(diff-s.rttvar))
+		s.srtt += time.Duration(rtoAlpha * float64(sample-s.srtt))
+	}
+
+	s.rto = clampRTO(s.srtt + rtoK*s.rttvar)
+}
+
+// currentRTO returns the current base RTO estimate, or fallback (clamped)
+// if no RTT sample has been taken yet (e.g. before the first ACK).
+func (s *UDPStream) currentRTO(fallback time.Duration) time.Duration {
+	s.rtoMu.Lock()
+	defer s.rtoMu.Unlock()
+	if !s.hasRTT {
+		return clampRTO(fallback)
+	}
+	return s.rto
+}
+
+// clampRTO bounds d to [minRTO, maxRTO].
+func clampRTO(d time.Duration) time.Duration {
+	if d < minRTO {
+		return minRTO
+	}
+	if d > maxRTO {
+		return maxRTO
+	}
+	return d
+}
+
+// backoffRTO applies RFC 6298 §5.5-style exponential backoff on top of the
+// base RTO for a segment that has already been retransmitted retransmits
+// times, so repeated loss of the same segment progressively slows down
+// instead of hammering an already-congested or broken path.
+func backoffRTO(base time.Duration, retransmits int) time.Duration {
+	shift := retransmits
+	if shift > maxBackoffShift {
+		shift = maxBackoffShift
+	}
+	d := base << shift
+	if d > maxBackoffRTO || d < 0 { // d < 0: defend against shift overflow
+		return maxBackoffRTO
+	}
+	if d < minRTO {
+		return minRTO
+	}
+	return d
 }
 
 // registerPendingSYN records the just-sent SYN under seq 0 in the send
@@ -406,23 +594,29 @@ func (s *UDPStream) handleFin() {
 // Retransmission — called by UDPMux.retransmitLoop()
 // ---------------------------------------------------------------------------
 
-// retransmit resends unacknowledged packets that have exceeded the timeout.
-// If a packet exceeds maxRetransmits, the stream is dead: we notify the peer
-// with an RST (best effort) and force-close locally. Without the RST, the
-// peer would never learn the sender gave up and could block in Read()
-// indefinitely waiting for data that will never arrive (previously observed
-// as flaky timeouts in TestStress_PacketLoss30Pct).
-func (s *UDPStream) retransmit(timeout time.Duration, maxRetransmits int) {
+// retransmit resends unacknowledged packets that have exceeded their
+// adaptive RTO (DP-13): each segment's effective timeout is the stream's
+// current RFC 6298 RTO estimate (falling back to defaultTimeout before the
+// first RTT sample), backed off exponentially per how many times that
+// specific segment has already been retransmitted. If a packet exceeds
+// maxRetransmits, the stream is dead: we notify the peer with an RST (best
+// effort) and force-close locally. Without the RST, the peer would never
+// learn the sender gave up and could block in Read() indefinitely waiting
+// for data that will never arrive (previously observed as flaky timeouts
+// in TestStress_PacketLoss30Pct).
+func (s *UDPStream) retransmit(defaultTimeout time.Duration, maxRetransmits int) {
 	if atomic.LoadUint32(&s.closed) == 1 {
 		return
 	}
+
+	baseRTO := s.currentRTO(defaultTimeout)
 
 	s.sendBufLock.Lock()
 	defer s.sendBufLock.Unlock()
 
 	now := time.Now()
 	for seq, pkt := range s.sendBuf {
-		if now.Sub(pkt.sentAt) < timeout {
+		if now.Sub(pkt.sentAt) < backoffRTO(baseRTO, pkt.retransmits) {
 			continue
 		}
 		if pkt.retransmits >= maxRetransmits {

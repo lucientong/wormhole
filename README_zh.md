@@ -84,6 +84,11 @@ wormhole client --local 8080 --inspector 4040
 
 # 禁用 P2P 模式（仅使用中继）
 wormhole client --local 8080 --p2p=false
+
+# client 间直连（完全绕过中继）：peer A 正常暴露服务，peer B 通过对方的
+# 子域名直接打洞连过去，全程走加密 UDP 通道——server 只做信令，不转发流量
+wormhole client --local 8080 --subdomain peer-a   # 在 peer A 上执行
+wormhole connect peer-a --local 9090               # 在 peer B 上执行
 ```
 
 就这么简单！你的本地服务现在可以从公网访问了。
@@ -181,6 +186,20 @@ wormhole server \
 | `--protocol` / `-P` | 隧道协议：http、https、tcp、udp、ws、grpc | `http` |
 | `--hostname` | 自定义域名路由 | 无 |
 | `--path-prefix` | 路径前缀路由 | 无 |
+
+### `wormhole connect` 选项
+
+`wormhole connect <对方子域名>` 直接通过 P2P 连接另一个 `wormhole client` 暴露的服务，完全绕过服务器中继。它不会像 `wormhole client` 那样注册自己的隧道，只是打开一个本地监听，把接受到的连接直接转发给对端（经过打洞后的加密 UDP 通道）。由于该模式没有中继兜底，一旦打洞失败（例如双方 NAT 类型不兼容），命令会直接失败退出。
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--server` / `-s` | 要连接的服务器地址 | `localhost:7000` |
+| `--local` / `-l` | 本地监听端口（必填） | 无 |
+| `--local-host` | 本地监听绑定地址 | `127.0.0.1` |
+| `--token` / `-t` | 认证 Token | 无 |
+| `--tls` | 对服务器控制连接启用 TLS | false |
+| `--tls-insecure` | 跳过 TLS 证书验证（仅开发环境） | false |
+| `--tls-ca` | 自定义 CA 证书路径 | 无 |
 
 ### 服务器选项
 
@@ -370,11 +389,16 @@ P2P 直连使用**端到端加密**，基于 X25519 ECDH 密钥交换和 AES-256
 - **HMAC-SHA256** 认证打洞探测包，防止注入攻击
 - **HKDF-SHA256** 密钥派生，加密密钥和探测认证密钥分离
 
-如果 P2P 打洞失败，客户端会自动降级到加密的中继通道：
+**两种 P2P 场景，两条不同的流量路径。** 公网访客（浏览器、curl 等普通 HTTP 客户端）访问你的隧道 hostname 时永远无法打洞——服务器物理上不可能替一个任意的 HTTP 客户端做 NAT 穿透——所以这条流量始终走加密中继。P2P 真正加速的是 **`wormhole connect`**：当对端也是一个 `wormhole client` 时，双方打洞成功后所有数据全程走端到端加密的 UDP 直连通道，服务器只用于信令（不会看到任何一个字节的隧道流量）。如果打洞失败或 P2P 通道之后中断，`wormhole connect` 会直接关闭本地监听，而不是悄悄降级到中继——connect 模式没有中继兜底路径（服务器从未为这类会话注册过隧道），所以 P2P 路径丢失就意味着连接真的断了，需要重试。
+
+`wormhole connect` 与 P2P 加速数据面底层共用的可靠 UDP 传输（`UDPMux` + `UDPStream`）采用 RFC 6298 风格的自适应重传（SRTT/RTTVAR/RTO 估算 + 按段指数退避），替代固定超时时间，在真实网络抖动和丢包下吞吐能平滑退化，不会因固定超时过短而过度重传、也不会因固定超时过长而恢复迟缓。
 
 ```bash
 # 禁用 P2P，强制所有流量走加密的中继通道
 wormhole client --local 8080 --p2p=false
+
+# 直接连接另一个 client，设计上没有中继兜底
+wormhole connect <对方子域名> --local 9090
 ```
 
 #### 流量检查器
@@ -414,6 +438,8 @@ Admin API 默认绑定 `127.0.0.1`。如需远程访问，使用 `--admin-host 0
 - [x] Phase 10（v0.5.3）：OIDC / OAuth SSO — OIDC Discovery、JWKS JWT 校验、Device Code Flow、`wormhole login`
 - [x] Phase 11（v0.6.0）：HA / 多节点控制面 — `StateStore` 接口、Redis 后端、集群心跳、跨节点 HTTP 路由
 - [x] Phase 12（v0.6.1）：可靠的连接丢失检测（`Mux.CloseNotify()` + 心跳触发强制重连）、真正生效的多隧道路由（`TunnelID` 端到端接线分发）、修复 P2P 信令帧不匹配、P2P 接收缓冲背压（带超时的阻塞交付 + 消费者卡死时 RST）、TCP 端口分配失败拒绝注册、可靠的 P2P 建流握手（SYN 重传 + SYN-ACK，此前只要一个 SYN 包在丢包环境下丢失，连接就会悄无声息地"半开"卡死）、修复 WebSocket inspector 的数据竞争
+- [x] Phase 13（v0.6.1）：端到端 SSO 可用——`wormhole login` 保存的凭证现在会被 `wormhole client` 自动加载（无需再手动 `--token`/`jq`），access token 过期后通过 `refresh_token` 静默续期（包括会话中途、断线重连场景），device flow 轮询请求补齐 `client_id`（符合 RFC 8628），`wormhole client` 未传 `--local`/`--config` 时会回退到 `~/.wormhole/wormhole.yml`
+- [x] Phase 14（v0.6.2）：P2P 数据面接入与传输优化——新增 `wormhole connect <子域名>` 命令，两个 `wormhole client` 打洞后流量全程 P2P 直连（server 只做信令，不转发一个字节）；`UDPStream` 从固定 200ms 重传升级为 RFC 6298 风格自适应 RTO + 按段指数退避；发送/接收路径降拷贝（加密直写目标 buffer、消除冗余拷贝）；删除已被 `UDPMux`/`UDPStream` 取代的 `pkg/p2p/transport.go` 旧 ARQ 实现
 
 ## 贡献
 

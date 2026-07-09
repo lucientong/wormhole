@@ -187,6 +187,11 @@ type P2POfferRequest struct {
 	LocalAddr string `json:"local_addr,omitempty"`
 	// PublicKey is the sender's ECDH X25519 public key (base64-encoded).
 	PublicKey string `json:"public_key,omitempty"`
+	// TargetSubdomain, when set, requests a P2P match against the specific
+	// client that owns this subdomain (used by `wormhole connect`). When
+	// empty, this message only registers the sender's P2P reachability
+	// info — no match is attempted.
+	TargetSubdomain string `json:"target_subdomain,omitempty"`
 }
 
 // P2POfferResponse is the server's response to a P2P offer.
@@ -201,6 +206,11 @@ type P2POfferResponse struct {
 	PeerNATType string `json:"peer_nat_type,omitempty"`
 	// PeerPublicKey is the peer's ECDH X25519 public key (base64-encoded).
 	PeerPublicKey string `json:"peer_public_key,omitempty"`
+	// PeerTunnelID is the specific tunnel ID on the peer that owns the
+	// requested TargetSubdomain, letting the initiator address outgoing
+	// P2P stream requests to the right tunnel when the peer serves more
+	// than one.
+	PeerTunnelID string `json:"peer_tunnel_id,omitempty"`
 }
 
 // P2PCandidates carries additional candidate endpoints for hole punching.
@@ -567,11 +577,12 @@ func closeResponseToProto(c *CloseResponse) *pb.CloseResponse {
 
 func p2pOfferRequestToProto(p *P2POfferRequest) *pb.P2POfferRequest {
 	return &pb.P2POfferRequest{
-		TunnelId:   p.TunnelID,
-		NatType:    p.NATType,
-		PublicAddr: p.PublicAddr,
-		LocalAddr:  p.LocalAddr,
-		PublicKey:  p.PublicKey,
+		TunnelId:        p.TunnelID,
+		NatType:         p.NATType,
+		PublicAddr:      p.PublicAddr,
+		LocalAddr:       p.LocalAddr,
+		PublicKey:       p.PublicKey,
+		TargetSubdomain: p.TargetSubdomain,
 	}
 }
 
@@ -582,6 +593,7 @@ func p2pOfferResponseToProto(p *P2POfferResponse) *pb.P2POfferResponse {
 		PeerAddr:      p.PeerAddr,
 		PeerNatType:   p.PeerNATType,
 		PeerPublicKey: p.PeerPublicKey,
+		PeerTunnelId:  p.PeerTunnelID,
 	}
 }
 
@@ -758,11 +770,12 @@ func p2pOfferRequestFromProto(p *pb.P2POfferRequest) *P2POfferRequest {
 		return nil
 	}
 	return &P2POfferRequest{
-		TunnelID:   p.TunnelId,
-		NATType:    p.NatType,
-		PublicAddr: p.PublicAddr,
-		LocalAddr:  p.LocalAddr,
-		PublicKey:  p.PublicKey,
+		TunnelID:        p.TunnelId,
+		NATType:         p.NatType,
+		PublicAddr:      p.PublicAddr,
+		LocalAddr:       p.LocalAddr,
+		PublicKey:       p.PublicKey,
+		TargetSubdomain: p.TargetSubdomain,
 	}
 }
 
@@ -776,6 +789,7 @@ func p2pOfferResponseFromProto(p *pb.P2POfferResponse) *P2POfferResponse {
 		PeerAddr:      p.PeerAddr,
 		PeerNATType:   p.PeerNatType,
 		PeerPublicKey: p.PeerPublicKey,
+		PeerTunnelID:  p.PeerTunnelId,
 	}
 }
 
@@ -950,22 +964,26 @@ func NewCloseResponse(success bool) *ControlMessage {
 	}
 }
 
-// NewP2POfferRequest creates a P2P offer request message.
-func NewP2POfferRequest(tunnelID, natType, publicAddr, localAddr, publicKey string) *ControlMessage {
+// NewP2POfferRequest creates a P2P offer request message. targetSubdomain
+// is empty for a plain reachability-info registration (the normal case for
+// a client that's only exposing a tunnel), or set to the peer's subdomain
+// when requesting an actual match (`wormhole connect`).
+func NewP2POfferRequest(tunnelID, natType, publicAddr, localAddr, publicKey, targetSubdomain string) *ControlMessage {
 	return &ControlMessage{
 		Type: MessageTypeP2POfferRequest,
 		P2POfferRequest: &P2POfferRequest{
-			TunnelID:   tunnelID,
-			NATType:    natType,
-			PublicAddr: publicAddr,
-			LocalAddr:  localAddr,
-			PublicKey:  publicKey,
+			TunnelID:        tunnelID,
+			NATType:         natType,
+			PublicAddr:      publicAddr,
+			LocalAddr:       localAddr,
+			PublicKey:       publicKey,
+			TargetSubdomain: targetSubdomain,
 		},
 	}
 }
 
 // NewP2POfferResponse creates a P2P offer response message.
-func NewP2POfferResponse(success bool, err, peerAddr, peerNATType, peerPublicKey string) *ControlMessage {
+func NewP2POfferResponse(success bool, err, peerAddr, peerNATType, peerPublicKey, peerTunnelID string) *ControlMessage {
 	return &ControlMessage{
 		Type: MessageTypeP2POfferResponse,
 		P2POfferResponse: &P2POfferResponse{
@@ -974,6 +992,7 @@ func NewP2POfferResponse(success bool, err, peerAddr, peerNATType, peerPublicKey
 			PeerAddr:      peerAddr,
 			PeerNATType:   peerNATType,
 			PeerPublicKey: peerPublicKey,
+			PeerTunnelID:  peerTunnelID,
 		},
 	}
 }

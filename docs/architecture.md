@@ -560,15 +560,21 @@ Phase 4 provides the foundational P2P primitives, and Phase 4.5 completes end-to
 | **Hole Puncher** | `pkg/p2p/hole_punch.go` | ✅ Complete — UDP probe/ack with WHPP magic prefix |
 | **Port Predictor** | `pkg/p2p/predictor.go` | ✅ Complete — Delta-based prediction for symmetric NAT |
 | **P2P Manager** | `pkg/p2p/manager.go` | ✅ Complete — Coordinates STUN + hole punch + relay fallback |
-| **Reliable UDP Transport** | `pkg/p2p/transport.go` | ✅ Complete — ARQ protocol with seq/ack, retransmission, FIN |
-| **Signaling Messages** | `pkg/proto/messages.go` | ✅ Complete — P2POfferRequest/Response, Candidates, Result |
-| **Client Integration** | `pkg/client/client.go` | ✅ Complete — NAT discovery, P2P offer, hot switch, fallback |
-| **Server Signaling** | `pkg/server/server.go` | ✅ Complete — Peer matching, NAT compatibility check |
+| **Reliable UDP Transport** | `pkg/p2p/mux.go`, `pkg/p2p/stream.go` | ✅ Complete — `UDPMux`/`UDPStream`: multiplexed ARQ with adaptive RTO (RFC 6298), sliding window, reliable SYN handshake |
+| **Signaling Messages** | `pkg/proto/messages.go` | ✅ Complete — P2POfferRequest/Response (targeted by subdomain), Candidates, Result |
+| **Client Integration** | `pkg/client/client.go`, `cmd/wormhole/cmd/connect.go` | ✅ Complete — NAT discovery, P2P offer, `wormhole connect` direct data plane |
+| **Server Signaling** | `pkg/server/server.go` | ✅ Complete — Subdomain-targeted peer matching, NAT compatibility check |
 | **Integration Tests** | `pkg/p2p/integration_test.go` | ✅ Complete — 15+ test cases |
+
+> **Note on scope (P3-3 / DP-23):** P2P only ever carries traffic between two `wormhole` processes that can both run the hole-punch protocol — i.e. `wormhole client` ↔ `wormhole connect`. A public visitor hitting your tunnel's hostname (a browser, curl, mobile app, etc.) is not running Wormhole's P2P protocol and physically cannot be hole-punched, so that traffic always goes through the Server relay; P2P for that path is not a roadmap gap, it's a hard physical constraint. Earlier versions of this document described a "hot switch" from relay to P2P for arbitrary tunnel traffic, which did not correspond to anything actually wired up end-to-end (the mux was established but no code path ever routed real HTTP/TCP tunnel bytes through it). `wormhole connect` (below) is what makes P2P carry real traffic in the one scenario where it's physically possible.
 
 ### Reliable UDP Transport Layer
 
-Production P2P data transfer is carried by `UDPMux` + `UDPStream` (`pkg/p2p/mux.go`, `pkg/p2p/stream.go`) — a custom ARQ-based reliable, ordered, multiplexed stream layer over a single UDP socket pair. (`transport.go` contains an older single-stream ARQ implementation retained only for its own tests; it is not wired into the client/server data path — see roadmap DP-16.)
+Production P2P data transfer is carried by `UDPMux` + `UDPStream` (`pkg/p2p/mux.go`, `pkg/p2p/stream.go`) — a custom ARQ-based reliable, ordered, multiplexed stream layer over a single UDP socket pair. The older single-stream `pkg/p2p/transport.go` implementation it superseded has been removed (P3-3 / DP-16); anything it covered is now exercised against `UDPMux`/`UDPStream` instead.
+
+**Adaptive retransmission (RFC 6298, P3-3 / DP-13):** instead of a fixed 200ms retransmit timeout, `UDPStream` maintains per-stream SRTT/RTTVAR estimates (`updateRTO`, gains α=1/8, β=1/4, `RTO = SRTT + 4×RTTVAR`, clamped to `[100ms, 10s]`) sampled from ACKs of segments that were **not** retransmitted (Karn's algorithm — a retransmitted segment's ACK is ambiguous about which transmission it's acking, so it's excluded from the sample to avoid skewing the estimate). Each in-flight segment additionally backs off its *own* retransmit timer exponentially (doubling per attempt, capped at 32× the base RTO) rather than sharing one global timer, so a single lossy segment doesn't inflate the timeout applied to every other segment on the stream. This lets the stream retransmit aggressively on a clean low-latency link and back off gracefully on a lossy/high-RTT one, instead of picking one fixed value that's wrong for most conditions.
+
+**Reduced copies (P3-3 / DP-14):** the send path's `SessionCipher.EncryptInto` encrypts directly into the pre-sized outbound frame buffer instead of encrypting into a scratch buffer and then copying into the frame; the receive path (`handleData`/`deliverLocked`) no longer re-copies a payload that `decryptPayload` already returned as an independently-owned buffer. Combined, this cuts the encrypted send path from 8 allocations / 5200 B per packet to 6 allocations / 2640 B (`BenchmarkMux_SendPacket`), with no throughput regression under simulated WAN conditions (`BenchmarkUDPMux_Throughput_SimulatedWAN`, 50ms RTT / 1% loss).
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -597,29 +603,44 @@ Each `UDPStream` multiplexed on the mux has an independent receive buffer (`recv
 
 **Reliable stream handshake (SYN/SYN-ACK):** `OpenStream()` registers the outbound SYN under reserved sequence `0` in the same send buffer used for data segments (real data always starts at seq `1`), so `retransmitLoop` retries the SYN exactly like any other segment until it's acknowledged or `MaxRetransmits` is exhausted. The accepting side replies with an ordinary ACK for seq `0` once the stream is admitted, and re-ACKs on a duplicate SYN (covering the case where its first SYN-ACK was itself lost). Without this, a single dropped SYN packet would leave the peer unaware of the stream forever — every subsequent data segment would be silently discarded by `dispatch()` as "unknown stream", and the accepting side would block in `AcceptStream()`/`Read()` indefinitely instead of surfacing a connection failure. When any segment (including the SYN) exhausts `MaxRetransmits`, the sender now also sends an RST before force-closing locally, so the peer learns the stream died instead of hanging.
 
-### Relay→P2P Hot Switching
+### `wormhole connect`: Client-to-Client Direct Data Plane (P3-3 / DP-23)
 
-When P2P connection succeeds, data transfer seamlessly switches from relay to direct:
+`wormhole connect <target-subdomain> --local <port>` is the scenario where P2P actually carries real application traffic end-to-end. One process runs `wormhole client` and exposes a service as usual (registering a tunnel + subdomain with the Server); a second process runs `wormhole connect <that-subdomain>` instead of `wormhole client` — it does **not** register a tunnel of its own, it only asks the Server to match it against the peer that owns the given subdomain.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                    Hot Switch Flow                        │
+│              wormhole connect data flow                   │
 │                                                           │
-│  1. Initial: Traffic via Server relay                     │
-│     Client A ──TCP──► Server ──TCP──► Client B            │
+│  1. Peer A: `wormhole client --local 8080 --subdomain a`  │
+│     registers tunnel "a" with the Server (signaling only) │
 │                                                           │
-│  2. P2P attempt succeeds                                  │
-│     Client A ◄──UDP P2P──► Client B                       │
+│  2. Peer B: `wormhole connect a --local 9090`              │
+│     sends P2POfferRequest{target_subdomain: "a"}           │
+│     Server looks up "a" via Router.LookupSubdomain(),      │
+│     returns P2POfferResponse{peer_tunnel_id: <A's tunnel>} │
 │                                                           │
-│  3. Hot switch: New streams use P2P                       │
-│     - Existing streams continue on relay                  │
-│     - New streams routed via p2pReadLoop                  │
-│     - Graceful transition, no data loss                   │
+│  3. Both sides STUN + hole-punch (same primitives as       │
+│     Phase 4/4.5); on success both have a UDPMux over a     │
+│     single UDP socket pair                                │
 │                                                           │
-│  4. Fallback: If P2P fails, automatic relay fallback      │
-│     Client A ──TCP──► Server ──TCP──► Client B            │
+│  4. Peer B listens on 127.0.0.1:9090; for every accepted   │
+│     local connection it opens a UDPStream on the mux,      │
+│     sends a StreamRequest addressed to A's peer_tunnel_id, │
+│     and proxies bytes bidirectionally — the Server never   │
+│     sees a single byte of this traffic, only the initial   │
+│     signaling messages                                     │
+│                                                           │
+│  5. No relay fallback: if the hole punch fails or the      │
+│     UDPMux later dies, `wormhole connect` closes its local │
+│     listener rather than silently degrading — there is no  │
+│     tunnel registered on the Server for this session to    │
+│     relay through                                          │
 └──────────────────────────────────────────────────────────┘
 ```
+
+Server-side, `Server.findPeerBySubdomain` (in `pkg/server/server.go`) resolves `target_subdomain` to both the owning `ClientSession` and the specific `TunnelInfo.ID` serving it (a peer may expose more than one tunnel), distinguishing "no target requested" (a normal `wormhole client` registering its own P2P reachability, silently ignored), "target not found", "target is self", and "target has no usable P2P/NAT info" as distinct `P2POfferResponse.Error` reasons.
+
+This is deliberately **not** how the normal public-visitor tunnel path works — see the scope note above.
 
 ### NAT Type Classification
 
@@ -636,11 +657,13 @@ When P2P connection succeeds, data transfer seamlessly switches from relay to di
 ```
 Attempt P2P Connection
     │
-    ├── Success → Use P2P channel for data transfer
-    │              (p2pReadLoop handles incoming data)
+    ├── Success → acceptP2PStreams() / startConnectListener()
+    │              proxy data over the UDPMux
     │
-    └── Failure → Automatic fallback to Server relay
+    └── Failure → `wormhole client`: automatic fallback to Server relay
                   (fallbackToRelay() resets P2P state)
+                  `wormhole connect`: no relay to fall back to — the
+                  command fails outright (see above)
 ```
 
 ---
@@ -1006,11 +1029,15 @@ wormhole login --issuer <url> --client-id <id>
   ├── 1. OIDC Discovery → device_authorization_endpoint, token_endpoint
   ├── 2. POST /device/auth → { device_code, user_code, verification_uri, interval }
   ├── 3. Print: "Open <url> and enter code: XXXX-YYYY"
-  ├── 4. Poll token endpoint every <interval> seconds
-  └── 5. On success: SaveCredentials(~/.wormhole/credentials.json, server, token, expiry)
+  ├── 4. Poll token endpoint every <interval> seconds (request body includes
+  │       client_id per RFC 8628 §3.4, required by strict IdPs like Keycloak)
+  └── 5. On success: SaveCredentialsFull(~/.wormhole/credentials.json, {
+            token, expires_at (parsed from the JWT's own `exp` claim,
+            falling back to expires_in), refresh_token, oidc_issuer,
+            client_id, token_endpoint })
 ```
 
-Saved tokens are automatically used by `wormhole client --server <url>`.
+**End-to-end usage (no manual token handling required):** `wormhole client` (via `resolveClientCredentials` in `cmd/wormhole/cmd/client.go`) automatically loads the saved credentials for `--server` when `--token` isn't explicitly given. If the saved token is expired but the credentials carry enough material to refresh (`Credentials.CanRefresh()`: `refresh_token` + `client_id` + `token_endpoint`), it's silently renewed via the OAuth2 `refresh_token` grant (`auth.RefreshAccessToken`) and the renewed credentials are persisted back to disk — no re-running `wormhole login`. The same refresh path is also wired as `Config.OnAuthFailure`, so a token that expires *mid-session* (e.g. across a reconnect triggered by `Mux.CloseNotify()`) is refreshed and retried automatically by `authenticateWithRefresh()` instead of failing the connection.
 
 ### Rate Limiting
 

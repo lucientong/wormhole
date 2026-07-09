@@ -998,10 +998,28 @@ func (s *Server) releaseTunnelResources(client *ClientSession, removed *TunnelIn
 	}
 }
 
+// P2P offer rejection reasons. errP2PNoTarget is the expected, silent
+// outcome for a client that's only exposing a tunnel and never asked to
+// reach a peer (TargetSubdomain == "") — the client treats it as a no-op
+// rather than a P2P failure worth falling back from (see
+// Client.handleP2POfferResponse).
+const (
+	errP2PNoTarget         = "no target specified"
+	errP2PTargetNotFound   = "target not found: no client with that subdomain is currently connected"
+	errP2PTargetIsSelf     = "cannot connect to your own tunnel via P2P"
+	errP2PNATIncompatible  = "NAT types not compatible"
+	errP2PTargetTunnelMeta = "target tunnel metadata unavailable"
+)
+
 // handleP2POffer handles a P2P connection offer from a client.
-// It stores the client's P2P info and returns the peer's info if available.
+//
+// It always stores the sender's P2P reachability info (public/local
+// address, NAT type, ECDH public key) so it's available if some other
+// client later requests a match against one of this client's subdomains.
+// A match is only searched for when req.TargetSubdomain is set (i.e. this
+// is a `wormhole connect <subdomain>` request) — an empty target is just
+// presence registration and gets a quiet errP2PNoTarget response.
 func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, req *proto.P2POfferRequest) {
-	// Store client's P2P info (including ECDH public key).
 	client.mu.Lock()
 	client.P2PPublicAddr = req.PublicAddr
 	client.P2PNATType = req.NATType
@@ -1016,15 +1034,23 @@ func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, re
 		Str("public_addr", req.PublicAddr).
 		Str("local_addr", req.LocalAddr).
 		Bool("has_public_key", req.PublicKey != "").
+		Str("target_subdomain", req.TargetSubdomain).
 		Msg("P2P offer received")
 
-	// Try to find a peer that can establish P2P connection.
-	peer := s.FindPeerForP2P(client.ID)
-	if peer == nil {
-		resp := proto.NewP2POfferResponse(false, "no peer available for P2P", "", "", "")
+	if req.TargetSubdomain == "" {
+		resp := proto.NewP2POfferResponse(false, errP2PNoTarget, "", "", "", "")
 		if err := proto.WriteControlMessage(stream, resp); err != nil {
 			log.Error().Err(err).Msg("Failed to write P2P offer response")
 		}
+		return
+	}
+
+	peer, peerTunnelID, findErr := s.findPeerBySubdomain(req.TargetSubdomain, client)
+	if findErr != "" {
+		log.Info().Str("client", client.ID).Str("target", req.TargetSubdomain).Str("reason", findErr).
+			Msg("P2P connect request could not be matched")
+		resp := proto.NewP2POfferResponse(false, findErr, "", "", "", "")
+		_ = proto.WriteControlMessage(stream, resp)
 		return
 	}
 
@@ -1034,22 +1060,22 @@ func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, re
 			Str("client_nat", req.NATType).
 			Str("peer_nat", peer.P2PNATType).
 			Msg("NAT types not compatible for P2P")
-		resp := proto.NewP2POfferResponse(false, "NAT types not compatible", "", "", "")
+		resp := proto.NewP2POfferResponse(false, errP2PNATIncompatible, "", "", "", "")
 		_ = proto.WriteControlMessage(stream, resp)
 		return
 	}
 
-	// Found a compatible peer! Return peer info to initiator.
+	// Found the target! Return peer info to initiator.
 	peer.mu.Lock()
 	peerAddr := peer.P2PPublicAddr
 	peerNATType := peer.P2PNATType
 	peerPublicKey := peer.P2PPublicKey
-	peerTunnelID := peer.P2PTunnelID
 	peer.mu.Unlock()
 
 	log.Info().
 		Str("client", client.ID).
 		Str("peer", peer.ID).
+		Str("target_subdomain", req.TargetSubdomain).
 		Str("peer_addr", peerAddr).
 		Str("client_nat", req.NATType).
 		Str("peer_nat", peerNATType).
@@ -1086,7 +1112,7 @@ func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, re
 	}
 
 	// Send peer info (including ECDH public key) to initiating client.
-	resp := proto.NewP2POfferResponse(true, "", peerAddr, peerNATType, peerPublicKey)
+	resp := proto.NewP2POfferResponse(true, "", peerAddr, peerNATType, peerPublicKey, peerTunnelID)
 	if err := proto.WriteControlMessage(stream, resp); err != nil {
 		log.Error().Err(err).Msg("Failed to write P2P offer response")
 		return
@@ -1187,7 +1213,10 @@ func (s *Server) notifyPeerOfP2P(peer *ClientSession, initiator *ClientSession) 
 	}
 
 	// Send P2P offer response (as a notification) with the initiator's info and public key.
-	msg := proto.NewP2POfferResponse(true, "", initiatorAddr, initiatorNATType, initiatorPublicKey)
+	// PeerTunnelID is only meaningful for the initiator (addressing outgoing
+	// streams to a specific tunnel on the target); the notified side accepts
+	// P2P streams generically, so it's left empty here.
+	msg := proto.NewP2POfferResponse(true, "", initiatorAddr, initiatorNATType, initiatorPublicKey, "")
 	if err := proto.WriteControlMessage(stream, msg); err != nil {
 		log.Error().Err(err).Str("peer", peer.ID).Msg("Failed to write P2P notification")
 		return
@@ -1244,28 +1273,32 @@ func natPriority(natType string) int {
 	}
 }
 
-// FindPeerForP2P looks up the best peer client for P2P connection with the
-// given initiator.  Candidates are ranked by NAT traversal friendliness:
-// Full Cone > Restricted Cone > Port Restricted > Symmetric.
-// Returns nil if no suitable peer is found.
-func (s *Server) FindPeerForP2P(excludeClientID string) *ClientSession {
-	s.clientLock.RLock()
-	defer s.clientLock.RUnlock()
+// findPeerBySubdomain looks up the client session that owns targetSubdomain
+// (via the router, which is kept in sync with tunnel registration/teardown)
+// and the specific TunnelInfo.ID serving it, for a `wormhole connect`
+// request from initiator. Returns a non-empty reason string instead of an
+// error when no match can be made, suitable for direct use as the
+// P2POfferResponse.Error field.
+func (s *Server) findPeerBySubdomain(targetSubdomain string, initiator *ClientSession) (peer *ClientSession, tunnelID string, reason string) {
+	peer = s.router.LookupSubdomain(targetSubdomain)
+	if peer == nil {
+		return nil, "", errP2PTargetNotFound
+	}
+	if peer == initiator {
+		return nil, "", errP2PTargetIsSelf
+	}
 
-	var best *ClientSession
-	bestScore := -1
-
-	for _, client := range s.clients {
-		if client.ID == excludeClientID || client.P2PPublicAddr == "" {
-			continue
-		}
-		score := natPriority(client.P2PNATType)
-		if score > bestScore {
-			bestScore = score
-			best = client
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+	if peer.P2PPublicAddr == "" {
+		return nil, "", errP2PTargetNotFound
+	}
+	for _, t := range peer.Tunnels {
+		if t.Subdomain == targetSubdomain {
+			return peer, t.ID, ""
 		}
 	}
-	return best
+	return nil, "", errP2PTargetTunnelMeta
 }
 
 // serveHTTP serves HTTP requests using the new HTTPHandler.

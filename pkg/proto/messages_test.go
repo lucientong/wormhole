@@ -193,7 +193,7 @@ func TestNewCloseResponse_Failure(t *testing.T) {
 }
 
 func TestNewP2POfferRequest(t *testing.T) {
-	msg := NewP2POfferRequest("tunnel-1", "Full Cone", "1.2.3.4:5000", "192.168.1.1:5000", "cHViS2V5")
+	msg := NewP2POfferRequest("tunnel-1", "Full Cone", "1.2.3.4:5000", "192.168.1.1:5000", "cHViS2V5", "myapp")
 	assert.Equal(t, MessageTypeP2POfferRequest, msg.Type)
 	require.NotNil(t, msg.P2POfferRequest)
 	assert.Equal(t, "tunnel-1", msg.P2POfferRequest.TunnelID)
@@ -201,10 +201,11 @@ func TestNewP2POfferRequest(t *testing.T) {
 	assert.Equal(t, "1.2.3.4:5000", msg.P2POfferRequest.PublicAddr)
 	assert.Equal(t, "192.168.1.1:5000", msg.P2POfferRequest.LocalAddr)
 	assert.Equal(t, "cHViS2V5", msg.P2POfferRequest.PublicKey)
+	assert.Equal(t, "myapp", msg.P2POfferRequest.TargetSubdomain)
 }
 
 func TestNewP2POfferResponse(t *testing.T) {
-	msg := NewP2POfferResponse(true, "", "5.6.7.8:6000", "Restricted Cone", "cGVlcktleQ==")
+	msg := NewP2POfferResponse(true, "", "5.6.7.8:6000", "Restricted Cone", "cGVlcktleQ==", "tunnel-2")
 	assert.Equal(t, MessageTypeP2POfferResponse, msg.Type)
 	require.NotNil(t, msg.P2POfferResponse)
 	assert.True(t, msg.P2POfferResponse.Success)
@@ -212,10 +213,11 @@ func TestNewP2POfferResponse(t *testing.T) {
 	assert.Equal(t, "5.6.7.8:6000", msg.P2POfferResponse.PeerAddr)
 	assert.Equal(t, "Restricted Cone", msg.P2POfferResponse.PeerNATType)
 	assert.Equal(t, "cGVlcktleQ==", msg.P2POfferResponse.PeerPublicKey)
+	assert.Equal(t, "tunnel-2", msg.P2POfferResponse.PeerTunnelID)
 }
 
 func TestNewP2POfferResponse_Error(t *testing.T) {
-	msg := NewP2POfferResponse(false, "no peer found", "", "", "")
+	msg := NewP2POfferResponse(false, "no peer found", "", "", "", "")
 	require.NotNil(t, msg.P2POfferResponse)
 	assert.False(t, msg.P2POfferResponse.Success)
 	assert.Equal(t, "no peer found", msg.P2POfferResponse.Error)
@@ -320,7 +322,7 @@ func TestRoundTrip_CloseRequest(t *testing.T) {
 }
 
 func TestRoundTrip_P2POfferRequest(t *testing.T) {
-	original := NewP2POfferRequest("t-1", "Full Cone", "1.2.3.4:5000", "192.168.1.1:5000", "key123")
+	original := NewP2POfferRequest("t-1", "Full Cone", "1.2.3.4:5000", "192.168.1.1:5000", "key123", "myapp")
 	data, err := original.Encode()
 	require.NoError(t, err)
 
@@ -330,6 +332,7 @@ func TestRoundTrip_P2POfferRequest(t *testing.T) {
 	require.NotNil(t, decoded.P2POfferRequest)
 	assert.Equal(t, "Full Cone", decoded.P2POfferRequest.NATType)
 	assert.Equal(t, "key123", decoded.P2POfferRequest.PublicKey)
+	assert.Equal(t, "myapp", decoded.P2POfferRequest.TargetSubdomain)
 }
 
 func TestRoundTrip_P2PResult(t *testing.T) {
@@ -445,8 +448,8 @@ func TestWriteReadControlMessage_RoundTrip(t *testing.T) {
 		NewStreamResponse("r-1", true, ""),
 		NewCloseRequest("t-1", "shutdown"),
 		NewCloseResponse(true),
-		NewP2POfferRequest("t-1", "Full Cone", "1.2.3.4:5000", "192.168.1.1:5000", "pubkey"),
-		NewP2POfferResponse(true, "", "5.6.7.8:6000", "Restricted", "peerkey"),
+		NewP2POfferRequest("t-1", "Full Cone", "1.2.3.4:5000", "192.168.1.1:5000", "pubkey", "myapp"),
+		NewP2POfferResponse(true, "", "5.6.7.8:6000", "Restricted", "peerkey", "t-2"),
 		NewP2PCandidates("t-1", []string{"1.1.1.1:100", "2.2.2.2:200"}),
 		NewP2PResult("t-1", true, "1.2.3.4:5000", ""),
 	}

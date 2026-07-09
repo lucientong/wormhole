@@ -204,24 +204,33 @@ func (m *UDPMux) RemoteAddr() net.Addr { return m.peerAddr }
 
 // sendPacket constructs and sends a mux frame.
 // payload is encrypted if a cipher is configured.
+//
+// DP-14: the frame buffer is pre-sized for header + (encrypted) payload
+// up front, and the header is written directly into it; encryption (when
+// enabled) then appends its output straight into the same buffer via
+// EncryptInto instead of encrypting into a standalone buffer that then
+// gets copied into the frame — avoiding an extra allocation+copy on every
+// send.
 func (m *UDPMux) sendPacket(streamID uint32, pktType byte, seq uint32, payload []byte) error {
-	// Encrypt payload if cipher configured.
-	encPayload := payload
+	capacity := muxHeaderSize + len(payload)
 	if m.cipher != nil && len(payload) > 0 {
-		var err error
-		encPayload, err = m.cipher.Encrypt(payload)
-		if err != nil {
-			return fmt.Errorf("encrypt: %w", err)
-		}
+		capacity += m.cipher.Overhead()
 	}
-
-	// Build frame: [StreamID(4)][Type(1)][Seq(4)][Payload...]
-	frame := make([]byte, muxHeaderSize+len(encPayload))
+	frame := make([]byte, muxHeaderSize, capacity)
 	binary.BigEndian.PutUint32(frame[0:4], streamID)
 	frame[4] = pktType
 	binary.BigEndian.PutUint32(frame[5:9], seq)
-	if len(encPayload) > 0 {
-		copy(frame[9:], encPayload)
+
+	if len(payload) > 0 {
+		if m.cipher != nil {
+			var err error
+			frame, err = m.cipher.EncryptInto(frame, payload)
+			if err != nil {
+				return fmt.Errorf("encrypt: %w", err)
+			}
+		} else {
+			frame = append(frame, payload...)
+		}
 	}
 
 	_, err := m.conn.WriteTo(frame, m.peerAddr)

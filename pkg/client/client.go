@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -236,6 +238,13 @@ func (c *Client) connect(ctx context.Context) error {
 			_ = conn.Close()
 			return fmt.Errorf("authenticate: %w", err)
 		}
+	}
+
+	// "Connect" mode (`wormhole connect <target>`) doesn't expose a tunnel
+	// of its own — it only needs the control connection to exchange P2P
+	// signaling with the server, so tunnel registration is skipped entirely.
+	if c.config.ConnectTarget != "" {
+		return nil
 	}
 
 	// Register tunnel(s).
@@ -1136,6 +1145,7 @@ func (c *Client) sendP2POffer(ctx context.Context) {
 		natInfo.PublicAddr.String(),
 		natInfo.LocalAddr.String(),
 		pubKeyB64,
+		c.config.ConnectTarget,
 	)
 	data, err := req.Encode()
 	if err != nil {
@@ -1193,9 +1203,17 @@ func readP2POfferResponse(stream io.Reader) (*proto.P2POfferResponse, []string, 
 // returned) and kicks off hole punching, or logs the relay-mode fallback.
 func (c *Client) handleP2POfferResponse(ctx context.Context, resp *proto.P2POfferResponse, candidates []string) {
 	if !resp.Success || resp.PeerAddr == "" {
-		log.Debug().
-			Str("reason", resp.Error).
-			Msg("P2P offer: no peer available, staying in relay mode")
+		// errP2PNoTarget is the expected, silent outcome for an "expose"
+		// mode client (ConnectTarget == ""): it only registered its P2P
+		// reachability info and never asked to reach a peer, so this isn't
+		// a failure worth surfacing.
+		if c.config.ConnectTarget == "" {
+			log.Debug().Str("reason", resp.Error).Msg("P2P offer: no peer available, staying in relay mode")
+			return
+		}
+		fmt.Printf("  ❌ wormhole connect: %s (target %q)\n", resp.Error, c.config.ConnectTarget)
+		log.Error().Str("target", c.config.ConnectTarget).Str("reason", resp.Error).
+			Msg("wormhole connect: failed to match target peer")
 		return
 	}
 
@@ -1214,7 +1232,7 @@ func (c *Client) handleP2POfferResponse(ctx context.Context, resp *proto.P2POffe
 		Msg("P2P peer found, attempting connection")
 
 	// Offer sender is the initiator for stream-ID allocation.
-	go c.attemptP2P(ctx, resp.PeerAddr, true)
+	go c.attemptP2P(ctx, resp.PeerAddr, resp.PeerTunnelID, true)
 }
 
 // deriveP2PCipher derives the E2E session cipher from the peer's public key.
@@ -1248,7 +1266,9 @@ func (c *Client) deriveP2PCipher(peerPubKeyB64 string) error {
 // attemptP2P attempts to establish a P2P connection with the given peer address.
 // isInitiator must be true on exactly one side; the other side passes false.
 // The initiator allocates odd stream IDs; the acceptor uses even IDs.
-func (c *Client) attemptP2P(ctx context.Context, peerAddr string, isInitiator bool) {
+// peerTunnelID is the peer's tunnel ID to address outgoing stream requests
+// to in "connect" mode (see startConnectListener); it's ignored otherwise.
+func (c *Client) attemptP2P(ctx context.Context, peerAddr, peerTunnelID string, isInitiator bool) {
 	// Parse peer endpoint.
 	peerEndpoint, err := c.parseEndpoint(peerAddr)
 	if err != nil {
@@ -1310,6 +1330,13 @@ func (c *Client) attemptP2P(ctx context.Context, peerAddr string, isInitiator bo
 	} else {
 		fmt.Printf("  🎉 P2P Mode: Direct connection to %s\n", peerAddrStr)
 	}
+
+	// "Connect" mode: we're the initiator reaching a specific peer tunnel,
+	// so also open a local listener that proxies each accepted connection
+	// to the peer over this P2P mux (see startConnectListener).
+	if isInitiator && c.config.ConnectTarget != "" {
+		go c.startConnectListener(ctx, mux, peerTunnelID, p2pCloseCh)
+	}
 }
 
 // acceptP2PStreams accepts incoming multiplexed P2P streams and proxies each
@@ -1361,6 +1388,103 @@ func (c *Client) acceptP2PStreams(ctx context.Context, mux *p2p.UDPMux, closeCh 
 			c.forwardToLocal(ctx, s, msg.StreamRequest)
 		}(stream)
 	}
+}
+
+// startConnectListener implements the client side of `wormhole connect`: it
+// opens a local TCP listener on Config.LocalHost:LocalPort and, for every
+// accepted connection, proxies it over the P2P mux directly to the peer's
+// tunnel identified by peerTunnelID — completely bypassing the server
+// relay for the actual traffic (the server was only used for signaling).
+// There is intentionally no relay fallback here: connect mode only makes
+// sense when a direct P2P path to the peer exists, so a lost P2P mux closes
+// the listener rather than silently falling back to a relay path the
+// server has no way to support for an unregistered connect-mode session.
+func (c *Client) startConnectListener(ctx context.Context, mux *p2p.UDPMux, peerTunnelID string, closeCh chan struct{}) {
+	host := c.config.LocalHost
+	if host == "" {
+		host = defaultLocalHost
+	}
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", c.config.LocalPort))
+
+	lc := net.ListenConfig{}
+	ln, err := lc.Listen(ctx, protocolTCP, addr)
+	if err != nil {
+		log.Error().Err(err).Str("addr", addr).Msg("wormhole connect: failed to open local listener")
+		fmt.Printf("  ❌ wormhole connect: failed to listen on %s: %v\n", addr, err)
+		return
+	}
+	defer ln.Close()
+
+	fmt.Printf("  🔗 wormhole connect: forwarding %s -> peer tunnel %s (direct P2P)\n", addr, peerTunnelID)
+	log.Info().Str("addr", addr).Str("peer_tunnel_id", peerTunnelID).Msg("wormhole connect: listening for local connections")
+
+	go func() {
+		select {
+		case <-closeCh:
+		case <-c.closeCh:
+		case <-ctx.Done():
+		}
+		_ = ln.Close()
+	}()
+
+	for {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			return
+		}
+		go c.proxyConnectConn(ctx, mux, conn, peerTunnelID)
+	}
+}
+
+// proxyConnectConn opens one P2P stream per accepted local connection,
+// sends a StreamRequest addressed to the peer's tunnel (mirroring what the
+// server does for a relay-mode TCP tunnel, see Server.handleTCPConnection),
+// and proxies bytes bidirectionally until either side closes.
+func (c *Client) proxyConnectConn(_ context.Context, mux *p2p.UDPMux, localConn net.Conn, peerTunnelID string) {
+	defer localConn.Close()
+
+	stream, err := mux.OpenStream()
+	if err != nil {
+		log.Error().Err(err).Msg("wormhole connect: failed to open P2P stream")
+		return
+	}
+	defer stream.Close()
+
+	streamReq := proto.NewStreamRequest(peerTunnelID, generateRequestID(), localConn.RemoteAddr().String(), proto.ProtocolTCP)
+	if writeErr := proto.WriteControlMessage(stream, streamReq); writeErr != nil {
+		log.Error().Err(writeErr).Msg("wormhole connect: failed to send stream request")
+		return
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		n, _ := io.Copy(stream, localConn)
+		if n > 0 {
+			atomic.AddUint64(&c.stats.BytesOut, uint64(n)) // #nosec G115
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		n, _ := io.Copy(localConn, stream)
+		if n > 0 {
+			atomic.AddUint64(&c.stats.BytesIn, uint64(n))
+		}
+	}()
+
+	wg.Wait()
+	atomic.AddUint64(&c.stats.Requests, 1)
+}
+
+// generateRequestID returns a random hex identifier for a StreamRequest
+// originated by this client (only used in "connect" mode — normally the
+// server originates StreamRequests and assigns the RequestID itself).
+func generateRequestID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 // parseEndpoint parses a string address into a p2p.Endpoint.
@@ -1463,8 +1587,9 @@ func (c *Client) handleP2PNotification(ctx context.Context, resp *proto.P2POffer
 		}
 	}
 
-	// Notified side is the acceptor for stream-ID allocation.
-	go c.attemptP2P(ctx, resp.PeerAddr, false)
+	// Notified side is the acceptor for stream-ID allocation; it never
+	// initiates outgoing connect-mode streams, so peerTunnelID is unused.
+	go c.attemptP2P(ctx, resp.PeerAddr, "", false)
 }
 
 // fallbackToRelay switches from P2P back to relay mode.

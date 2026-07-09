@@ -102,6 +102,16 @@ func DeriveSession(localPriv *ecdh.PrivateKey, remotePubBytes []byte) (*SessionC
 // Encrypt encrypts plaintext using AES-256-GCM with a unique nonce.
 // The output format is: [8-byte nonce counter][GCM ciphertext+tag].
 func (sc *SessionCipher) Encrypt(plaintext []byte) ([]byte, error) {
+	return sc.EncryptInto(nil, plaintext)
+}
+
+// EncryptInto behaves like Encrypt but appends its output — [8-byte nonce
+// counter][GCM ciphertext+tag] — to dst and returns the extended slice,
+// following the same convention as cipher.AEAD.Seal. This lets a caller
+// that's assembling a larger buffer (e.g. UDPMux.sendPacket prepending a
+// wire header) avoid the extra allocation+copy of first encrypting into a
+// standalone buffer and then copying that into the final one (DP-14).
+func (sc *SessionCipher) EncryptInto(dst, plaintext []byte) ([]byte, error) {
 	// Increment nonce counter atomically.
 	counter := atomic.AddUint64(&sc.sendNonce, 1)
 
@@ -110,16 +120,15 @@ func (sc *SessionCipher) Encrypt(plaintext []byte) ([]byte, error) {
 	// atomic counter that is unique per Encrypt call.
 	nonce := buildNonce(sc.aead.NonceSize(), counter)
 
-	// Encrypt: nonce is prepended as an 8-byte counter prefix so receiver
-	// can reconstruct it.
-	ciphertext := sc.aead.Seal(nil, nonce, plaintext, nil) // #nosec G407 -- nonce is derived from atomic counter, not hardcoded
+	// Reserve space for the 8-byte counter prefix so the receiver can
+	// reconstruct the nonce, then let Seal append the ciphertext+tag
+	// directly after it — straight into dst's backing array, no
+	// intermediate ciphertext buffer.
+	start := len(dst)
+	dst = append(dst, 0, 0, 0, 0, 0, 0, 0, 0)
+	binary.BigEndian.PutUint64(dst[start:start+8], counter)
 
-	// Output: [8-byte counter][ciphertext+tag].
-	out := make([]byte, 8+len(ciphertext))
-	binary.BigEndian.PutUint64(out[:8], counter)
-	copy(out[8:], ciphertext)
-
-	return out, nil
+	return sc.aead.Seal(dst, nonce, plaintext, nil), nil // #nosec G407 -- nonce is derived from atomic counter, not hardcoded
 }
 
 // Decrypt decrypts data produced by Encrypt.
