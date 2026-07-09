@@ -3,6 +3,7 @@ package client
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"gopkg.in/yaml.v3"
 )
@@ -74,6 +75,18 @@ type FileTunnelDef struct {
 
 	// PathPrefix is a path-based routing prefix.
 	PathPrefix string `yaml:"path_prefix"`
+}
+
+// DefaultTunnelConfigPath returns the conventional location for a
+// multi-tunnel YAML config file (~/.wormhole/wormhole.yml), mirroring the
+// default-config-discovery convention used by tools like ngrok/frp. Returns
+// "" if the home directory can't be determined.
+func DefaultTunnelConfigPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ConfigDirName, "wormhole.yml")
 }
 
 // LoadFileConfig reads and parses a YAML configuration file.

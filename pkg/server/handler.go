@@ -240,23 +240,46 @@ func (h *HTTPHandler) resolveTunnelID(client *ClientSession, host, path string) 
 		host = host[:idx]
 	}
 
+	if id := matchTunnelByHostname(tunnels, host); id != "" {
+		return id
+	}
+	if id := matchTunnelBySubdomain(tunnels, host, h.server.config.Domain); id != "" {
+		return id
+	}
+	return matchTunnelByPathPrefix(tunnels, path)
+}
+
+// matchTunnelByHostname returns the ID of the tunnel whose custom Hostname
+// exactly matches host, or "" if none match.
+func matchTunnelByHostname(tunnels []*TunnelInfo, host string) string {
 	for _, t := range tunnels {
 		if t.Hostname != "" && strings.EqualFold(t.Hostname, host) {
 			return t.ID
 		}
 	}
+	return ""
+}
 
-	domain := strings.ToLower(h.server.config.Domain)
-	suffix := "." + domain
-	if strings.HasSuffix(host, suffix) {
-		sub := host[:len(host)-len(suffix)]
-		for _, t := range tunnels {
-			if t.Subdomain != "" && strings.EqualFold(t.Subdomain, sub) {
-				return t.ID
-			}
+// matchTunnelBySubdomain returns the ID of the tunnel whose Subdomain
+// matches the label of host under domain, or "" if host isn't a subdomain
+// of domain or no tunnel claims that label.
+func matchTunnelBySubdomain(tunnels []*TunnelInfo, host, domain string) string {
+	suffix := "." + strings.ToLower(domain)
+	if !strings.HasSuffix(host, suffix) {
+		return ""
+	}
+	sub := host[:len(host)-len(suffix)]
+	for _, t := range tunnels {
+		if t.Subdomain != "" && strings.EqualFold(t.Subdomain, sub) {
+			return t.ID
 		}
 	}
+	return ""
+}
 
+// matchTunnelByPathPrefix returns the ID of the tunnel with the longest
+// PathPrefix that prefixes path, or "" if no tunnel has a matching prefix.
+func matchTunnelByPathPrefix(tunnels []*TunnelInfo, path string) string {
 	normPath := normalizePath(path)
 	var best *TunnelInfo
 	bestLen := 0
@@ -273,7 +296,6 @@ func (h *HTTPHandler) resolveTunnelID(client *ClientSession, host, path string) 
 	if best != nil {
 		return best.ID
 	}
-
 	return ""
 }
 

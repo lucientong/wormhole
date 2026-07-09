@@ -5,7 +5,9 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"github.com/lucientong/wormhole/pkg/auth"
 	"github.com/lucientong/wormhole/pkg/client"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
@@ -74,21 +76,32 @@ func init() {
 	clientCmd.Flags().StringVar(&clientPathPrefix, "path-prefix", "", "Path-based routing prefix")
 	clientCmd.Flags().StringVarP(&clientConfigFile, "config", "c", "", "Path to YAML config file (enables multi-tunnel mode)")
 	clientCmd.Flags().IntVar(&clientCtrlPort, "ctrl-port", 0, "Local control server port for 'wormhole tunnels list' (0 = disabled)")
-	// --local is required only in single-tunnel mode (not with --config).
-	clientCmd.MarkFlagsOneRequired("local", "config")
+	// Note: --local/--config requiredness is validated manually in runClient
+	// (not via MarkFlagsOneRequired) so that neither flag being set can fall
+	// through to default tunnel-config-file discovery (U3) before erroring.
 }
 
 func runClient(cmd *cobra.Command, _ []string) {
-	if clientConfigFile != "" {
-		runClientFromConfig(clientConfigFile, clientCtrlPort)
+	cfgFile := clientConfigFile
+	if cfgFile == "" && !cmd.Flags().Changed("local") {
+		if defaultPath := client.DefaultTunnelConfigPath(); defaultPath != "" {
+			if _, err := os.Stat(defaultPath); err == nil {
+				log.Info().Str("path", defaultPath).Msg("No --local/--config given; using default tunnel config file")
+				cfgFile = defaultPath
+			}
+		}
+	}
+
+	if cfgFile != "" {
+		runClientFromConfig(cfgFile, clientCtrlPort)
 		return
 	}
-	// --local is required when not using --config.
+	// --local is required when not using --config and no default config file exists.
 	if !cmd.Flags().Changed("local") {
-		log.Fatal().Msg("required flag(s) \"local\" not set (or use --config for multi-tunnel mode)")
+		log.Fatal().Msg("required flag(s) \"local\" not set (or use --config for multi-tunnel mode, or create ~/.wormhole/wormhole.yml)")
 	}
 	startClient(clientLocalPort, clientServer, clientLocalHost, clientSubdomain,
-		clientToken, clientInspectorPort, clientInspectorHost, clientP2PEnabled, clientTLS, clientTLSInsecure, clientTLSCA,
+		clientToken, cmd.Flags().Changed("token"), clientInspectorPort, clientInspectorHost, clientP2PEnabled, clientTLS, clientTLSInsecure, clientTLSCA,
 		clientProtocol, clientHostname, clientPathPrefix, clientCtrlPort)
 }
 
@@ -103,6 +116,7 @@ func runClientFromConfig(cfgPath string, ctrlPort int) {
 	if ctrlPort > 0 {
 		cfg.CtrlPort = ctrlPort
 	}
+	resolveClientCredentials(&cfg, fc.Token != "")
 
 	c := client.NewClient(cfg)
 
@@ -146,7 +160,7 @@ func runClientFromConfig(cfgPath string, ctrlPort int) {
 
 // startClient creates and starts a Wormhole client with the given parameters.
 // It is shared by both the client subcommand and the root quick-mode handler.
-func startClient(localPort int, serverAddr, localHost, subdomain, token string, inspectorPort int, inspectorHost string, p2pEnabled, tlsEnabled, tlsInsecure bool, tlsCA, protocol, hostname, pathPrefix string, ctrlPort int) {
+func startClient(localPort int, serverAddr, localHost, subdomain, token string, tokenExplicitlySet bool, inspectorPort int, inspectorHost string, p2pEnabled, tlsEnabled, tlsInsecure bool, tlsCA, protocol, hostname, pathPrefix string, ctrlPort int) {
 	config := client.DefaultConfig()
 	config.ServerAddr = serverAddr
 	config.LocalPort = localPort
@@ -163,6 +177,7 @@ func startClient(localPort int, serverAddr, localHost, subdomain, token string, 
 	config.Hostname = hostname
 	config.PathPrefix = pathPrefix
 	config.CtrlPort = ctrlPort
+	resolveClientCredentials(&config, tokenExplicitlySet)
 
 	c := client.NewClient(config)
 
@@ -197,4 +212,83 @@ func startClient(localPort int, serverAddr, localHost, subdomain, token string, 
 	cancel()
 	// Graceful shutdown: send CloseRequest to server before exiting.
 	_ = c.Close()
+}
+
+// resolveClientCredentials loads saved OIDC credentials for cfg.ServerAddr
+// when no --token was explicitly given (and the YAML config didn't set one
+// either), transparently refreshing an expired access token if a
+// refresh_token is available (S5, O1-O4). It also wires cfg.OnAuthFailure so
+// a token that expires mid-session or across a reconnect is refreshed
+// automatically without requiring the user to run `wormhole login` again.
+func resolveClientCredentials(cfg *client.Config, tokenExplicitlySet bool) {
+	if tokenExplicitlySet || cfg.Token != "" {
+		// Explicit --token, or a token already set from a YAML config file,
+		// takes precedence over saved login credentials.
+		return
+	}
+
+	creds, err := auth.LoadCredentials("", cfg.ServerAddr)
+	if err == nil {
+		if !creds.IsExpired() {
+			cfg.Token = creds.Token
+			log.Info().Str("server", cfg.ServerAddr).Msg("Loaded saved credentials from wormhole login")
+		} else if refreshed := refreshSavedCredentials(context.Background(), creds); refreshed != nil {
+			cfg.Token = refreshed.Token
+		} else {
+			log.Warn().Str("server", cfg.ServerAddr).
+				Msg("Saved credentials expired and could not be refreshed; run 'wormhole login' again")
+		}
+	}
+
+	// Wire automatic refresh for tokens that expire mid-session or across a
+	// reconnect, regardless of whether the initial load above succeeded
+	// (credentials may be created later via `wormhole login` while this
+	// client keeps running).
+	cfg.OnAuthFailure = func(ctx context.Context) (string, bool) {
+		latest, loadErr := auth.LoadCredentials("", cfg.ServerAddr)
+		if loadErr != nil {
+			return "", false
+		}
+		refreshed := refreshSavedCredentials(ctx, latest)
+		if refreshed == nil {
+			return "", false
+		}
+		return refreshed.Token, true
+	}
+}
+
+// refreshSavedCredentials attempts an OAuth2 refresh_token grant for creds
+// and, on success, persists the renewed credentials to disk. Returns nil if
+// creds can't be refreshed or the refresh request fails.
+func refreshSavedCredentials(ctx context.Context, creds *auth.Credentials) *auth.Credentials {
+	if !creds.CanRefresh() {
+		return nil
+	}
+
+	result, err := auth.RefreshAccessToken(ctx, creds.TokenEndpoint, creds.ClientID, creds.RefreshToken)
+	if err != nil {
+		log.Warn().Err(err).Str("server", creds.Server).Msg("Failed to refresh access token")
+		return nil
+	}
+
+	token := result.Token()
+	expiresAt := auth.ParseJWTExpiry(token)
+	if expiresAt.IsZero() && result.ExpiresIn > 0 {
+		expiresAt = time.Now().Add(time.Duration(result.ExpiresIn) * time.Second)
+	}
+
+	updated := auth.Credentials{
+		Server:        creds.Server,
+		Token:         token,
+		ExpiresAt:     expiresAt,
+		RefreshToken:  result.RefreshToken,
+		OIDCIssuer:    creds.OIDCIssuer,
+		ClientID:      creds.ClientID,
+		TokenEndpoint: creds.TokenEndpoint,
+	}
+	if saveErr := auth.SaveCredentialsFull("", updated); saveErr != nil {
+		log.Warn().Err(saveErr).Msg("Failed to persist refreshed credentials")
+	}
+	log.Info().Str("server", creds.Server).Msg("Refreshed access token using saved refresh token")
+	return &updated
 }

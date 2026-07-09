@@ -24,6 +24,10 @@ type MockAddr struct {
 	AddrStr    string
 }
 
+// networkTCP is the canonical "tcp" network string used by mock addresses
+// and dialers in this package.
+const networkTCP = "tcp"
+
 func (a MockAddr) Network() string { return a.NetworkStr }
 func (a MockAddr) String() string  { return a.AddrStr }
 
@@ -37,15 +41,15 @@ func NewMockConnPair() (*MockConn, *MockConn) {
 	conn1 := &MockConn{
 		reader:     r1,
 		writer:     w2,
-		localAddr:  MockAddr{NetworkStr: "tcp", AddrStr: "127.0.0.1:1234"},
-		remoteAddr: MockAddr{NetworkStr: "tcp", AddrStr: "127.0.0.1:5678"},
+		localAddr:  MockAddr{NetworkStr: networkTCP, AddrStr: "127.0.0.1:1234"},
+		remoteAddr: MockAddr{NetworkStr: networkTCP, AddrStr: "127.0.0.1:5678"},
 	}
 
 	conn2 := &MockConn{
 		reader:     r2,
 		writer:     w1,
-		localAddr:  MockAddr{NetworkStr: "tcp", AddrStr: "127.0.0.1:5678"},
-		remoteAddr: MockAddr{NetworkStr: "tcp", AddrStr: "127.0.0.1:1234"},
+		localAddr:  MockAddr{NetworkStr: networkTCP, AddrStr: "127.0.0.1:5678"},
+		remoteAddr: MockAddr{NetworkStr: networkTCP, AddrStr: "127.0.0.1:1234"},
 	}
 
 	return conn1, conn2

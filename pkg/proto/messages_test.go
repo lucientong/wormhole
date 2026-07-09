@@ -19,14 +19,14 @@ func TestProtocol_String(t *testing.T) {
 		proto    Protocol
 		expected string
 	}{
-		{ProtocolUnknown, "Unknown"},
+		{ProtocolUnknown, protocolUnknownName},
 		{ProtocolHTTP, "HTTP"},
 		{ProtocolHTTPS, "HTTPS"},
 		{ProtocolTCP, "TCP"},
 		{ProtocolUDP, "UDP"},
 		{ProtocolWebSocket, "WebSocket"},
 		{ProtocolGRPC, "gRPC"},
-		{Protocol(99), "Unknown"},
+		{Protocol(99), protocolUnknownName},
 	}
 
 	for _, tt := range tests {

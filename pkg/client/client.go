@@ -32,6 +32,9 @@ const defaultLocalHost = "127.0.0.1"
 // protocolHTTP is the canonical string for HTTP tunnel protocol.
 const protocolHTTP = "http"
 
+// protocolTCP is the canonical string for TCP dialing and the TCP tunnel protocol.
+const protocolTCP = "tcp"
+
 // Client is the wormhole client.
 // ActiveTunnel holds runtime state for a registered tunnel.
 type ActiveTunnel struct {
@@ -201,9 +204,9 @@ func (c *Client) connect(ctx context.Context) error {
 			NetDialer: dialer,
 			Config:    tlsConfig,
 		}
-		conn, err = tlsDialer.DialContext(ctx, "tcp", c.config.ServerAddr)
+		conn, err = tlsDialer.DialContext(ctx, protocolTCP, c.config.ServerAddr)
 	} else {
-		conn, err = dialer.DialContext(ctx, "tcp", c.config.ServerAddr)
+		conn, err = dialer.DialContext(ctx, protocolTCP, c.config.ServerAddr)
 	}
 	if err != nil {
 		return fmt.Errorf("dial server: %w", err)
@@ -228,7 +231,7 @@ func (c *Client) connect(ctx context.Context) error {
 
 	// Phase 5: Authenticate if token is provided.
 	if c.config.Token != "" {
-		if err := c.authenticate(ctx); err != nil {
+		if err := c.authenticateWithRefresh(ctx); err != nil {
 			_ = mux.Close()
 			_ = conn.Close()
 			return fmt.Errorf("authenticate: %w", err)
@@ -285,6 +288,31 @@ func (c *Client) buildTLSConfig() (*tls.Config, error) {
 	tlsConfig.ServerName = host
 
 	return tlsConfig, nil
+}
+
+// authenticateWithRefresh calls authenticate() and, if the server rejects the
+// current token and Config.OnAuthFailure is set (e.g. wired to an OAuth2
+// refresh_token grant by the CLI layer), attempts to obtain a fresh token
+// and retries authentication exactly once. This lets a long-lived client
+// survive an OIDC access token expiring mid-session or across a reconnect
+// without requiring the user to run `wormhole login` again.
+func (c *Client) authenticateWithRefresh(ctx context.Context) error {
+	err := c.authenticate(ctx)
+	if err == nil || c.config.OnAuthFailure == nil {
+		return err
+	}
+
+	newToken, ok := c.config.OnAuthFailure(ctx)
+	if !ok || newToken == "" {
+		return err
+	}
+
+	log.Info().Msg("Auth token refreshed after rejection, retrying authentication")
+	c.mu.Lock()
+	c.config.Token = newToken
+	c.mu.Unlock()
+
+	return c.authenticate(ctx)
 }
 
 // authenticate sends an AuthRequest to the server and validates the response.
@@ -830,7 +858,7 @@ func (c *Client) dialAndProxy(ctx context.Context, inReader io.Reader, outWriter
 	localHost, localPort := c.resolveLocalAddr(sreq.TunnelID)
 	localAddr := net.JoinHostPort(localHost, fmt.Sprintf("%d", localPort))
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	localConn, err := dialer.DialContext(ctx, "tcp", localAddr)
+	localConn, err := dialer.DialContext(ctx, protocolTCP, localAddr)
 	if err != nil {
 		log.Error().Err(err).Str("addr", localAddr).Msg("Connect to local failed")
 		resp := proto.NewStreamResponse(sreq.RequestID, false, "Local service unavailable")
@@ -1131,48 +1159,62 @@ func (c *Client) sendP2POffer(ctx context.Context) {
 	// Both are length-prefixed via proto.WriteControlMessage, so we
 	// loop-read framed messages rather than relying on a single raw
 	// stream.Read() to capture the whole exchange (DP-24).
+	resp, candidates, readErr := readP2POfferResponse(stream)
+	if readErr != nil {
+		log.Debug().Err(readErr).Msg("Failed to read P2P offer response")
+		return
+	}
+
+	c.handleP2POfferResponse(ctx, resp, candidates)
+}
+
+// readP2POfferResponse loop-reads framed control messages from stream until
+// the terminal P2POfferResponse arrives, collecting any P2PCandidates sent
+// beforehand (DP-24).
+func readP2POfferResponse(stream io.Reader) (*proto.P2POfferResponse, []string, error) {
 	var candidates []string
-	var resp *proto.P2POfferResponse
-	for resp == nil {
+	for {
 		msg, readErr := proto.ReadControlMessage(stream)
 		if readErr != nil {
-			log.Debug().Err(readErr).Msg("Failed to read P2P offer response")
-			return
+			return nil, nil, readErr
 		}
 		switch {
 		case msg.P2PCandidates != nil:
 			candidates = append(candidates, msg.P2PCandidates.Candidates...)
 		case msg.P2POfferResponse != nil:
-			resp = msg.P2POfferResponse
+			return msg.P2POfferResponse, candidates, nil
 		default:
-			log.Debug().Int("type", int(msg.Type)).Msg("Unexpected message type in P2P offer response")
+			return nil, nil, fmt.Errorf("unexpected message type %d in P2P offer response", msg.Type)
+		}
+	}
+}
+
+// handleP2POfferResponse derives the E2E session cipher (if a peer key was
+// returned) and kicks off hole punching, or logs the relay-mode fallback.
+func (c *Client) handleP2POfferResponse(ctx context.Context, resp *proto.P2POfferResponse, candidates []string) {
+	if !resp.Success || resp.PeerAddr == "" {
+		log.Debug().
+			Str("reason", resp.Error).
+			Msg("P2P offer: no peer available, staying in relay mode")
+		return
+	}
+
+	if resp.PeerPublicKey != "" {
+		if derivErr := c.deriveP2PCipher(resp.PeerPublicKey); derivErr != nil {
+			log.Error().Err(derivErr).Msg("Failed to derive P2P session cipher")
 			return
 		}
 	}
 
-	if resp.Success && resp.PeerAddr != "" {
-		// Derive session cipher from peer's public key.
-		if resp.PeerPublicKey != "" {
-			if derivErr := c.deriveP2PCipher(resp.PeerPublicKey); derivErr != nil {
-				log.Error().Err(derivErr).Msg("Failed to derive P2P session cipher")
-				return
-			}
-		}
+	log.Info().
+		Str("peer_addr", resp.PeerAddr).
+		Str("peer_nat", resp.PeerNATType).
+		Bool("encrypted", c.p2pCipher != nil).
+		Int("predicted_candidates", len(candidates)).
+		Msg("P2P peer found, attempting connection")
 
-		log.Info().
-			Str("peer_addr", resp.PeerAddr).
-			Str("peer_nat", resp.PeerNATType).
-			Bool("encrypted", c.p2pCipher != nil).
-			Int("predicted_candidates", len(candidates)).
-			Msg("P2P peer found, attempting connection")
-
-		// Offer sender is the initiator for stream-ID allocation.
-		go c.attemptP2P(ctx, resp.PeerAddr, true)
-	} else {
-		log.Debug().
-			Str("reason", resp.Error).
-			Msg("P2P offer: no peer available, staying in relay mode")
-	}
+	// Offer sender is the initiator for stream-ID allocation.
+	go c.attemptP2P(ctx, resp.PeerAddr, true)
 }
 
 // deriveP2PCipher derives the E2E session cipher from the peer's public key.
@@ -1730,11 +1772,11 @@ func (c *Client) GetInspector() *inspector.Inspector {
 // Returns proto.ProtocolHTTP if the input is empty or unrecognized.
 func parseProtocol(s string) proto.Protocol {
 	switch strings.ToLower(s) {
-	case "http", "":
+	case protocolHTTP, "":
 		return proto.ProtocolHTTP
 	case "https":
 		return proto.ProtocolHTTPS
-	case "tcp":
+	case protocolTCP:
 		return proto.ProtocolTCP
 	case "udp":
 		return proto.ProtocolUDP

@@ -13,7 +13,7 @@ func TestServerDefaultConfig(t *testing.T) {
 	assert.Equal(t, ":7000", cfg.ListenAddr)
 	assert.Equal(t, ":80", cfg.HTTPAddr)
 	assert.Equal(t, ":7001", cfg.AdminAddr)
-	assert.Equal(t, "localhost", cfg.Domain)
+	assert.Equal(t, defaultDomain, cfg.Domain)
 	assert.False(t, cfg.TLSEnabled)
 	assert.Equal(t, 10000, cfg.TCPPortRangeStart)
 	assert.Equal(t, 20000, cfg.TCPPortRangeEnd)

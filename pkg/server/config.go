@@ -16,6 +16,12 @@ const (
 	PersistenceSQLite PersistenceType = "sqlite"
 )
 
+// defaultDomain is the default Config.Domain value used for local
+// development. It's also the sentinel checked by the ACME/TLS manager to
+// skip certificate provisioning, since Let's Encrypt cannot issue certs for
+// "localhost".
+const defaultDomain = "localhost"
+
 // Config holds the server configuration.
 type Config struct {
 	// ListenAddr is the address to listen on for client connections.
@@ -178,7 +184,7 @@ func DefaultConfig() Config {
 		ListenAddr:             ":7000",
 		HTTPAddr:               ":80",
 		AdminAddr:              ":7001",
-		Domain:                 "localhost",
+		Domain:                 defaultDomain,
 		TLSEnabled:             false,
 		TCPPortRangeStart:      10000,
 		TCPPortRangeEnd:        20000,

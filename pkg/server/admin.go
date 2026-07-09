@@ -19,6 +19,23 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// fieldProtocol is the shared field/column name for a tunnel's protocol in
+// admin API JSON responses and audit CSV exports (kept in sync with the
+// `json:"protocol"` struct tag on TunnelJSON, which — being a struct tag —
+// cannot itself reference a constant).
+const fieldProtocol = "protocol"
+
+// Common admin API error messages, shared across handlers.
+const (
+	errMsgMethodNotAllowed   = "method not allowed"
+	errMsgInvalidRequestBody = "invalid request body"
+	errMsgAuthNotEnabled     = "authentication is not enabled"
+)
+
+// fieldMessage is the JSON response key used for human-readable success
+// messages returned by several admin API handlers.
+const fieldMessage = "message"
+
 // AdminAPI provides the RESTful management API.
 type AdminAPI struct {
 	server *Server
@@ -208,14 +225,14 @@ func (a *AdminAPI) handleTunnels(w http.ResponseWriter, _ *http.Request) {
 		client.mu.Lock()
 		for _, t := range client.Tunnels {
 			tunnels = append(tunnels, map[string]interface{}{
-				"id":         t.ID,
-				"client_id":  client.ID,
-				"subdomain":  client.Subdomain,
-				"local_port": t.LocalPort,
-				"protocol":   t.Protocol.String(),
-				"public_url": t.PublicURL,
-				"tcp_port":   t.TCPPort,
-				"created_at": t.CreatedAt.Format(time.RFC3339),
+				"id":          t.ID,
+				"client_id":   client.ID,
+				"subdomain":   client.Subdomain,
+				"local_port":  t.LocalPort,
+				fieldProtocol: t.Protocol.String(),
+				"public_url":  t.PublicURL,
+				"tcp_port":    t.TCPPort,
+				"created_at":  t.CreatedAt.Format(time.RFC3339),
 			})
 		}
 		client.mu.Unlock()
@@ -308,7 +325,7 @@ type RateLimitResponse struct {
 // handleRateLimit returns the current rate limit status.
 func (a *AdminAPI) handleRateLimit(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: errMsgMethodNotAllowed})
 		return
 	}
 
@@ -343,7 +360,7 @@ type UnblockRequest struct {
 // handleUnblockIP unblocks a specific IP address.
 func (a *AdminAPI) handleUnblockIP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: errMsgMethodNotAllowed})
 		return
 	}
 
@@ -355,7 +372,7 @@ func (a *AdminAPI) handleUnblockIP(w http.ResponseWriter, r *http.Request) {
 
 	var req UnblockRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: errMsgInvalidRequestBody})
 		return
 	}
 
@@ -369,8 +386,8 @@ func (a *AdminAPI) handleUnblockIP(w http.ResponseWriter, r *http.Request) {
 	log.Info().Str("ip", req.IP).Msg("IP unblocked via admin API")
 
 	writeJSON(w, http.StatusOK, map[string]string{
-		"message": "IP unblocked successfully",
-		"ip":      req.IP,
+		fieldMessage: "IP unblocked successfully",
+		"ip":         req.IP,
 	})
 }
 
@@ -390,7 +407,7 @@ type CreateTeamRequest struct {
 // handleTeams handles GET /teams (list) and POST /teams (create).
 func (a *AdminAPI) handleTeams(w http.ResponseWriter, r *http.Request) {
 	if a.server.authenticator == nil {
-		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "authentication is not enabled"})
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: errMsgAuthNotEnabled})
 		return
 	}
 
@@ -411,7 +428,7 @@ func (a *AdminAPI) handleTeams(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		var req CreateTeamRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: errMsgInvalidRequestBody})
 			return
 		}
 		if req.Name == "" {
@@ -427,24 +444,24 @@ func (a *AdminAPI) handleTeams(w http.ResponseWriter, r *http.Request) {
 		log.Info().Str("team", req.Name).Msg("Team created via admin API")
 
 		writeJSON(w, http.StatusCreated, map[string]string{
-			"message": "team created successfully",
-			"name":    req.Name,
+			fieldMessage: "team created successfully",
+			"name":       req.Name,
 		})
 
 	default:
-		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: errMsgMethodNotAllowed})
 	}
 }
 
 // handleTeamByName handles GET /teams/{name}.
 func (a *AdminAPI) handleTeamByName(w http.ResponseWriter, r *http.Request) {
 	if a.server.authenticator == nil {
-		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "authentication is not enabled"})
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: errMsgAuthNotEnabled})
 		return
 	}
 
 	if r.Method != http.MethodGet {
-		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: errMsgMethodNotAllowed})
 		return
 	}
 
@@ -486,18 +503,18 @@ type GenerateTokenResponse struct {
 // handleGenerateToken handles POST /tokens/generate.
 func (a *AdminAPI) handleGenerateToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: errMsgMethodNotAllowed})
 		return
 	}
 
 	if a.server.authenticator == nil {
-		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "authentication is not enabled"})
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: errMsgAuthNotEnabled})
 		return
 	}
 
 	var req GenerateTokenRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: errMsgInvalidRequestBody})
 		return
 	}
 
@@ -554,18 +571,18 @@ type RevokeTokenRequest struct {
 // handleRevokeToken handles POST /tokens/revoke.
 func (a *AdminAPI) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: errMsgMethodNotAllowed})
 		return
 	}
 
 	if a.server.authenticator == nil {
-		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "authentication is not enabled"})
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: errMsgAuthNotEnabled})
 		return
 	}
 
 	var req RevokeTokenRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: errMsgInvalidRequestBody})
 		return
 	}
 
@@ -603,8 +620,8 @@ func (a *AdminAPI) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{
-		"message":  "token revoked successfully",
-		"token_id": tokenID,
+		fieldMessage: "token revoked successfully",
+		"token_id":   tokenID,
 	})
 }
 
@@ -616,18 +633,18 @@ type RevokeTeamTokensRequest struct {
 // handleRevokeTeamTokens handles POST /tokens/revoke-team.
 func (a *AdminAPI) handleRevokeTeamTokens(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: errMsgMethodNotAllowed})
 		return
 	}
 
 	if a.server.authenticator == nil {
-		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "authentication is not enabled"})
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: errMsgAuthNotEnabled})
 		return
 	}
 
 	var req RevokeTeamTokensRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: errMsgInvalidRequestBody})
 		return
 	}
 
@@ -652,8 +669,8 @@ func (a *AdminAPI) handleRevokeTeamTokens(w http.ResponseWriter, r *http.Request
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{
-		"message": "all team tokens revoked successfully",
-		"team":    req.Team,
+		fieldMessage: "all team tokens revoked successfully",
+		"team":       req.Team,
 	})
 }
 
@@ -673,7 +690,7 @@ func (a *AdminAPI) handleRevokeTeamTokens(w http.ResponseWriter, r *http.Request
 //	offset     - pagination offset
 func (a *AdminAPI) handleAudit(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: errMsgMethodNotAllowed})
 		return
 	}
 
@@ -709,7 +726,7 @@ func (a *AdminAPI) handleAudit(w http.ResponseWriter, r *http.Request) {
 //	format - "json" (default) or "csv"
 func (a *AdminAPI) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: errMsgMethodNotAllowed})
 		return
 	}
 
@@ -812,7 +829,7 @@ func writeAuditCSV(w http.ResponseWriter, events []auth.AuditEvent) {
 	// Header row.
 	_ = cw.Write([]string{
 		"timestamp", "type", "ip", "team", "role",
-		"session_id", "subdomain", "tunnel_id", "protocol", "error",
+		"session_id", "subdomain", "tunnel_id", fieldProtocol, "error",
 	})
 
 	for _, ev := range events {
@@ -848,18 +865,18 @@ type RefreshTokenRequest struct {
 // handleRefreshToken handles POST /tokens/refresh.
 func (a *AdminAPI) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: errMsgMethodNotAllowed})
 		return
 	}
 
 	if a.server.authenticator == nil {
-		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "authentication is not enabled"})
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: errMsgAuthNotEnabled})
 		return
 	}
 
 	var req RefreshTokenRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: errMsgInvalidRequestBody})
 		return
 	}
 

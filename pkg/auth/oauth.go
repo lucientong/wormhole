@@ -12,6 +12,31 @@ import (
 	"time"
 )
 
+// OAuth2 token/device-authorization request form-field names (RFC 6749,
+// RFC 8628 §3.1/§3.4).
+const (
+	paramGrantType    = "grant_type"
+	paramDeviceCode   = "device_code"
+	paramClientID     = "client_id"
+	paramRefreshToken = "refresh_token"
+	paramScope        = "scope"
+)
+
+// grantTypeDeviceCode is the "grant_type" value for the device authorization
+// grant (RFC 8628 §3.4). grantTypeRefreshToken reuses paramRefreshToken since
+// RFC 6749 §6 spells the refresh_token grant type identically to the
+// refresh_token form field name.
+const grantTypeDeviceCode = "urn:ietf:params:oauth:grant-type:device_code"
+
+const grantTypeRefreshToken = paramRefreshToken
+
+// OAuth2 token-endpoint error codes relevant to device-flow polling
+// (RFC 8628 §3.5).
+const (
+	errCodeAuthorizationPending = "authorization_pending"
+	errCodeSlowDown             = "slow_down"
+)
+
 // DeviceFlowConfig configures an OAuth2 Device Authorization Grant flow.
 type DeviceFlowConfig struct {
 	// Issuer is the OIDC provider URL used for endpoint discovery.
@@ -47,6 +72,34 @@ type DeviceCode struct {
 
 	// TokenEndpoint is the endpoint to poll for a token.
 	TokenEndpoint string
+
+	// ClientID is carried through from DeviceFlowConfig so requestToken can
+	// include it in the token-poll request body (RFC 8628 §3.4 requires
+	// client_id for public clients that have no client secret).
+	ClientID string
+}
+
+// TokenResult holds everything obtained from a successful token response,
+// including refresh material needed for silent renewal.
+type TokenResult struct {
+	// AccessToken is the OAuth2 access token.
+	AccessToken string
+	// IDToken is the OIDC ID token, if the provider issued one.
+	IDToken string
+	// RefreshToken allows obtaining a new access/ID token without
+	// re-running the interactive flow (empty if the provider didn't issue one).
+	RefreshToken string
+	// ExpiresIn is the access token lifetime in seconds, as reported by the
+	// provider (0 if not reported).
+	ExpiresIn int
+}
+
+// Token returns the ID token if present, otherwise the access token.
+func (r *TokenResult) Token() string {
+	if r.IDToken != "" {
+		return r.IDToken
+	}
+	return r.AccessToken
 }
 
 // ErrAuthorizationPending is returned while the user has not yet completed auth.
@@ -66,7 +119,7 @@ func StartDeviceFlow(ctx context.Context, cfg DeviceFlowConfig) (*DeviceCode, er
 		return nil, errors.New("client_id is required")
 	}
 	if len(cfg.Scopes) == 0 {
-		cfg.Scopes = []string{"openid", "email", "profile"}
+		cfg.Scopes = []string{"openid", claimEmail, "profile"}
 	}
 
 	deviceEndpoint, tokenEndpoint, err := discoverDeviceEndpoints(ctx, cfg.Issuer)
@@ -80,7 +133,7 @@ func StartDeviceFlow(ctx context.Context, cfg DeviceFlowConfig) (*DeviceCode, er
 // PollDeviceFlow polls the token endpoint until the user completes authorisation
 // or the device code expires. It handles the "slow_down" and
 // "authorization_pending" error responses automatically.
-func PollDeviceFlow(ctx context.Context, dc *DeviceCode) (string, error) {
+func PollDeviceFlow(ctx context.Context, dc *DeviceCode) (*TokenResult, error) {
 	interval := time.Duration(dc.Interval) * time.Second
 	if interval <= 0 {
 		interval = 5 * time.Second
@@ -92,17 +145,21 @@ func PollDeviceFlow(ctx context.Context, dc *DeviceCode) (string, error) {
 	for {
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return nil, ctx.Err()
 		case <-time.After(interval):
 		}
 
 		if time.Now().After(deadline) {
-			return "", errors.New("device code expired")
+			return nil, errors.New("device code expired")
 		}
 
-		token, err := requestToken(ctx, client, dc)
+		result, err := requestToken(ctx, client, dc.TokenEndpoint, url.Values{
+			paramGrantType:  {grantTypeDeviceCode},
+			paramDeviceCode: {dc.DeviceCode},
+			paramClientID:   {dc.ClientID},
+		})
 		if err == nil {
-			return token, nil
+			return result, nil
 		}
 		if errors.Is(err, ErrAuthorizationPending) {
 			continue
@@ -111,8 +168,34 @@ func PollDeviceFlow(ctx context.Context, dc *DeviceCode) (string, error) {
 			interval += 5 * time.Second
 			continue
 		}
-		return "", err
+		return nil, err
 	}
+}
+
+// RefreshAccessToken exchanges a refresh token for a new access/ID token
+// using the OAuth2 refresh_token grant (RFC 6749 §6). tokenEndpoint and
+// clientID are normally the values cached in Credentials from the original
+// device-flow login.
+func RefreshAccessToken(ctx context.Context, tokenEndpoint, clientID, refreshToken string) (*TokenResult, error) {
+	if tokenEndpoint == "" || clientID == "" || refreshToken == "" {
+		return nil, errors.New("refresh access token: tokenEndpoint, clientID and refreshToken are required")
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	result, err := requestToken(ctx, client, tokenEndpoint, url.Values{
+		paramGrantType:    {grantTypeRefreshToken},
+		paramRefreshToken: {refreshToken},
+		paramClientID:     {clientID},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("refresh access token: %w", err)
+	}
+	// Some providers omit refresh_token on renewal, meaning the original
+	// one remains valid for future refreshes — preserve it in that case.
+	if result.RefreshToken == "" {
+		result.RefreshToken = refreshToken
+	}
+	return result, nil
 }
 
 // ─── Private helpers ──────────────────────────────────────────────────────────
@@ -147,8 +230,8 @@ func discoverDeviceEndpoints(ctx context.Context, issuer string) (deviceEP, toke
 
 func startDeviceAuthorization(ctx context.Context, deviceEP, tokenEP string, cfg DeviceFlowConfig) (*DeviceCode, error) {
 	body := url.Values{
-		"client_id": {cfg.ClientID},
-		"scope":     {strings.Join(cfg.Scopes, " ")},
+		paramClientID: {cfg.ClientID},
+		paramScope:    {strings.Join(cfg.Scopes, " ")},
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, deviceEP, strings.NewReader(body.Encode()))
@@ -196,57 +279,59 @@ func startDeviceAuthorization(ctx context.Context, deviceEP, tokenEP string, cfg
 		ExpiresIn:               dc.ExpiresIn,
 		Interval:                dc.Interval,
 		TokenEndpoint:           tokenEP,
+		ClientID:                cfg.ClientID,
 	}, nil
 }
 
-func requestToken(ctx context.Context, client *http.Client, dc *DeviceCode) (string, error) {
-	body := url.Values{
-		"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
-		"device_code": {dc.DeviceCode},
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, dc.TokenEndpoint, strings.NewReader(body.Encode()))
+// requestToken performs a single POST to tokenEndpoint with the given form
+// body (grant-specific fields already set by the caller) and parses the
+// response into a TokenResult.
+func requestToken(ctx context.Context, client *http.Client, tokenEndpoint string, body url.Values) (*TokenResult, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenEndpoint, strings.NewReader(body.Encode()))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
 
 	var result struct {
-		AccessToken string `json:"access_token"`
-		IDToken     string `json:"id_token"`
-		Error       string `json:"error"`
-		Description string `json:"error_description"`
+		AccessToken  string `json:"access_token"`
+		IDToken      string `json:"id_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int    `json:"expires_in"`
+		Error        string `json:"error"`
+		Description  string `json:"error_description"`
 	}
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return "", fmt.Errorf("decode token response: %w", err)
+		return nil, fmt.Errorf("decode token response: %w", err)
 	}
 
 	if result.Error != "" {
 		switch result.Error {
-		case "authorization_pending":
-			return "", ErrAuthorizationPending
-		case "slow_down":
-			return "", ErrSlowDown
+		case errCodeAuthorizationPending:
+			return nil, ErrAuthorizationPending
+		case errCodeSlowDown:
+			return nil, ErrSlowDown
 		default:
-			return "", fmt.Errorf("token error %q: %s", result.Error, result.Description)
+			return nil, fmt.Errorf("token error %q: %s", result.Error, result.Description)
 		}
 	}
 
-	// Prefer ID token (contains OIDC claims) over access token.
-	token := result.IDToken
-	if token == "" {
-		token = result.AccessToken
+	if result.AccessToken == "" && result.IDToken == "" {
+		return nil, errors.New("no token in response")
 	}
-	if token == "" {
-		return "", errors.New("no token in response")
-	}
-	return token, nil
+
+	return &TokenResult{
+		AccessToken:  result.AccessToken,
+		IDToken:      result.IDToken,
+		RefreshToken: result.RefreshToken,
+		ExpiresIn:    result.ExpiresIn,
+	}, nil
 }

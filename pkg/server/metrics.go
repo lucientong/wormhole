@@ -5,6 +5,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 )
 
+// metricsNamespace is the shared Prometheus namespace prefix for all
+// wormhole server metrics (e.g. "wormhole_active_clients").
+const metricsNamespace = "wormhole"
+
 // Metrics holds all Prometheus metrics for the wormhole server.
 type Metrics struct {
 	// ActiveClients is the number of currently connected clients.
@@ -48,48 +52,48 @@ func NewMetrics() *Metrics {
 
 	m := &Metrics{
 		ActiveClients: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: "wormhole",
+			Namespace: metricsNamespace,
 			Name:      "active_clients",
 			Help:      "Number of currently connected clients.",
 		}),
 		ActiveTunnels: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: "wormhole",
+			Namespace: metricsNamespace,
 			Name:      "active_tunnels",
 			Help:      "Number of currently active tunnels.",
 		}),
 		ConnectionsTotal: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: "wormhole",
+			Namespace: metricsNamespace,
 			Name:      "connections_total",
 			Help:      "Total number of client connections accepted.",
 		}),
 		BytesTransferredTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "wormhole",
+			Namespace: metricsNamespace,
 			Name:      "bytes_transferred_total",
 			Help:      "Total bytes transferred, labeled by direction.",
 		}, []string{"direction"}),
 		RequestsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "wormhole",
+			Namespace: metricsNamespace,
 			Name:      "requests_total",
 			Help:      "Total number of proxied requests, labeled by protocol and status.",
 		}, []string{"protocol", "status"}),
 		RequestDurationSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Namespace: "wormhole",
+			Namespace: metricsNamespace,
 			Name:      "request_duration_seconds",
 			Help:      "Histogram of request durations in seconds.",
 			Buckets:   prometheus.DefBuckets,
 		}),
 		AuthAttemptsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "wormhole",
+			Namespace: metricsNamespace,
 			Name:      "auth_attempts_total",
 			Help:      "Total number of authentication attempts, labeled by result.",
 		}, []string{"result"}),
 		P2PConnectionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Namespace: "wormhole",
+			Namespace: metricsNamespace,
 			Name:      "p2p_connections_total",
 			Help:      "Total number of P2P connection attempts, labeled by result.",
 		}, []string{"result"}),
 		TunnelDurationSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Namespace: "wormhole",
+			Namespace: metricsNamespace,
 			Name:      "tunnel_duration_seconds",
 			Help:      "Histogram of tunnel lifetimes in seconds.",
 			Buckets:   []float64{1, 5, 15, 30, 60, 120, 300, 600, 1800, 3600, 7200, 86400},

@@ -95,7 +95,7 @@ func runLogin(_ *cobra.Command, _ []string) {
 	fmt.Printf("╚══════════════════════════════════════════════════════════╝\n\n")
 	fmt.Printf("Waiting for authentication...")
 
-	token, err := auth.PollDeviceFlow(ctx, dc)
+	result, err := auth.PollDeviceFlow(ctx, dc)
 	if err != nil {
 		fmt.Println()
 		log.Fatal().Err(err).Msg("Authentication failed")
@@ -103,12 +103,26 @@ func runLogin(_ *cobra.Command, _ []string) {
 
 	fmt.Println(" done!")
 
-	// Determine expiry from the device code's ExpiresIn field as an approximation.
-	// A proper implementation would parse the ID token's exp claim.
-	expiresAt := time.Time{}
+	token := result.Token()
+
+	// Prefer the JWT's own `exp` claim over the device code's ExpiresIn
+	// (which bounds the login window, not the issued token's lifetime).
+	expiresAt := auth.ParseJWTExpiry(token)
+	if expiresAt.IsZero() && result.ExpiresIn > 0 {
+		expiresAt = time.Now().Add(time.Duration(result.ExpiresIn) * time.Second)
+	}
 
 	credsPath := loginCredsPath
-	if err := auth.SaveCredentials(credsPath, loginServer, token, expiresAt); err != nil {
+	creds := auth.Credentials{
+		Server:        loginServer,
+		Token:         token,
+		ExpiresAt:     expiresAt,
+		RefreshToken:  result.RefreshToken,
+		OIDCIssuer:    loginOIDCIssuer,
+		ClientID:      loginClientID,
+		TokenEndpoint: dc.TokenEndpoint,
+	}
+	if err := auth.SaveCredentialsFull(credsPath, creds); err != nil {
 		log.Fatal().Err(err).Msg("Failed to save credentials")
 	}
 
@@ -117,9 +131,12 @@ func runLogin(_ *cobra.Command, _ []string) {
 	}
 
 	fmt.Printf("\n✅ Credentials saved to %s\n", credsPath)
+	if result.RefreshToken != "" {
+		fmt.Printf("   (includes a refresh token — wormhole client will renew it automatically when it expires)\n")
+	}
 	fmt.Printf("\nYou can now run:\n")
-	fmt.Printf("  wormhole client --server %s --local 8080 --token $(cat %s | jq -r '.[\"%s\"].token')\n",
-		loginServer, credsPath, loginServer)
+	fmt.Printf("  wormhole client --server %s --local 8080\n", loginServer)
+	fmt.Printf("(credentials are loaded automatically — no need to pass --token)\n")
 	fmt.Printf("\nOr configure the server with:\n")
 	fmt.Printf("  wormhole server --require-auth --oidc-issuer %s --oidc-client-id %s\n\n",
 		loginOIDCIssuer, loginClientID)

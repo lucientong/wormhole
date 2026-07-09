@@ -18,7 +18,7 @@ func TestFS(t *testing.T) {
 	require.NotNil(t, fsys)
 
 	// Should be able to open index.html.
-	f, err := fsys.Open("index.html")
+	f, err := fsys.Open(indexHTML)
 	require.NoError(t, err)
 	defer f.Close()
 
@@ -73,13 +73,13 @@ func TestGetContentType(t *testing.T) {
 		path     string
 		expected string
 	}{
-		{"index.html", "text/html; charset=utf-8"},
+		{indexHTML, "text/html; charset=utf-8"},
 		{"style.css", "text/css; charset=utf-8"},
 		{"app.js", "application/javascript; charset=utf-8"},
 		{"data.json", "application/json; charset=utf-8"},
 		{"logo.png", "image/png"},
-		{"photo.jpg", "image/jpeg"},
-		{"photo.jpeg", "image/jpeg"},
+		{"photo.jpg", contentTypeJPEG},
+		{"photo.jpeg", contentTypeJPEG},
 		{"anim.gif", "image/gif"},
 		{"icon.svg", "image/svg+xml"},
 		{"favicon.ico", "image/x-icon"},
@@ -255,7 +255,7 @@ func (d dirWithIndexFS) Open(name string) (fs.File, error) {
 	case "subdir/index.html":
 		content := []byte("<html><body>subdir index</body></html>")
 		return &seekableFile{
-			info:   fakeFileInfo{name: "index.html", size: int64(len(content))},
+			info:   fakeFileInfo{name: indexHTML, size: int64(len(content))},
 			reader: bytes.NewReader(content),
 		}, nil
 	default:

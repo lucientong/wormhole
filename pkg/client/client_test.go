@@ -2175,13 +2175,13 @@ func TestParseProtocol(t *testing.T) {
 		input    string
 		expected proto.Protocol
 	}{
-		{"http", proto.ProtocolHTTP},
+		{protocolHTTP, proto.ProtocolHTTP},
 		{"HTTP", proto.ProtocolHTTP},
 		{"Http", proto.ProtocolHTTP},
 		{"", proto.ProtocolHTTP},
 		{"https", proto.ProtocolHTTPS},
 		{"HTTPS", proto.ProtocolHTTPS},
-		{"tcp", proto.ProtocolTCP},
+		{protocolTCP, proto.ProtocolTCP},
 		{"TCP", proto.ProtocolTCP},
 		{"udp", proto.ProtocolUDP},
 		{"UDP", proto.ProtocolUDP},

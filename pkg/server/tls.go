@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 
 	"github.com/rs/zerolog/log"
 	"golang.org/x/crypto/acme/autocert"
@@ -44,7 +45,7 @@ func (m *TLSManager) TLSConfig() (*tls.Config, error) {
 
 // autoTLSConfig sets up automatic certificate management via Let's Encrypt.
 func (m *TLSManager) autoTLSConfig() (*tls.Config, error) {
-	if m.config.Domain == "" || m.config.Domain == "localhost" {
+	if m.config.Domain == "" || m.config.Domain == defaultDomain {
 		return nil, fmt.Errorf("auto-TLS requires a valid domain (got %q)", m.config.Domain)
 	}
 
@@ -142,8 +143,27 @@ func (m *TLSManager) certCacheDir() string {
 	return filepath.Join(home, ".wormhole", "certs")
 }
 
-// redirectToHTTPS redirects HTTP requests to HTTPS.
+// validHostHeaderPattern matches a syntactically valid HTTP Host header:
+// a DNS hostname or IPv4/IPv6 literal, optionally followed by ":<port>".
+// It intentionally does not allow "/", "\", "@", control characters, etc.,
+// which is what makes it safe to reflect into a redirect Location below.
+var validHostHeaderPattern = regexp.MustCompile(`^[a-zA-Z0-9.\-\[\]:]+$`)
+
+// redirectToHTTPS redirects HTTP requests to HTTPS on the same host.
+//
+// The target host always mirrors the Host the client already connected
+// with, so this cannot be turned into a cross-domain open redirect: an
+// attacker cannot make the server redirect somewhere other than the host
+// they themselves dialed. We still validate the Host header's syntax
+// before reflecting it (rather than trusting it blindly) so that
+// malformed values — e.g. containing "/", "@", or control characters —
+// can't be smuggled into the Location header at all.
 func redirectToHTTPS(w http.ResponseWriter, r *http.Request) {
-	target := "https://" + r.Host + r.URL.RequestURI()
-	http.Redirect(w, r, target, http.StatusMovedPermanently)
+	host := r.Host
+	if !validHostHeaderPattern.MatchString(host) {
+		http.Error(w, "invalid host header", http.StatusBadRequest)
+		return
+	}
+	target := "https://" + host + r.URL.RequestURI()
+	http.Redirect(w, r, target, http.StatusMovedPermanently) // #nosec G710 -- host validated above; redirect target always mirrors the requested host, never an attacker-chosen different domain
 }

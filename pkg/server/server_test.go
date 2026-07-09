@@ -81,14 +81,14 @@ func TestServer_IsP2PCompatible(t *testing.T) {
 		nat2     string
 		expected bool
 	}{
-		{"Both Full Cone", "Full Cone", "Full Cone", true},
-		{"Full Cone and Restricted", "Full Cone", "Restricted Cone", true},
-		{"Symmetric and Full Cone", "Symmetric", "Full Cone", true},
+		{"Both Full Cone", natTypeFullCone, natTypeFullCone, true},
+		{"Full Cone and Restricted", natTypeFullCone, natTypeRestrictedCone, true},
+		{"Symmetric and Full Cone", natTypeSymmetric, natTypeFullCone, true},
 		// Both Symmetric is now attempted with port prediction instead of rejected.
-		{"Both Symmetric", "Symmetric", "Symmetric", true},
-		{"Port Restricted and Symmetric", "Port Restricted Cone", "Symmetric", true},
+		{"Both Symmetric", natTypeSymmetric, natTypeSymmetric, true},
+		{"Port Restricted and Symmetric", natTypePortRestrictedCone, natTypeSymmetric, true},
 		// Unknown/empty NAT type has priority 0 — incompatible.
-		{"Empty and Full Cone", "", "Full Cone", false},
+		{"Empty and Full Cone", "", natTypeFullCone, false},
 	}
 
 	for _, tt := range tests {
@@ -145,17 +145,17 @@ func TestServer_FindPeerForP2P_SelectsBestNATType(t *testing.T) {
 	s.clients["sym-peer"] = &ClientSession{
 		ID:            "sym-peer",
 		P2PPublicAddr: "1.2.3.4:5000",
-		P2PNATType:    "Symmetric",
+		P2PNATType:    natTypeSymmetric,
 	}
 	s.clients["rc-peer"] = &ClientSession{
 		ID:            "rc-peer",
 		P2PPublicAddr: "2.3.4.5:5000",
-		P2PNATType:    "Restricted Cone",
+		P2PNATType:    natTypeRestrictedCone,
 	}
 	s.clients["fc-peer"] = &ClientSession{
 		ID:            "fc-peer",
 		P2PPublicAddr: "3.4.5.6:5000",
-		P2PNATType:    "Full Cone",
+		P2PNATType:    natTypeFullCone,
 	}
 
 	// Should prefer Full Cone (highest priority).
@@ -799,7 +799,7 @@ func TestServer_HandleP2POffer_NoPeer(t *testing.T) {
 		}
 		defer stream.Close()
 
-		req := proto.NewP2POfferRequest("tunnel-1", "Full Cone", "1.2.3.4:5000", "192.168.1.1:5000", "")
+		req := proto.NewP2POfferRequest("tunnel-1", natTypeFullCone, "1.2.3.4:5000", "192.168.1.1:5000", "")
 		data, _ := req.Encode()
 		_, _ = stream.Write(data)
 
@@ -1316,7 +1316,7 @@ func TestServer_HandleP2POffer_WithPeer(t *testing.T) {
 		ID:            "peer",
 		Mux:           peerServerMux,
 		P2PPublicAddr: "5.6.7.8:6000",
-		P2PNATType:    "Full Cone",
+		P2PNATType:    natTypeFullCone,
 		P2PPublicKey:  "peer-public-key-base64",
 	}
 
@@ -1355,7 +1355,7 @@ func TestServer_HandleP2POffer_WithPeer(t *testing.T) {
 		}
 		defer stream.Close()
 
-		req := proto.NewP2POfferRequest("tunnel-1", "Full Cone", "1.2.3.4:5000", "192.168.1.1:5000", "initiator-pub-key")
+		req := proto.NewP2POfferRequest("tunnel-1", natTypeFullCone, "1.2.3.4:5000", "192.168.1.1:5000", "initiator-pub-key")
 		data, _ := req.Encode()
 		_, _ = stream.Write(data)
 
@@ -1368,7 +1368,7 @@ func TestServer_HandleP2POffer_WithPeer(t *testing.T) {
 			// Should get the peer's info.
 			assert.True(t, msg.P2POfferResponse.Success)
 			assert.Equal(t, "5.6.7.8:6000", msg.P2POfferResponse.PeerAddr)
-			assert.Equal(t, "Full Cone", msg.P2POfferResponse.PeerNATType)
+			assert.Equal(t, natTypeFullCone, msg.P2POfferResponse.PeerNATType)
 			assert.Equal(t, "peer-public-key-base64", msg.P2POfferResponse.PeerPublicKey)
 		}
 	}()
@@ -1399,7 +1399,7 @@ func TestServer_HandleP2POffer_WithPeer(t *testing.T) {
 	// Verify initiator's P2P info was stored.
 	initiator.mu.Lock()
 	assert.Equal(t, "1.2.3.4:5000", initiator.P2PPublicAddr)
-	assert.Equal(t, "Full Cone", initiator.P2PNATType)
+	assert.Equal(t, natTypeFullCone, initiator.P2PNATType)
 	assert.Equal(t, "initiator-pub-key", initiator.P2PPublicKey)
 	initiator.mu.Unlock()
 }
@@ -1667,7 +1667,7 @@ func TestServer_HandleP2POffer_SymmetricSymmetric(t *testing.T) {
 	peer := &ClientSession{
 		ID:            "sym-peer",
 		P2PPublicAddr: "5.6.7.8:6000",
-		P2PNATType:    "Symmetric",
+		P2PNATType:    natTypeSymmetric,
 		P2PTunnelID:   "peer-tunnel-1",
 		Mux:           serverMux2,
 	}
@@ -1719,7 +1719,7 @@ func TestServer_HandleP2POffer_SymmetricSymmetric(t *testing.T) {
 		}
 		defer stream.Close()
 
-		req := proto.NewP2POfferRequest("tunnel-1", "Symmetric", "1.2.3.4:5000", "192.168.1.1:5000", "key")
+		req := proto.NewP2POfferRequest("tunnel-1", natTypeSymmetric, "1.2.3.4:5000", "192.168.1.1:5000", "key")
 		data, _ := req.Encode()
 		_, _ = stream.Write(data)
 

@@ -33,7 +33,7 @@ func testGenRSAKey(t *testing.T) *rsa.PrivateKey {
 func testBuildJWT(t *testing.T, key *rsa.PrivateKey, issuer, audience, subject string, extra map[string]interface{}, exp int64) string {
 	t.Helper()
 
-	hdr := map[string]string{"alg": "RS256", "kid": "key-1", "typ": "JWT"}
+	hdr := map[string]string{"alg": jwtAlgRS256, "kid": "key-1", "typ": "JWT"}
 	hdrJSON, _ := json.Marshal(hdr)
 	hdrB64 := base64.RawURLEncoding.EncodeToString(hdrJSON)
 
@@ -81,7 +81,7 @@ func testFakeOIDCServer(t *testing.T, key *rsa.PrivateKey) *httptest.Server {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"keys": []map[string]string{
-				{"kty": "RSA", "kid": "key-1", "alg": "RS256", "use": "sig", "n": nB64, "e": eB64},
+				{"kty": "RSA", "kid": "key-1", "alg": jwtAlgRS256, "use": "sig", "n": nB64, "e": eB64},
 			},
 		})
 	})
@@ -104,7 +104,7 @@ func TestOIDCValidator_ValidToken(t *testing.T) {
 	require.NoError(t, err)
 
 	jwt := testBuildJWT(t, key, srv.URL, "my-client", "user@example.com", map[string]interface{}{
-		"email": "user@example.com",
+		claimEmail: "user@example.com",
 	}, time.Now().Add(1*time.Hour).Unix())
 
 	claims, err := v.ValidateToken(jwt)
@@ -165,14 +165,14 @@ func TestOIDCValidator_CustomRoleClaim(t *testing.T) {
 		Issuer:   srv.URL,
 		ClientID: "my-client",
 		ClaimMapping: OIDCClaimMapping{
-			TeamClaim: "email",
+			TeamClaim: claimEmail,
 			RoleClaim: "wormhole_role",
 		},
 	})
 	require.NoError(t, err)
 
 	jwt := testBuildJWT(t, key, srv.URL, "my-client", "admin@example.com", map[string]interface{}{
-		"email":         "admin@example.com",
+		claimEmail:      "admin@example.com",
 		"wormhole_role": "admin",
 	}, time.Now().Add(1*time.Hour).Unix())
 
@@ -206,17 +206,17 @@ func testGenECKey(t *testing.T) *ecdsa.PrivateKey {
 func testBuildES256JWT(t *testing.T, key *ecdsa.PrivateKey, kid, issuer, audience, subject string, exp int64) string {
 	t.Helper()
 
-	hdr := map[string]string{"alg": "ES256", "kid": kid, "typ": "JWT"}
+	hdr := map[string]string{"alg": jwtAlgES256, "kid": kid, "typ": "JWT"}
 	hdrJSON, _ := json.Marshal(hdr)
 	hdrB64 := base64.RawURLEncoding.EncodeToString(hdrJSON)
 
 	payload := map[string]interface{}{
-		"iss":   issuer,
-		"aud":   audience,
-		"sub":   subject,
-		"email": subject,
-		"iat":   time.Now().Unix(),
-		"exp":   exp,
+		"iss":      issuer,
+		"aud":      audience,
+		"sub":      subject,
+		claimEmail: subject,
+		"iat":      time.Now().Unix(),
+		"exp":      exp,
 	}
 	payloadJSON, _ := json.Marshal(payload)
 	payloadB64 := base64.RawURLEncoding.EncodeToString(payloadJSON)
@@ -258,7 +258,7 @@ func testFakeECOIDCServer(t *testing.T, key *ecdsa.PrivateKey, kid string) *http
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"keys": []map[string]string{
-				{"kty": "EC", "kid": kid, "alg": "ES256", "use": "sig", "crv": "P-256", "x": xB64, "y": yB64},
+				{"kty": "EC", "kid": kid, "alg": jwtAlgES256, "use": "sig", "crv": "P-256", "x": xB64, "y": yB64},
 			},
 		})
 	})
@@ -307,7 +307,7 @@ func TestOIDCValidator_ES384ValidToken(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"keys": []map[string]string{
-				{"kty": "EC", "kid": kid, "alg": "ES384", "use": "sig", "crv": "P-384", "x": xB64, "y": yB64},
+				{"kty": "EC", "kid": kid, "alg": jwtAlgES384, "use": "sig", "crv": "P-384", "x": xB64, "y": yB64},
 			},
 		})
 	})
@@ -315,12 +315,12 @@ func TestOIDCValidator_ES384ValidToken(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	// Build ES384 JWT.
-	hdr := map[string]string{"alg": "ES384", "kid": kid, "typ": "JWT"}
+	hdr := map[string]string{"alg": jwtAlgES384, "kid": kid, "typ": "JWT"}
 	hdrJSON, _ := json.Marshal(hdr)
 	hdrB64 := base64.RawURLEncoding.EncodeToString(hdrJSON)
 
 	payload := map[string]interface{}{
-		"iss": srv.URL, "aud": "cli", "sub": "u@x.com", "email": "u@x.com",
+		"iss": srv.URL, "aud": "cli", "sub": "u@x.com", claimEmail: "u@x.com",
 		"iat": time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix(),
 	}
 	payloadJSON, _ := json.Marshal(payload)
@@ -375,7 +375,7 @@ func TestAuthValidateToken_OIDCIntegration(t *testing.T) {
 	a.SetOIDCValidator(oidcV)
 
 	jwt := testBuildJWT(t, key, srv.URL, "cli", "user@example.com", map[string]interface{}{
-		"email": "user@example.com",
+		claimEmail: "user@example.com",
 	}, time.Now().Add(1*time.Hour).Unix())
 
 	claims, err := a.ValidateToken(jwt)

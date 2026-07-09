@@ -11,8 +11,8 @@ import (
 )
 
 func TestMockAddr(t *testing.T) {
-	addr := MockAddr{NetworkStr: "tcp", AddrStr: "127.0.0.1:8080"}
-	assert.Equal(t, "tcp", addr.Network())
+	addr := MockAddr{NetworkStr: networkTCP, AddrStr: "127.0.0.1:8080"}
+	assert.Equal(t, networkTCP, addr.Network())
 	assert.Equal(t, "127.0.0.1:8080", addr.String())
 }
 

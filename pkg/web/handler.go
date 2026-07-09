@@ -8,6 +8,13 @@ import (
 	"strings"
 )
 
+// indexHTML is the canonical SPA entry-point filename served for "/" and as
+// the fallback for unknown client-side routes.
+const indexHTML = "index.html"
+
+// contentTypeJPEG is the MIME type shared by both .jpg and .jpeg extensions.
+const contentTypeJPEG = "image/jpeg"
+
 // ServerConfig holds configuration for the web server.
 type ServerConfig struct {
 	// APIHandler handles /api/* routes.
@@ -40,7 +47,7 @@ func NewServer(config ServerConfig) http.Handler {
 
 		// SPA fallback: serve index.html for unknown routes.
 		if config.FallbackToIndex {
-			if serveFile(w, r, webFS, "/index.html") {
+			if serveFile(w, r, webFS, "/"+indexHTML) {
 				return
 			}
 		}
@@ -53,7 +60,7 @@ func NewServer(config ServerConfig) http.Handler {
 func serveFile(w http.ResponseWriter, r *http.Request, fsys fs.FS, path string) bool {
 	// Clean the path.
 	if path == "/" {
-		path = "index.html"
+		path = indexHTML
 	} else {
 		path = strings.TrimPrefix(path, "/")
 	}
@@ -69,7 +76,7 @@ func serveFile(w http.ResponseWriter, r *http.Request, fsys fs.FS, path string) 
 	stat, err := f.Stat()
 	if err != nil || stat.IsDir() {
 		// If it's a directory, try index.html.
-		indexPath := path + "/index.html"
+		indexPath := path + "/" + indexHTML
 		f2, err := fsys.Open(indexPath)
 		if err != nil {
 			return false
@@ -118,8 +125,8 @@ func getContentType(path string) string {
 		"js":    "application/javascript; charset=utf-8",
 		"json":  "application/json; charset=utf-8",
 		"png":   "image/png",
-		"jpg":   "image/jpeg",
-		"jpeg":  "image/jpeg",
+		"jpg":   contentTypeJPEG,
+		"jpeg":  contentTypeJPEG,
 		"gif":   "image/gif",
 		"svg":   "image/svg+xml",
 		"ico":   "image/x-icon",

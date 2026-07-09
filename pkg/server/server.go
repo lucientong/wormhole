@@ -19,10 +19,16 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// Server is the wormhole server.
-// natTypeSymmetric is the canonical string for Symmetric NAT type.
-const natTypeSymmetric = "Symmetric"
+// NAT type strings as reported by pkg/p2p NAT detection and carried in
+// P2POfferRequest/P2POfferResponse.P2PNATType.
+const (
+	natTypeSymmetric          = "Symmetric"
+	natTypeFullCone           = "Full Cone"
+	natTypeRestrictedCone     = "Restricted Cone"
+	natTypePortRestrictedCone = "Port Restricted Cone"
+)
 
+// Server is the wormhole server.
 type Server struct {
 	config Config
 
@@ -898,12 +904,7 @@ func (s *Server) handleStats(client *ClientSession, stream *tunnel.Stream, _ *pr
 func (s *Server) handleClose(client *ClientSession, stream *tunnel.Stream, req *proto.CloseRequest) {
 	if req == nil || req.TunnelID == "" {
 		log.Warn().Str("client", client.ID).Msg("Close request with empty tunnel ID")
-		resp := proto.NewCloseResponse(false)
-		data, err := resp.Encode()
-		if err != nil {
-			return
-		}
-		_, _ = stream.Write(data)
+		writeCloseResponse(stream, client.ID, false)
 		return
 	}
 
@@ -913,59 +914,17 @@ func (s *Server) handleClose(client *ClientSession, stream *tunnel.Stream, req *
 		Str("reason", req.Reason).
 		Msg("Close request received")
 
-	// Find and remove the tunnel from the client session.
-	client.mu.Lock()
-	var removed *TunnelInfo
-	for i, t := range client.Tunnels {
-		if t.ID == req.TunnelID {
-			removed = t
-			// Remove from slice by swapping with last element.
-			client.Tunnels[i] = client.Tunnels[len(client.Tunnels)-1]
-			client.Tunnels = client.Tunnels[:len(client.Tunnels)-1]
-			break
-		}
-	}
-	client.mu.Unlock()
-
+	removed := removeTunnelFromClient(client, req.TunnelID)
 	if removed == nil {
 		log.Warn().
 			Str("client", client.ID).
 			Str("tunnel_id", req.TunnelID).
 			Msg("Tunnel not found for close request")
-		resp := proto.NewCloseResponse(false)
-		data, err := resp.Encode()
-		if err != nil {
-			return
-		}
-		_, _ = stream.Write(data)
+		writeCloseResponse(stream, client.ID, false)
 		return
 	}
 
-	// Release allocated TCP port if any.
-	if removed.TCPPort > 0 {
-		s.portAllocator.Release(int(removed.TCPPort))
-	}
-
-	// Unregister this tunnel's routes so traffic stops reaching the closed
-	// tunnel while the client's other tunnels (if any) keep working. The
-	// connection-level default subdomain is left registered until full
-	// disconnect (removeClient), matching legacy single-tunnel behavior.
-	if removed.Hostname != "" {
-		s.router.UnregisterHostname(removed.Hostname)
-	}
-	if removed.PathPrefix != "" {
-		s.router.UnregisterPath(removed.PathPrefix)
-	}
-	if removed.Subdomain != "" && removed.Subdomain != client.Subdomain {
-		s.router.UnregisterSubdomain(removed.Subdomain)
-	}
-
-	// Decrement active tunnel counter.
-	atomic.AddUint64(&s.stats.ActiveTunnels, ^uint64(0))
-	if s.metrics != nil {
-		s.metrics.ActiveTunnels.Dec()
-		s.metrics.TunnelDurationSeconds.Observe(time.Since(removed.CreatedAt).Seconds())
-	}
+	s.releaseTunnelResources(client, removed)
 
 	log.Info().
 		Str("client", client.ID).
@@ -977,15 +936,65 @@ func (s *Server) handleClose(client *ClientSession, stream *tunnel.Stream, req *
 		s.auditLogger.LogTunnelClosed(client.ID, removed.ID, removed.Protocol.String(), req.Reason)
 	}
 
-	// Send success response.
-	resp := proto.NewCloseResponse(true)
+	writeCloseResponse(stream, client.ID, true)
+}
+
+// writeCloseResponse encodes and writes a CloseResponse, logging any
+// encode/write failure instead of propagating it (the client will simply
+// time out waiting for a response it never receives).
+func writeCloseResponse(stream *tunnel.Stream, clientID string, success bool) {
+	resp := proto.NewCloseResponse(success)
 	data, err := resp.Encode()
 	if err != nil {
-		log.Error().Err(err).Str("client", client.ID).Msg("Failed to encode close response")
+		log.Error().Err(err).Str("client", clientID).Msg("Failed to encode close response")
 		return
 	}
 	if _, err := stream.Write(data); err != nil {
-		log.Error().Err(err).Str("client", client.ID).Msg("Failed to write close response")
+		log.Error().Err(err).Str("client", clientID).Msg("Failed to write close response")
+	}
+}
+
+// removeTunnelFromClient finds and removes the tunnel with the given ID from
+// client.Tunnels, returning the removed TunnelInfo or nil if not found.
+func removeTunnelFromClient(client *ClientSession, tunnelID string) *TunnelInfo {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+
+	for i, t := range client.Tunnels {
+		if t.ID == tunnelID {
+			removed := t
+			// Remove from slice by swapping with the last element.
+			client.Tunnels[i] = client.Tunnels[len(client.Tunnels)-1]
+			client.Tunnels = client.Tunnels[:len(client.Tunnels)-1]
+			return removed
+		}
+	}
+	return nil
+}
+
+// releaseTunnelResources releases the TCP port and unregisters the routes
+// owned by a closed tunnel, and updates tunnel metrics. The connection-level
+// default subdomain is left registered until full disconnect (removeClient),
+// matching legacy single-tunnel behavior.
+func (s *Server) releaseTunnelResources(client *ClientSession, removed *TunnelInfo) {
+	if removed.TCPPort > 0 {
+		s.portAllocator.Release(int(removed.TCPPort))
+	}
+
+	if removed.Hostname != "" {
+		s.router.UnregisterHostname(removed.Hostname)
+	}
+	if removed.PathPrefix != "" {
+		s.router.UnregisterPath(removed.PathPrefix)
+	}
+	if removed.Subdomain != "" && removed.Subdomain != client.Subdomain {
+		s.router.UnregisterSubdomain(removed.Subdomain)
+	}
+
+	atomic.AddUint64(&s.stats.ActiveTunnels, ^uint64(0))
+	if s.metrics != nil {
+		s.metrics.ActiveTunnels.Dec()
+		s.metrics.TunnelDurationSeconds.Observe(time.Since(removed.CreatedAt).Seconds())
 	}
 }
 
@@ -1222,11 +1231,11 @@ func (s *Server) handleP2PResult(client *ClientSession, result *proto.P2PResult)
 // Higher score = more traversal-friendly = preferred peer.
 func natPriority(natType string) int {
 	switch natType {
-	case "Full Cone":
+	case natTypeFullCone:
 		return 4
-	case "Restricted Cone":
+	case natTypeRestrictedCone:
 		return 3
-	case "Port Restricted Cone":
+	case natTypePortRestrictedCone:
 		return 2
 	case natTypeSymmetric:
 		return 1

@@ -380,7 +380,7 @@ func TestAdminAPI_UnblockIP_Success(t *testing.T) {
 	var result map[string]string
 	err := json.Unmarshal(rec.Body.Bytes(), &result)
 	require.NoError(t, err)
-	assert.Equal(t, "IP unblocked successfully", result["message"])
+	assert.Equal(t, "IP unblocked successfully", result[fieldMessage])
 	assert.Equal(t, "10.0.0.1", result["ip"])
 
 	// Verify IP is no longer blocked.
@@ -433,7 +433,7 @@ func TestAdminAPI_UnblockIP_InvalidBody(t *testing.T) {
 	var resp ErrorResponse
 	err := json.Unmarshal(rec.Body.Bytes(), &resp)
 	require.NoError(t, err)
-	assert.Equal(t, "invalid request body", resp.Error)
+	assert.Equal(t, errMsgInvalidRequestBody, resp.Error)
 }
 
 func TestAdminAPI_UnblockIP_MissingIP(t *testing.T) {
@@ -625,7 +625,7 @@ func TestAdminAPI_Teams_Create(t *testing.T) {
 	var result map[string]string
 	err := json.Unmarshal(rec.Body.Bytes(), &result)
 	require.NoError(t, err)
-	assert.Equal(t, "team created successfully", result["message"])
+	assert.Equal(t, "team created successfully", result[fieldMessage])
 	assert.Equal(t, "new-team", result["name"])
 
 	// Verify team exists.
@@ -980,7 +980,7 @@ func TestAdminAPI_Teams_MethodNotAllowed(t *testing.T) {
 	var resp ErrorResponse
 	err := json.Unmarshal(rec.Body.Bytes(), &resp)
 	require.NoError(t, err)
-	assert.Equal(t, "method not allowed", resp.Error)
+	assert.Equal(t, errMsgMethodNotAllowed, resp.Error)
 }
 
 func TestAdminAPI_Teams_Create_InvalidBody(t *testing.T) {
@@ -1000,7 +1000,7 @@ func TestAdminAPI_Teams_Create_InvalidBody(t *testing.T) {
 	var resp ErrorResponse
 	err := json.Unmarshal(rec.Body.Bytes(), &resp)
 	require.NoError(t, err)
-	assert.Equal(t, "invalid request body", resp.Error)
+	assert.Equal(t, errMsgInvalidRequestBody, resp.Error)
 }
 
 func TestAdminAPI_TeamByName_MethodNotAllowed(t *testing.T) {
@@ -1018,7 +1018,7 @@ func TestAdminAPI_TeamByName_MethodNotAllowed(t *testing.T) {
 	var resp ErrorResponse
 	err := json.Unmarshal(rec.Body.Bytes(), &resp)
 	require.NoError(t, err)
-	assert.Equal(t, "method not allowed", resp.Error)
+	assert.Equal(t, errMsgMethodNotAllowed, resp.Error)
 }
 
 func TestAdminAPI_TeamByName_EmptyName(t *testing.T) {
@@ -1055,7 +1055,7 @@ func TestAdminAPI_GenerateToken_MethodNotAllowed(t *testing.T) {
 	var resp ErrorResponse
 	err := json.Unmarshal(rec.Body.Bytes(), &resp)
 	require.NoError(t, err)
-	assert.Equal(t, "method not allowed", resp.Error)
+	assert.Equal(t, errMsgMethodNotAllowed, resp.Error)
 }
 
 func TestAdminAPI_GenerateToken_InvalidBody(t *testing.T) {
@@ -1075,7 +1075,7 @@ func TestAdminAPI_GenerateToken_InvalidBody(t *testing.T) {
 	var resp ErrorResponse
 	err := json.Unmarshal(rec.Body.Bytes(), &resp)
 	require.NoError(t, err)
-	assert.Equal(t, "invalid request body", resp.Error)
+	assert.Equal(t, errMsgInvalidRequestBody, resp.Error)
 }
 
 func TestAdminAPI_GenerateToken_AllRoles(t *testing.T) {
@@ -1143,7 +1143,7 @@ func TestAdminAPI_RevokeToken_InvalidBody(t *testing.T) {
 	var resp ErrorResponse
 	err := json.Unmarshal(rec.Body.Bytes(), &resp)
 	require.NoError(t, err)
-	assert.Equal(t, "invalid request body", resp.Error)
+	assert.Equal(t, errMsgInvalidRequestBody, resp.Error)
 }
 
 func TestAdminAPI_RefreshToken_MethodNotAllowed(t *testing.T) {
@@ -1176,7 +1176,7 @@ func TestAdminAPI_RefreshToken_InvalidBody(t *testing.T) {
 	var resp ErrorResponse
 	err := json.Unmarshal(rec.Body.Bytes(), &resp)
 	require.NoError(t, err)
-	assert.Equal(t, "invalid request body", resp.Error)
+	assert.Equal(t, errMsgInvalidRequestBody, resp.Error)
 }
 
 func TestAdminAPI_RefreshToken_InvalidDuration(t *testing.T) {
@@ -1237,7 +1237,7 @@ func TestAdminAPI_RevokeTeamTokens(t *testing.T) {
 	var result map[string]string
 	err = json.Unmarshal(rec.Body.Bytes(), &result)
 	require.NoError(t, err)
-	assert.Equal(t, "all team tokens revoked successfully", result["message"])
+	assert.Equal(t, "all team tokens revoked successfully", result[fieldMessage])
 	assert.Equal(t, "revoke-team", result["team"])
 
 	// Both old tokens should be revoked.
@@ -1365,7 +1365,7 @@ func TestAdminAPI_NoAuthenticator(t *testing.T) {
 			var resp ErrorResponse
 			err := json.Unmarshal(rec.Body.Bytes(), &resp)
 			require.NoError(t, err)
-			assert.Equal(t, "authentication is not enabled", resp.Error)
+			assert.Equal(t, errMsgAuthNotEnabled, resp.Error)
 		})
 	}
 }

@@ -28,8 +28,8 @@ func buildClientWithTunnels(defs []ActiveTunnel) *Client {
 
 func TestListActiveTunnels_MultiTunnel(t *testing.T) {
 	c := buildClientWithTunnels([]ActiveTunnel{
-		{Def: TunnelDef{Name: "web", LocalPort: 3000, Protocol: "http"}, TunnelID: "tid-1", PublicURL: "https://abc.example.com"},
-		{Def: TunnelDef{Name: "api", LocalPort: 8080, Protocol: "http"}, TunnelID: "tid-2", PublicURL: "https://def.example.com"},
+		{Def: TunnelDef{Name: "web", LocalPort: 3000, Protocol: protocolHTTP}, TunnelID: "tid-1", PublicURL: "https://abc.example.com"},
+		{Def: TunnelDef{Name: "api", LocalPort: 8080, Protocol: protocolHTTP}, TunnelID: "tid-2", PublicURL: "https://def.example.com"},
 	})
 
 	list := c.ListActiveTunnels()
@@ -45,7 +45,7 @@ func TestListActiveTunnels_SingleTunnelFallback(t *testing.T) {
 	}
 	c.config.LocalPort = 5000
 	c.config.LocalHost = "127.0.0.1"
-	c.config.Protocol = "http"
+	c.config.Protocol = protocolHTTP
 
 	list := c.ListActiveTunnels()
 	require.Len(t, list, 1)
@@ -67,7 +67,7 @@ func TestListActiveTunnels_Empty(t *testing.T) {
 func TestHandleCtrlTunnels_JSON(t *testing.T) {
 	c := buildClientWithTunnels([]ActiveTunnel{
 		{
-			Def:       TunnelDef{Name: "web", LocalPort: 3000, LocalHost: "127.0.0.1", Protocol: "http"},
+			Def:       TunnelDef{Name: "web", LocalPort: 3000, LocalHost: "127.0.0.1", Protocol: protocolHTTP},
 			TunnelID:  "tid-1",
 			PublicURL: "https://abc.example.com",
 		},
@@ -100,7 +100,7 @@ func TestHandleCtrlTunnels_MethodNotAllowed(t *testing.T) {
 
 func TestStartControlServer_BindsAndServes(t *testing.T) {
 	c := buildClientWithTunnels([]ActiveTunnel{
-		{Def: TunnelDef{Name: "test", LocalPort: 9999, Protocol: "http"}, TunnelID: "tid-test"},
+		{Def: TunnelDef{Name: "test", LocalPort: 9999, Protocol: protocolHTTP}, TunnelID: "tid-test"},
 	})
 
 	// Port 0 should be treated as disabled (no-op).

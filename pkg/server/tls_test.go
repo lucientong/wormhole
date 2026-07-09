@@ -43,7 +43,7 @@ func TestTLSManager_TLSConfig_AutoTLS_InvalidDomain(t *testing.T) {
 	config := DefaultConfig()
 	config.TLSEnabled = true
 	config.AutoTLS = true
-	config.Domain = "localhost" // Invalid for Let's Encrypt.
+	config.Domain = defaultDomain // Invalid for Let's Encrypt.
 
 	m := NewTLSManager(config)
 

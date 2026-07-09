@@ -29,6 +29,10 @@ const (
 	ProtocolGRPC      Protocol = 6
 )
 
+// protocolUnknownName is the String() representation of an unrecognized
+// Protocol value (including the zero value ProtocolUnknown).
+const protocolUnknownName = "Unknown"
+
 func (p Protocol) String() string {
 	switch p {
 	case ProtocolHTTP:
@@ -44,7 +48,7 @@ func (p Protocol) String() string {
 	case ProtocolGRPC:
 		return "gRPC"
 	default:
-		return "Unknown"
+		return protocolUnknownName
 	}
 }
 

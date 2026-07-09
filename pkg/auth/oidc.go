@@ -21,6 +21,13 @@ import (
 	"time"
 )
 
+// JWT signing algorithm identifiers (JWS "alg" header values, RFC 7518).
+const (
+	jwtAlgRS256 = "RS256"
+	jwtAlgES256 = "ES256"
+	jwtAlgES384 = "ES384"
+)
+
 // OIDCConfig holds the OIDC provider configuration.
 type OIDCConfig struct {
 	// Issuer is the OIDC provider URL (e.g. "https://accounts.google.com").
@@ -69,6 +76,10 @@ type OIDCValidator struct {
 
 const jwksCacheTTL = 15 * time.Minute
 
+// claimEmail is the standard OIDC claim name used as the default team claim
+// and as a default OAuth2 scope (see also pkg/auth/oauth.go).
+const claimEmail = "email"
+
 // NewOIDCValidator creates an OIDCValidator and performs the OIDC discovery.
 func NewOIDCValidator(config OIDCConfig) (*OIDCValidator, error) {
 	if config.Issuer == "" {
@@ -81,7 +92,7 @@ func NewOIDCValidator(config OIDCConfig) (*OIDCValidator, error) {
 		config.Audience = config.ClientID
 	}
 	if config.ClaimMapping.TeamClaim == "" {
-		config.ClaimMapping.TeamClaim = "email"
+		config.ClaimMapping.TeamClaim = claimEmail
 	}
 	if config.ClaimMapping.DefaultRole == "" {
 		config.ClaimMapping.DefaultRole = RoleMember
@@ -322,7 +333,7 @@ func mapRole(rawClaims map[string]json.RawMessage, mapping OIDCClaimMapping) Rol
 // verifyJWTSignature verifies a JWT signature using the given algorithm and key.
 func verifyJWTSignature(alg string, key crypto.PublicKey, signingInput, sig []byte) error {
 	switch alg {
-	case "RS256":
+	case jwtAlgRS256:
 		sum := sha256.Sum256(signingInput)
 		return verifyRSA(key, crypto.SHA256, sum[:], sig)
 	case "RS384":
@@ -331,9 +342,9 @@ func verifyJWTSignature(alg string, key crypto.PublicKey, signingInput, sig []by
 	case "RS512":
 		sum := sha512.Sum512(signingInput)
 		return verifyRSA(key, crypto.SHA512, sum[:], sig)
-	case "ES256":
+	case jwtAlgES256:
 		return verifyECDSA(key, sha256.New(), signingInput, sig)
-	case "ES384":
+	case jwtAlgES384:
 		return verifyECDSA(key, sha512.New384(), signingInput, sig)
 	case "ES512":
 		return verifyECDSA(key, sha512.New(), signingInput, sig)

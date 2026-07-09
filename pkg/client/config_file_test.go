@@ -42,7 +42,7 @@ func TestLoadFileConfig_Valid(t *testing.T) {
 
 	web := fc.Tunnels["web"]
 	assert.Equal(t, 8080, web.LocalPort)
-	assert.Equal(t, "http", web.Protocol)
+	assert.Equal(t, protocolHTTP, web.Protocol)
 	assert.Equal(t, "myapp", web.Subdomain)
 
 	api := fc.Tunnels["api"]
@@ -129,7 +129,7 @@ tunnels:
 	require.Len(t, cfg.Tunnels, 1)
 	def := cfg.Tunnels[0]
 	assert.Equal(t, defaultLocalHost, def.LocalHost)
-	assert.Equal(t, "http", def.Protocol)
+	assert.Equal(t, protocolHTTP, def.Protocol)
 }
 
 // writeTempConfig writes content to a temp file and returns the path.

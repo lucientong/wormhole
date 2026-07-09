@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"time"
 
 	"github.com/lucientong/wormhole/pkg/p2p"
@@ -113,6 +114,15 @@ type Config struct {
 
 	// CtrlHost is the host the control server binds to (default: 127.0.0.1).
 	CtrlHost string
+
+	// OnAuthFailure, if set, is invoked whenever the server rejects the
+	// current Token during authenticate() (e.g. it has expired). It should
+	// attempt to obtain a fresh token (typically via an OAuth2 refresh_token
+	// grant) and return it with ok=true on success. The client updates
+	// Config.Token and retries authentication exactly once before giving up.
+	// This keeps pkg/client decoupled from any specific OIDC/OAuth2 provider
+	// implementation — the CLI layer wires in the actual refresh logic.
+	OnAuthFailure func(ctx context.Context) (token string, ok bool)
 }
 
 // DefaultConfig returns the default client configuration.
