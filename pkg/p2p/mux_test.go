@@ -307,6 +307,69 @@ func TestUDPMux_LargePayload(t *testing.T) {
 	assert.Equal(t, large, received, "large payload should be received intact")
 }
 
+// TestUDPMux_SlowConsumer_NoSilentDataLoss verifies the DP-10 fix: when a
+// stream's receive buffer fills up because the local consumer isn't
+// draining Read() fast enough, deliverLocked blocks with a bounded
+// timeout and withholds the ACK on failure — instead of the old behavior
+// of silently dropping the segment while still ACKing it (permanent,
+// undetectable data loss). The sender's ARQ retransmits unacked segments
+// until the consumer catches up, so once the slow consumer finally
+// starts reading, the data it receives must be complete, in order, and
+// byte-for-byte identical to what was sent.
+func TestUDPMux_SlowConsumer_NoSilentDataLoss(t *testing.T) {
+	// Use a generous retransmit budget instead of newMuxPair's aggressive
+	// test defaults: while the consumer is stalled, the sender must keep
+	// retrying withheld-ACK segments rather than giving up (which would
+	// force-close the sender's local stream without ever notifying the
+	// peer, hanging the receiver forever). This mirrors real-world
+	// behavior where the peer eventually catches up.
+	conn1, conn2, peer1, peer2 := newUDPPair(t)
+	cfg := DefaultTransportConfig()
+	cfg.RetransmitTimeout = 100 * time.Millisecond
+	cfg.MaxRetransmits = 100
+	initiator := NewUDPMux(conn1, peer1, cfg, nil, true)
+	acceptor := NewUDPMux(conn2, peer2, cfg, nil, false)
+	t.Cleanup(func() {
+		_ = initiator.Close()
+		_ = acceptor.Close()
+	})
+
+	stream, err := initiator.OpenStream()
+	require.NoError(t, err)
+
+	// Large enough to span far more segments than the receive buffer
+	// (streamRecvBufSize=256) and the send window (maxSendWindow=64), so
+	// the receive buffer is guaranteed to fill while the consumer stalls.
+	const totalSize = 1536 * 1024 // 1.5MB
+	payload := make([]byte, totalSize)
+	for i := range payload {
+		payload[i] = byte(i % 256)
+	}
+
+	writeErrCh := make(chan error, 1)
+	go func() {
+		_, writeErr := stream.Write(payload)
+		_ = stream.Close()
+		writeErrCh <- writeErr
+	}()
+
+	accepted, err := acceptor.AcceptStream()
+	require.NoError(t, err)
+	defer accepted.Close()
+
+	// Simulate a slow consumer: don't read at all for a while, letting
+	// the receive buffer fill and delivery attempts time out and retry.
+	time.Sleep(700 * time.Millisecond)
+
+	_ = accepted.SetReadDeadline(time.Now().Add(30 * time.Second))
+	received, readErr := io.ReadAll(accepted)
+	require.NoError(t, readErr)
+
+	require.NoError(t, <-writeErrCh)
+	require.Len(t, received, len(payload), "no bytes should be silently lost")
+	assert.Equal(t, payload, received, "received data must exactly match sent data, in order")
+}
+
 // --- SetReadDeadline ---
 
 func (s *UDPStream) SetReadDeadline(t time.Time) error {

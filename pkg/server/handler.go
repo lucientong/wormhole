@@ -200,9 +200,9 @@ func (h *HTTPHandler) handleWebSocket(client *ClientSession, w http.ResponseWrit
 
 // sendStreamRequest sends the stream metadata to the tunnel client.
 func (h *HTTPHandler) sendStreamRequest(stream *tunnel.Stream, client *ClientSession, r *http.Request) error {
-	_ = client // client is available for future use (e.g., selecting tunnel ID)
+	tunnelID := h.resolveTunnelID(client, r.Host, r.URL.Path)
 
-	streamReq := proto.NewStreamRequest("", generateID(), r.RemoteAddr, proto.ProtocolHTTP)
+	streamReq := proto.NewStreamRequest(tunnelID, generateID(), r.RemoteAddr, proto.ProtocolHTTP)
 	streamReq.StreamRequest.HTTPMetadata = &proto.HTTPMetadata{
 		Method:        r.Method,
 		URI:           r.RequestURI,
@@ -212,6 +212,69 @@ func (h *HTTPHandler) sendStreamRequest(stream *tunnel.Stream, client *ClientSes
 	}
 
 	return proto.WriteControlMessage(stream, streamReq)
+}
+
+// resolveTunnelID determines which of the client's registered tunnels a
+// given request targets, so the client can dispatch to the correct local
+// backend in multi-tunnel mode. Matching precedence mirrors Router.Route:
+// custom hostname > subdomain > longest path prefix. When the client has
+// registered exactly one tunnel, that tunnel is used unconditionally
+// (covers the common single-tunnel case without requiring exact route
+// bookkeeping). Returns "" when no unambiguous match is found, in which
+// case the client falls back to its single configured local port.
+func (h *HTTPHandler) resolveTunnelID(client *ClientSession, host, path string) string {
+	client.mu.Lock()
+	tunnels := make([]*TunnelInfo, len(client.Tunnels))
+	copy(tunnels, client.Tunnels)
+	client.mu.Unlock()
+
+	if len(tunnels) == 0 {
+		return ""
+	}
+	if len(tunnels) == 1 {
+		return tunnels[0].ID
+	}
+
+	host = strings.ToLower(host)
+	if idx := strings.LastIndex(host, ":"); idx != -1 {
+		host = host[:idx]
+	}
+
+	for _, t := range tunnels {
+		if t.Hostname != "" && strings.EqualFold(t.Hostname, host) {
+			return t.ID
+		}
+	}
+
+	domain := strings.ToLower(h.server.config.Domain)
+	suffix := "." + domain
+	if strings.HasSuffix(host, suffix) {
+		sub := host[:len(host)-len(suffix)]
+		for _, t := range tunnels {
+			if t.Subdomain != "" && strings.EqualFold(t.Subdomain, sub) {
+				return t.ID
+			}
+		}
+	}
+
+	normPath := normalizePath(path)
+	var best *TunnelInfo
+	bestLen := 0
+	for _, t := range tunnels {
+		if t.PathPrefix == "" {
+			continue
+		}
+		p := normalizePath(t.PathPrefix)
+		if strings.HasPrefix(normPath, p) && len(p) > bestLen {
+			best = t
+			bestLen = len(p)
+		}
+	}
+	if best != nil {
+		return best.ID
+	}
+
+	return ""
 }
 
 // notFound returns a styled 404 page.

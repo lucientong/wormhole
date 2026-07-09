@@ -408,10 +408,16 @@ Admin API 默认绑定 `127.0.0.1`。如需远程访问，使用 `--admin-host 0
 - [x] Phase 4.5：P2P 端到端集成（peer 匹配、数据传输、Relay→P2P 切换）
 - [x] Phase 5：团队协作（认证、HMAC Token、角色权限、Admin API 保护）
 - [x] Phase 6：P2P 端到端加密（X25519 ECDH、AES-256-GCM、HMAC 认证打洞）
+- [x] Phase 7：控制协议迁移到 Protobuf + 可靠 UDP 传输（UDPMux + UDPStream + ARQ）
+- [x] Phase 8（v0.5.1）：审计日志增强 — 新增事件类型、SQLite 持久化、Admin 查询/导出 API
+- [x] Phase 9（v0.5.2）：声明式隧道配置 — YAML 配置文件、多隧道、SIGHUP 热重载、`tunnels` 子命令
+- [x] Phase 10（v0.5.3）：OIDC / OAuth SSO — OIDC Discovery、JWKS JWT 校验、Device Code Flow、`wormhole login`
+- [x] Phase 11（v0.6.0）：HA / 多节点控制面 — `StateStore` 接口、Redis 后端、集群心跳、跨节点 HTTP 路由
+- [x] Phase 12（v0.6.1）：可靠的连接丢失检测（`Mux.CloseNotify()` + 心跳触发强制重连）、真正生效的多隧道路由（`TunnelID` 端到端接线分发）、修复 P2P 信令帧不匹配、P2P 接收缓冲背压（带超时的阻塞交付 + 消费者卡死时 RST）、TCP 端口分配失败拒绝注册
 
 ## 贡献
 
-欢迎贡献！请阅读 [贡献指南](CONTRIBUTING.md) 了解详情。
+欢迎贡献！
 
 ## 许可证
 

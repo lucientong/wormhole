@@ -96,6 +96,14 @@ type TunnelInfo struct {
 	PublicURL string
 	TCPPort   uint32
 	CreatedAt time.Time
+
+	// Routing metadata, used to disambiguate which tunnel a given HTTP
+	// request targets when a client has registered multiple tunnels
+	// (see resolveTunnelID in handler.go), and to clean up the
+	// corresponding Router entries when this tunnel is individually closed.
+	Subdomain  string
+	Hostname   string
+	PathPrefix string
 }
 
 // Stats contains server statistics.
@@ -715,33 +723,80 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 
 	tunnelID := generateID()
 
-	// Determine public URL based on TLS config.
+	// Determine the subdomain for THIS tunnel. Each RegisterRequest may ask
+	// for its own subdomain (multi-tunnel mode); when omitted, fall back to
+	// the connection-level subdomain assigned at auth time (legacy
+	// single-tunnel behavior).
+	subdomain := req.Subdomain
+	if subdomain == "" {
+		subdomain = client.Subdomain
+	}
+
+	// Determine public URL: prefer a custom hostname when the tunnel
+	// requested one, otherwise fall back to the subdomain-based URL.
 	scheme := "http"
 	if s.config.TLSEnabled {
 		scheme = "https"
 	}
-	publicURL := fmt.Sprintf("%s://%s.%s", scheme, client.Subdomain, s.config.Domain)
+	publicURL := fmt.Sprintf("%s://%s.%s", scheme, subdomain, s.config.Domain)
+	if req.Hostname != "" {
+		publicURL = fmt.Sprintf("%s://%s", scheme, req.Hostname)
+	}
 
-	// Allocate TCP port for TCP tunnels.
+	// Register this tunnel's subdomain route if it differs from the
+	// connection's default (which is already routed at auth time). This
+	// allows a single client connection to serve multiple subdomains, one
+	// per registered tunnel.
+	if subdomain != "" && subdomain != client.Subdomain {
+		if regErr := s.router.RegisterSubdomain(subdomain, client); regErr != nil {
+			log.Warn().Err(regErr).Str("subdomain", subdomain).Msg("Tunnel registration rejected: subdomain already in use")
+			resp := proto.NewRegisterResponse(false, fmt.Sprintf("subdomain %q already in use", subdomain), "", "", 0)
+			data, encErr := resp.Encode()
+			if encErr != nil {
+				return
+			}
+			_, _ = stream.Write(data)
+			return
+		}
+	}
+
+	// Allocate TCP port for TCP tunnels. Unlike HTTP tunnels (which can
+	// share the existing HTTP listener via routing), a TCP tunnel is
+	// useless without its own dedicated port — registering it as
+	// "successful" with TCPPort 0 would silently advertise a tunnel that
+	// can never receive traffic (DP-18). Reject the registration instead
+	// so the client can surface the failure and retry.
 	var tcpPort uint32
 	if req.Protocol == proto.ProtocolTCP {
 		port, ln, allocErr := s.portAllocator.Allocate(context.Background())
 		if allocErr != nil {
 			log.Error().Err(allocErr).Msg("Failed to allocate TCP port")
-		} else {
-			tcpPort = uint32(port) // #nosec G115 -- port from allocator is always in valid range (1024-65535)
-			// Start TCP listener for this tunnel.
-			go s.serveTCPTunnel(ln, client)
+			if subdomain != "" && subdomain != client.Subdomain {
+				s.router.UnregisterSubdomain(subdomain)
+			}
+			resp := proto.NewRegisterResponse(false, fmt.Sprintf("failed to allocate TCP port: %v", allocErr), "", "", 0)
+			data, encErr := resp.Encode()
+			if encErr != nil {
+				return
+			}
+			_, _ = stream.Write(data)
+			return
 		}
+		tcpPort = uint32(port) // #nosec G115 -- port from allocator is always in valid range (1024-65535)
+		// Start TCP listener for this tunnel.
+		go s.serveTCPTunnel(ln, client, tunnelID)
 	}
 
 	tunnelInfo := &TunnelInfo{
-		ID:        tunnelID,
-		LocalPort: req.LocalPort,
-		Protocol:  req.Protocol,
-		PublicURL: publicURL,
-		TCPPort:   tcpPort,
-		CreatedAt: time.Now(),
+		ID:         tunnelID,
+		LocalPort:  req.LocalPort,
+		Protocol:   req.Protocol,
+		PublicURL:  publicURL,
+		TCPPort:    tcpPort,
+		CreatedAt:  time.Now(),
+		Subdomain:  subdomain,
+		Hostname:   req.Hostname,
+		PathPrefix: req.PathPrefix,
 	}
 
 	client.mu.Lock()
@@ -891,6 +946,20 @@ func (s *Server) handleClose(client *ClientSession, stream *tunnel.Stream, req *
 		s.portAllocator.Release(int(removed.TCPPort))
 	}
 
+	// Unregister this tunnel's routes so traffic stops reaching the closed
+	// tunnel while the client's other tunnels (if any) keep working. The
+	// connection-level default subdomain is left registered until full
+	// disconnect (removeClient), matching legacy single-tunnel behavior.
+	if removed.Hostname != "" {
+		s.router.UnregisterHostname(removed.Hostname)
+	}
+	if removed.PathPrefix != "" {
+		s.router.UnregisterPath(removed.PathPrefix)
+	}
+	if removed.Subdomain != "" && removed.Subdomain != client.Subdomain {
+		s.router.UnregisterSubdomain(removed.Subdomain)
+	}
+
 	// Decrement active tunnel counter.
 	atomic.AddUint64(&s.stats.ActiveTunnels, ^uint64(0))
 	if s.metrics != nil {
@@ -944,12 +1013,7 @@ func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, re
 	peer := s.FindPeerForP2P(client.ID)
 	if peer == nil {
 		resp := proto.NewP2POfferResponse(false, "no peer available for P2P", "", "", "")
-		data, err := resp.Encode()
-		if err != nil {
-			log.Error().Err(err).Msg("Failed to encode P2P offer response")
-			return
-		}
-		if _, err := stream.Write(data); err != nil {
+		if err := proto.WriteControlMessage(stream, resp); err != nil {
 			log.Error().Err(err).Msg("Failed to write P2P offer response")
 		}
 		return
@@ -962,8 +1026,7 @@ func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, re
 			Str("peer_nat", peer.P2PNATType).
 			Msg("NAT types not compatible for P2P")
 		resp := proto.NewP2POfferResponse(false, "NAT types not compatible", "", "", "")
-		data, _ := resp.Encode()
-		_, _ = stream.Write(data)
+		_ = proto.WriteControlMessage(stream, resp)
 		return
 	}
 
@@ -986,6 +1049,10 @@ func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, re
 
 	// For Symmetric+Symmetric NAT, generate port prediction candidates and
 	// send them as a P2PCandidates message before the offer response.
+	// Both messages are length-prefixed (proto.WriteControlMessage) so the
+	// client can reliably distinguish and decode each one in turn — see
+	// Client.sendP2POffer, which now loop-reads framed messages instead of
+	// doing a single raw stream.Read() (DP-24).
 	bothSymmetric := req.NATType == natTypeSymmetric && peerNATType == natTypeSymmetric
 	if bothSymmetric {
 		initiatorCandidates := predictCandidatesForSymmetric(req.PublicAddr, req.NATType, 8)
@@ -994,8 +1061,9 @@ func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, re
 		// Send peer's predicted candidates to the initiating client.
 		if len(peerCandidates) > 0 {
 			candidatesMsg := proto.NewP2PCandidates(peerTunnelID, peerCandidates)
-			cData, _ := candidatesMsg.Encode()
-			_, _ = stream.Write(cData)
+			if err := proto.WriteControlMessage(stream, candidatesMsg); err != nil {
+				log.Error().Err(err).Msg("Failed to write P2P candidates")
+			}
 		}
 		// Initiator's predicted candidates will be forwarded to peer in notifyPeerOfP2P.
 		_ = initiatorCandidates
@@ -1010,12 +1078,7 @@ func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, re
 
 	// Send peer info (including ECDH public key) to initiating client.
 	resp := proto.NewP2POfferResponse(true, "", peerAddr, peerNATType, peerPublicKey)
-	data, err := resp.Encode()
-	if err != nil {
-		log.Error().Err(err).Msg("Failed to encode P2P offer response")
-		return
-	}
-	if _, err := stream.Write(data); err != nil {
+	if err := proto.WriteControlMessage(stream, resp); err != nil {
 		log.Error().Err(err).Msg("Failed to write P2P offer response")
 		return
 	}
@@ -1096,28 +1159,27 @@ func (s *Server) notifyPeerOfP2P(peer *ClientSession, initiator *ClientSession) 
 	}
 
 	// For Symmetric+Symmetric, send initiator's predicted candidates first.
+	// Framed with proto.WriteControlMessage (length-prefixed) to match the
+	// client's Client.handleStream, which loop-reads framed control
+	// messages off this notification stream (DP-24).
 	if initiatorNATType == natTypeSymmetric && peerNATType == natTypeSymmetric {
 		candidates := predictCandidatesForSymmetric(initiatorAddr, initiatorNATType, 8)
 		if len(candidates) > 0 {
 			candidatesMsg := proto.NewP2PCandidates(initiatorTunnelID, candidates)
-			cData, _ := candidatesMsg.Encode()
-			_, _ = stream.Write(cData)
-			log.Debug().
-				Str("peer", peer.ID).
-				Int("candidates", len(candidates)).
-				Msg("Sent initiator port prediction candidates to peer")
+			if err := proto.WriteControlMessage(stream, candidatesMsg); err != nil {
+				log.Error().Err(err).Str("peer", peer.ID).Msg("Failed to write P2P candidates to peer")
+			} else {
+				log.Debug().
+					Str("peer", peer.ID).
+					Int("candidates", len(candidates)).
+					Msg("Sent initiator port prediction candidates to peer")
+			}
 		}
 	}
 
 	// Send P2P offer response (as a notification) with the initiator's info and public key.
 	msg := proto.NewP2POfferResponse(true, "", initiatorAddr, initiatorNATType, initiatorPublicKey)
-	data, err := msg.Encode()
-	if err != nil {
-		log.Error().Err(err).Msg("Failed to encode P2P notification")
-		return
-	}
-
-	if _, err := stream.Write(data); err != nil {
+	if err := proto.WriteControlMessage(stream, msg); err != nil {
 		log.Error().Err(err).Str("peer", peer.ID).Msg("Failed to write P2P notification")
 		return
 	}
@@ -1247,7 +1309,7 @@ func (s *Server) serveACMEChallenge() {
 }
 
 // serveTCPTunnel handles raw TCP connections for a tunnel.
-func (s *Server) serveTCPTunnel(ln net.Listener, client *ClientSession) {
+func (s *Server) serveTCPTunnel(ln net.Listener, client *ClientSession, tunnelID string) {
 	defer ln.Close()
 
 	for {
@@ -1260,12 +1322,12 @@ func (s *Server) serveTCPTunnel(ln net.Listener, client *ClientSession) {
 			continue
 		}
 
-		go s.handleTCPConnection(conn, client)
+		go s.handleTCPConnection(conn, client, tunnelID)
 	}
 }
 
 // handleTCPConnection handles a single raw TCP connection by proxying it through the tunnel.
-func (s *Server) handleTCPConnection(conn net.Conn, client *ClientSession) {
+func (s *Server) handleTCPConnection(conn net.Conn, client *ClientSession, tunnelID string) {
 	defer conn.Close()
 
 	// Open stream to client.
@@ -1276,8 +1338,9 @@ func (s *Server) handleTCPConnection(conn net.Conn, client *ClientSession) {
 	}
 	defer stream.Close()
 
-	// Send stream request.
-	streamReq := proto.NewStreamRequest("", generateID(), conn.RemoteAddr().String(), proto.ProtocolTCP)
+	// Send stream request. TunnelID lets the client dispatch to the
+	// correct local port in multi-tunnel mode (see Client.resolveLocalAddr).
+	streamReq := proto.NewStreamRequest(tunnelID, generateID(), conn.RemoteAddr().String(), proto.ProtocolTCP)
 	if err := proto.WriteControlMessage(stream, streamReq); err != nil {
 		return
 	}

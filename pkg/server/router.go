@@ -76,6 +76,29 @@ func (r *Router) RegisterPath(pathPrefix string, client *ClientSession) error {
 	return nil
 }
 
+// UnregisterSubdomain removes a single subdomain route, if present.
+// Used when an individual tunnel is closed but the client connection
+// (and its other tunnels) remain active.
+func (r *Router) UnregisterSubdomain(subdomain string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.subdomains, strings.ToLower(subdomain))
+}
+
+// UnregisterHostname removes a single custom hostname route, if present.
+func (r *Router) UnregisterHostname(hostname string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.hostnames, strings.ToLower(hostname))
+}
+
+// UnregisterPath removes a single path-prefix route, if present.
+func (r *Router) UnregisterPath(pathPrefix string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.paths, normalizePath(pathPrefix))
+}
+
 // Unregister removes all routes for the given client session.
 func (r *Router) Unregister(client *ClientSession) {
 	r.mu.Lock()

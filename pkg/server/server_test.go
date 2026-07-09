@@ -803,13 +803,11 @@ func TestServer_HandleP2POffer_NoPeer(t *testing.T) {
 		data, _ := req.Encode()
 		_, _ = stream.Write(data)
 
-		buf := make([]byte, 4096)
-		n, readErr := stream.Read(buf)
+		msg, readErr := proto.ReadControlMessage(stream)
 		if readErr != nil {
 			return
 		}
 
-		msg, _ := proto.DecodeControlMessage(buf[:n])
 		if msg != nil && msg.P2POfferResponse != nil {
 			assert.False(t, msg.P2POfferResponse.Success)
 			assert.Contains(t, msg.P2POfferResponse.Error, "no peer available")
@@ -1172,7 +1170,7 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 	handlerDone := make(chan struct{})
 	go func() {
 		defer close(handlerDone)
-		s.handleTCPConnection(proxyConn, client)
+		s.handleTCPConnection(proxyConn, client, "test-tunnel")
 	}()
 
 	// External TCP client sends data.
@@ -1217,7 +1215,7 @@ func TestServer_HandleTCPConnection_ClientMuxClosed(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.handleTCPConnection(proxyConn, client)
+		s.handleTCPConnection(proxyConn, client, "test-tunnel")
 	}()
 
 	// Should return quickly since mux is closed.
@@ -1275,7 +1273,7 @@ func TestServer_ServeTCPTunnel(t *testing.T) {
 	}()
 
 	// Start serveTCPTunnel in background (it will close ln on return).
-	go s.serveTCPTunnel(ln, client)
+	go s.serveTCPTunnel(ln, client, "test-tunnel")
 
 	// Connect to the TCP tunnel port.
 	conn, err := net.Dial("tcp", ln.Addr().String())
@@ -1337,14 +1335,7 @@ func TestServer_HandleP2POffer_WithPeer(t *testing.T) {
 		}
 		defer stream.Close()
 
-		buf := make([]byte, 4096)
-		n, err := stream.Read(buf)
-		if err != nil {
-			peerNotified <- false
-			return
-		}
-
-		msg, err := proto.DecodeControlMessage(buf[:n])
+		msg, err := proto.ReadControlMessage(stream)
 		if err != nil || msg.P2POfferResponse == nil {
 			peerNotified <- false
 			return
@@ -1368,13 +1359,11 @@ func TestServer_HandleP2POffer_WithPeer(t *testing.T) {
 		data, _ := req.Encode()
 		_, _ = stream.Write(data)
 
-		buf := make([]byte, 4096)
-		n, readErr := stream.Read(buf)
+		msg, readErr := proto.ReadControlMessage(stream)
 		if readErr != nil {
 			return
 		}
 
-		msg, _ := proto.DecodeControlMessage(buf[:n])
 		if msg != nil && msg.P2POfferResponse != nil {
 			// Should get the peer's info.
 			assert.True(t, msg.P2POfferResponse.Success)
@@ -1580,6 +1569,87 @@ func TestServer_HandleRegister_TCP(t *testing.T) {
 	s.portAllocator.Release(int(tcpPort))
 }
 
+// TestServer_HandleRegister_TCP_PortAllocationFailure verifies the DP-18
+// fix: when no TCP port can be allocated, registration is rejected
+// (Success=false) instead of silently "succeeding" with TCPPort 0, which
+// would advertise a tunnel that can never actually receive traffic.
+func TestServer_HandleRegister_TCP_PortAllocationFailure(t *testing.T) {
+	s := newTestServerForIntegration()
+	// Exhausted range: Allocate() always fails.
+	s.portAllocator = NewTCPPortAllocator(20000, 20000)
+
+	clientMux, serverMux := newMuxPair(t)
+
+	client := &ClientSession{
+		ID:        "tcp-fail-client",
+		Subdomain: "tcpfail",
+		Mux:       serverMux,
+		CreatedAt: time.Now(),
+		LastSeen:  time.Now(),
+	}
+	s.clientLock.Lock()
+	s.clients[client.ID] = client
+	s.clientLock.Unlock()
+	_ = s.router.RegisterSubdomain("tcpfail", client)
+
+	errCh := make(chan error, 1)
+	go func() {
+		stream, err := clientMux.OpenStream()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer stream.Close()
+
+		req := proto.NewRegisterRequest(3306, proto.ProtocolTCP, "tcpfail", "", "")
+		data, _ := req.Encode()
+		if _, writeErr := stream.Write(data); writeErr != nil {
+			errCh <- writeErr
+			return
+		}
+
+		buf := make([]byte, 4096)
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			errCh <- readErr
+			return
+		}
+		msg, decErr := proto.DecodeControlMessage(buf[:n])
+		if decErr != nil {
+			errCh <- decErr
+			return
+		}
+		if msg.RegisterResponse == nil {
+			errCh <- errors.New("expected register response")
+			return
+		}
+		if msg.RegisterResponse.Success {
+			errCh <- errors.New("expected registration to fail when TCP port allocation fails")
+			return
+		}
+		errCh <- nil
+	}()
+
+	stream, err := serverMux.AcceptStream()
+	require.NoError(t, err)
+	defer stream.Close()
+
+	buf := make([]byte, 4096)
+	n, err := stream.Read(buf)
+	require.NoError(t, err)
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	require.NoError(t, err)
+	require.NotNil(t, msg.RegisterRequest)
+
+	s.handleRegister(client, stream, msg.RegisterRequest)
+	require.NoError(t, <-errCh)
+
+	// No tunnel should have been added to the client session.
+	client.mu.Lock()
+	assert.Empty(t, client.Tunnels)
+	client.mu.Unlock()
+}
+
 // TestServer_HandleP2POffer_SymmetricSymmetric verifies that when both peers
 // have Symmetric NAT, the server now uses port prediction and proceeds with P2P
 // (rather than immediately rejecting the pairing).
@@ -1607,22 +1677,39 @@ func TestServer_HandleP2POffer_SymmetricSymmetric(t *testing.T) {
 	s.clients[peer.ID] = peer
 	s.clientLock.Unlock()
 
-	// Goroutine simulating the peer client — reads the notification stream.
+	// Goroutine simulating the peer client — reads the notification stream
+	// opened by notifyPeerOfP2P and asserts that BOTH the P2PCandidates
+	// message and the terminal P2POfferResponse are correctly framed and
+	// decoded (DP-24 fix), rather than silently discarding one of them.
+	peerGotCandidates := 0
+	peerGotOfferResponse := false
 	peerDone := make(chan struct{})
 	go func() {
 		defer close(peerDone)
-		// Accept the notification stream opened by notifyPeerOfP2P.
 		stream, err := clientMux2.AcceptStream()
 		if err != nil {
 			return
 		}
 		defer stream.Close()
-		// Drain all messages written into this stream (candidates + notification).
-		buf := make([]byte, 4096)
-		_, _ = stream.Read(buf)
+		for {
+			msg, readErr := proto.ReadControlMessage(stream)
+			if readErr != nil {
+				return
+			}
+			if msg.P2PCandidates != nil {
+				peerGotCandidates = len(msg.P2PCandidates.Candidates)
+				continue
+			}
+			if msg.P2POfferResponse != nil {
+				peerGotOfferResponse = msg.P2POfferResponse.Success
+				return
+			}
+		}
 	}()
 
-	// Goroutine simulating the initiating client — sends offer and reads responses.
+	// Goroutine simulating the initiating client — sends offer and reads
+	// its own P2PCandidates + P2POfferResponse off the same stream.
+	initiatorGotCandidates := 0
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -1636,17 +1723,22 @@ func TestServer_HandleP2POffer_SymmetricSymmetric(t *testing.T) {
 		data, _ := req.Encode()
 		_, _ = stream.Write(data)
 
-		// Read one or two messages (optional candidates + offer response).
-		buf := make([]byte, 8192)
-		n, readErr := stream.Read(buf)
-		if readErr != nil {
-			return
+		// Read framed messages: an optional P2PCandidates message, then
+		// the terminal P2POfferResponse.
+		var resp *proto.P2POfferResponse
+		for resp == nil {
+			msg, readErr := proto.ReadControlMessage(stream)
+			if readErr != nil {
+				return
+			}
+			if msg.P2PCandidates != nil {
+				initiatorGotCandidates = len(msg.P2PCandidates.Candidates)
+				continue
+			}
+			resp = msg.P2POfferResponse
 		}
-		msg, _ := proto.DecodeControlMessage(buf[:n])
-		if msg != nil && msg.P2POfferResponse != nil {
-			// With port prediction enabled, Symmetric+Symmetric should succeed.
-			assert.True(t, msg.P2POfferResponse.Success)
-		}
+		// With port prediction enabled, Symmetric+Symmetric should succeed.
+		assert.True(t, resp.Success)
 	}()
 
 	stream, err := serverMux1.AcceptStream()
@@ -1663,6 +1755,13 @@ func TestServer_HandleP2POffer_SymmetricSymmetric(t *testing.T) {
 	s.handleP2POffer(initiator, stream, msg.P2POfferRequest)
 	<-done
 	<-peerDone
+
+	// Both sides must have received and correctly decoded their predicted
+	// candidates in addition to the terminal offer response — this is the
+	// DP-24 acceptance criterion.
+	assert.Greater(t, initiatorGotCandidates, 0, "initiator should receive peer's predicted candidates")
+	assert.Greater(t, peerGotCandidates, 0, "peer should receive initiator's predicted candidates")
+	assert.True(t, peerGotOfferResponse, "peer should receive a successful offer notification")
 }
 
 // TestServer_HandleP2POffer_IncompatibleNAT verifies that two clients with
@@ -1700,13 +1799,11 @@ func TestServer_HandleP2POffer_IncompatibleNAT(t *testing.T) {
 		data, _ := req.Encode()
 		_, _ = stream.Write(data)
 
-		buf := make([]byte, 4096)
-		n, readErr := stream.Read(buf)
+		msg, readErr := proto.ReadControlMessage(stream)
 		if readErr != nil {
 			return
 		}
 
-		msg, _ := proto.DecodeControlMessage(buf[:n])
 		if msg != nil && msg.P2POfferResponse != nil {
 			assert.False(t, msg.P2POfferResponse.Success)
 			assert.Contains(t, msg.P2POfferResponse.Error, "NAT types not compatible")
@@ -1800,6 +1897,199 @@ func TestServer_HandleRegister_CustomHostname(t *testing.T) {
 	// Verify the custom hostname was registered in the router.
 	resolved := s.router.Route("custom.example.com", "/")
 	assert.Equal(t, client, resolved)
+}
+
+// doRegisterRequest performs a full RegisterRequest/RegisterResponse
+// round-trip against handleRegister via a real mux pair, returning the
+// decoded response. Used by multi-tunnel routing tests below.
+func doRegisterRequest(t *testing.T, s *Server, client *ClientSession, req *proto.ControlMessage) *proto.RegisterResponse {
+	t.Helper()
+
+	clientMux, serverMux := newMuxPair(t)
+	defer clientMux.Close()
+	defer serverMux.Close()
+	client.Mux = serverMux
+
+	errCh := make(chan error, 1)
+	respCh := make(chan *proto.RegisterResponse, 1)
+	go func() {
+		stream, err := clientMux.OpenStream()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer stream.Close()
+
+		data, encErr := req.Encode()
+		if encErr != nil {
+			errCh <- encErr
+			return
+		}
+		if _, writeErr := stream.Write(data); writeErr != nil {
+			errCh <- writeErr
+			return
+		}
+
+		buf := make([]byte, 4096)
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			errCh <- readErr
+			return
+		}
+		msg, decErr := proto.DecodeControlMessage(buf[:n])
+		if decErr != nil {
+			errCh <- decErr
+			return
+		}
+		respCh <- msg.RegisterResponse
+		errCh <- nil
+	}()
+
+	stream, err := serverMux.AcceptStream()
+	require.NoError(t, err)
+	defer stream.Close()
+
+	buf := make([]byte, 4096)
+	n, err := stream.Read(buf)
+	require.NoError(t, err)
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	require.NoError(t, err)
+	require.NotNil(t, msg.RegisterRequest)
+
+	s.handleRegister(client, stream, msg.RegisterRequest)
+	require.NoError(t, <-errCh)
+	return <-respCh
+}
+
+// TestServer_HandleRegister_MultiTunnel_DistinctSubdomains verifies the
+// DP-21/DP-22 fix: a single client connection can register multiple
+// tunnels, each with its own subdomain, and each gets routed independently
+// (not all collapsed onto the connection-level default subdomain).
+func TestServer_HandleRegister_MultiTunnel_DistinctSubdomains(t *testing.T) {
+	s := newTestServerForIntegration()
+
+	client := &ClientSession{
+		ID:        "multi-tunnel-client",
+		Subdomain: "default",
+		CreatedAt: time.Now(),
+		LastSeen:  time.Now(),
+	}
+	s.clientLock.Lock()
+	s.clients[client.ID] = client
+	s.clientLock.Unlock()
+	_ = s.router.RegisterSubdomain("default", client)
+
+	webReq := proto.NewRegisterRequest(3000, proto.ProtocolHTTP, "web", "", "")
+	webResp := doRegisterRequest(t, s, client, webReq)
+	require.NotNil(t, webResp)
+	require.True(t, webResp.Success)
+
+	apiReq := proto.NewRegisterRequest(8080, proto.ProtocolHTTP, "api", "", "")
+	apiResp := doRegisterRequest(t, s, client, apiReq)
+	require.NotNil(t, apiResp)
+	require.True(t, apiResp.Success)
+
+	// Both subdomains should independently route to the same client.
+	assert.Equal(t, client, s.router.Route("web.localhost", "/"))
+	assert.Equal(t, client, s.router.Route("api.localhost", "/"))
+	assert.Equal(t, client, s.router.Route("default.localhost", "/"))
+
+	client.mu.Lock()
+	require.Len(t, client.Tunnels, 2)
+	assert.Equal(t, "web", client.Tunnels[0].Subdomain)
+	assert.Equal(t, "api", client.Tunnels[1].Subdomain)
+	client.mu.Unlock()
+}
+
+// TestServer_HandleRegister_MultiTunnel_SubdomainConflict verifies that
+// registering a tunnel with a subdomain already claimed by a *different*
+// client is rejected rather than silently overwriting the existing route.
+func TestServer_HandleRegister_MultiTunnel_SubdomainConflict(t *testing.T) {
+	s := newTestServerForIntegration()
+
+	other := &ClientSession{ID: "other-client", Subdomain: "taken"}
+	_ = s.router.RegisterSubdomain("taken", other)
+
+	client := &ClientSession{
+		ID:        "conflicting-client",
+		Subdomain: "default2",
+		CreatedAt: time.Now(),
+		LastSeen:  time.Now(),
+	}
+	s.clientLock.Lock()
+	s.clients[client.ID] = client
+	s.clientLock.Unlock()
+	_ = s.router.RegisterSubdomain("default2", client)
+
+	req := proto.NewRegisterRequest(3000, proto.ProtocolHTTP, "taken", "", "")
+	resp := doRegisterRequest(t, s, client, req)
+	require.NotNil(t, resp)
+	assert.False(t, resp.Success)
+	assert.Contains(t, resp.Error, "taken")
+
+	// The conflicting subdomain must still resolve to the original owner.
+	assert.Equal(t, other, s.router.Route("taken.localhost", "/"))
+}
+
+// TestServer_HandleClose_UnregistersTunnelSpecificRoutes verifies that
+// closing one tunnel of a multi-tunnel client removes only that tunnel's
+// subdomain route, leaving the client's other tunnels reachable.
+func TestServer_HandleClose_UnregistersTunnelSpecificRoutes(t *testing.T) {
+	s := newTestServerForIntegration()
+
+	client := &ClientSession{
+		ID:        "close-multi-client",
+		Subdomain: "default3",
+		CreatedAt: time.Now(),
+		LastSeen:  time.Now(),
+	}
+	s.clientLock.Lock()
+	s.clients[client.ID] = client
+	s.clientLock.Unlock()
+	_ = s.router.RegisterSubdomain("default3", client)
+
+	webResp := doRegisterRequest(t, s, client, proto.NewRegisterRequest(3000, proto.ProtocolHTTP, "web2", "", ""))
+	require.True(t, webResp.Success)
+	apiResp := doRegisterRequest(t, s, client, proto.NewRegisterRequest(8080, proto.ProtocolHTTP, "api2", "", ""))
+	require.True(t, apiResp.Success)
+
+	require.NotNil(t, s.router.Route("web2.localhost", "/"))
+	require.NotNil(t, s.router.Route("api2.localhost", "/"))
+
+	// Close the "web2" tunnel only.
+	clientMux, serverMux := newMuxPair(t)
+	defer clientMux.Close()
+	defer serverMux.Close()
+	client.Mux = serverMux
+
+	go func() {
+		stream, err := clientMux.OpenStream()
+		if err != nil {
+			return
+		}
+		defer stream.Close()
+		req := proto.NewCloseRequest(webResp.TunnelID, "test close")
+		data, _ := req.Encode()
+		_, _ = stream.Write(data)
+		buf := make([]byte, 4096)
+		_, _ = stream.Read(buf)
+	}()
+
+	stream, err := serverMux.AcceptStream()
+	require.NoError(t, err)
+	defer stream.Close()
+	buf := make([]byte, 4096)
+	n, err := stream.Read(buf)
+	require.NoError(t, err)
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	require.NoError(t, err)
+	require.NotNil(t, msg.CloseRequest)
+
+	s.handleClose(client, stream, msg.CloseRequest)
+
+	// web2 route is gone, api2 route (the other tunnel) is untouched.
+	assert.Nil(t, s.router.Route("web2.localhost", "/"))
+	assert.Equal(t, client, s.router.Route("api2.localhost", "/"))
 }
 
 // --- P1-3: Quota Enforcement Tests ---

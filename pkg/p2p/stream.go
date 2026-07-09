@@ -25,6 +25,17 @@ import (
 const (
 	maxSendWindow     = 64
 	streamRecvBufSize = 256 // must be >= maxSendWindow to avoid deadlocks
+
+	// recvDeliverTimeout bounds how long deliverLocked blocks trying to
+	// push a segment into recvCh when the buffer is full. Kept short
+	// because it runs on the mux's single readLoop goroutine, which is
+	// shared by every other stream on the same connection.
+	recvDeliverTimeout = 200 * time.Millisecond
+
+	// maxConsecutiveDeliverFailures is the number of consecutive delivery
+	// timeouts after which the stream is reset (RST) instead of retrying
+	// forever against a consumer that has stopped draining Read().
+	maxConsecutiveDeliverFailures = 25 // ~5s at 200ms each
 )
 
 // streamPacket represents a sent, unacknowledged data fragment.
@@ -50,9 +61,10 @@ type UDPStream struct {
 	sendCreditCh chan struct{}
 
 	// ARQ receive state.
-	recvSeq     uint32
-	recvBuf     map[uint32][]byte
-	recvBufLock sync.Mutex
+	recvSeq                    uint32
+	recvBuf                    map[uint32][]byte
+	recvBufLock                sync.Mutex
+	consecutiveDeliverFailures uint32 // count of consecutive deliverLocked timeouts, see handleData
 
 	// Ordered delivery channel.
 	recvCh chan []byte
@@ -257,31 +269,51 @@ func (s *UDPStream) drainCredits() {
 // ---------------------------------------------------------------------------
 
 // handleData processes an incoming DATA frame.
+//
+// Backpressure (DP-10): if the local consumer isn't draining Read() fast
+// enough, recvCh fills up. Rather than silently dropping the segment
+// while still ACKing it (which would desync recvSeq from what was
+// actually delivered — permanent, silent data loss with no recovery),
+// we withhold the ACK on delivery failure. The peer's ARQ then retransmits
+// the segment after its RTO, naturally slowing the sender down (implicit
+// window-shrink) until the consumer catches up. If the consumer stays
+// stuck long enough, the stream is reset instead of retrying forever.
 func (s *UDPStream) handleData(seq uint32, payload []byte) {
 	if atomic.LoadUint32(&s.closed) == 1 {
 		return
 	}
 
-	// Send ACK immediately.
-	_ = s.mux.sendPacket(s.id, muxTypeAck, seq, nil)
-
 	s.recvBufLock.Lock()
-	defer s.recvBufLock.Unlock()
 
 	expected := atomic.LoadUint32(&s.recvSeq) + 1
 
 	if seq == expected {
-		s.deliverLocked(seq, payload)
+		if !s.deliverLocked(seq, payload) {
+			// Delivery timed out: don't ACK, don't advance recvSeq, don't
+			// touch the out-of-order buffer. The sender will retransmit.
+			s.recvBufLock.Unlock()
+			if atomic.LoadUint32(&s.consecutiveDeliverFailures) >= maxConsecutiveDeliverFailures {
+				log.Warn().
+					Uint32("stream_id", s.id).
+					Msg("P2P stream: consumer stalled too long, resetting stream")
+				_ = s.mux.sendPacket(s.id, muxTypeRST, 0, nil)
+				s.forceClose()
+			}
+			return
+		}
 
-		// Deliver any buffered out-of-order segments.
+		// Deliver any buffered out-of-order segments now unblocked.
 		for {
 			next := atomic.LoadUint32(&s.recvSeq) + 1
-			if buf, ok := s.recvBuf[next]; ok {
-				s.deliverLocked(next, buf)
-				delete(s.recvBuf, next)
-			} else {
+			buf, ok := s.recvBuf[next]
+			if !ok {
 				break
 			}
+			if !s.deliverLocked(next, buf) {
+				// Leave it buffered; will retry on the next in-order DATA.
+				break
+			}
+			delete(s.recvBuf, next)
 		}
 	} else if seq > expected {
 		// Out-of-order: buffer.
@@ -291,20 +323,42 @@ func (s *UDPStream) handleData(seq uint32, payload []byte) {
 			s.recvBuf[seq] = copied
 		}
 	}
-	// seq < expected: duplicate, already ACKed — ignore.
+	// seq < expected: duplicate, already delivered — fall through to ACK
+	// below so a peer retransmit (e.g. its own ACK was lost) is confirmed.
+
+	s.recvBufLock.Unlock()
+	_ = s.mux.sendPacket(s.id, muxTypeAck, seq, nil)
 }
 
-// deliverLocked pushes decrypted data to recvCh and advances recvSeq.
-// Must be called with recvBufLock held.
-func (s *UDPStream) deliverLocked(seq uint32, data []byte) {
+// deliverLocked pushes decrypted data to recvCh and advances recvSeq. It
+// blocks for up to recvDeliverTimeout waiting for room in recvCh — this
+// runs on the UDPMux's single readLoop goroutine, so the timeout is kept
+// short to bound how long other streams sharing this mux are stalled.
+// Must be called with recvBufLock held. Returns false on timeout, in
+// which case recvSeq is deliberately left unadvanced (see handleData).
+func (s *UDPStream) deliverLocked(seq uint32, data []byte) bool {
 	copied := make([]byte, len(data))
 	copy(copied, data)
+
+	timer := time.NewTimer(recvDeliverTimeout)
+	defer timer.Stop()
+
 	select {
 	case s.recvCh <- copied:
-	default:
-		log.Warn().Uint32("stream_id", s.id).Msg("P2P stream: recv buffer full, dropping packet")
+		atomic.StoreUint32(&s.recvSeq, seq)
+		atomic.StoreUint32(&s.consecutiveDeliverFailures, 0)
+		return true
+	case <-timer.C:
+		n := atomic.AddUint32(&s.consecutiveDeliverFailures, 1)
+		log.Warn().
+			Uint32("stream_id", s.id).
+			Uint32("seq", seq).
+			Uint32("consecutive_failures", n).
+			Msg("P2P stream: recv buffer full, withholding ACK for backpressure")
+		return false
+	case <-s.closeCh:
+		return false
 	}
-	atomic.StoreUint32(&s.recvSeq, seq)
 }
 
 // handleAck removes the acknowledged segment from the send buffer and

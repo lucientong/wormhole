@@ -231,7 +231,16 @@ Fixed header size: 10 bytes (HeaderSize)
 
 ## Control Protocol
 
-Control messages use JSON encoding, transmitted over Mux Streams (each message uses an independent Stream).
+Control messages are Protobuf-encoded by default (`pkg/proto/messages.go`), with a JSON fallback path retained in `DecodeControlMessage` for compatibility. Each message is transmitted over a Mux Stream.
+
+### Wire Framing
+
+Two framing conventions coexist, depending on whether a Stream carries exactly one message or a sequence of messages:
+
+- **Single message per Stream** (Auth/Register/Ping/Stats/Close request-response pairs): the encoded message is written directly with no length prefix — the stream boundary itself delimits the message.
+- **Multiple messages per Stream** (P2P signaling — see below): each message is wrapped with a 4-byte big-endian length prefix via `proto.WriteControlMessage` / read back with `proto.ReadControlMessage`, so a reader can loop-read several framed messages off a single Stream without ambiguity.
+
+P2P signaling needs the length-prefixed form because a single notification Stream carries a variable-length list of `P2PCandidates` (Symmetric-NAT port predictions) **followed by** a terminal `P2POfferResponse` — both the server (`handleP2POffer`, `notifyPeerOfP2P`) and the client (`handleStream`, `sendP2POffer`) loop-read framed messages, collecting `P2PCandidates` until the terminal response arrives.
 
 ### Message Types
 
@@ -380,6 +389,12 @@ This is the most critical data flow — how external HTTP requests reach the loc
    - HTTP parse fails → falls back to `forwardRawTCP` (with buffer reassembly)
    - Local service unreachable → returns 502 Bad Gateway
 
+4. **Multi-tunnel dispatch** (`handler.go: resolveTunnelID` / `client.go: resolveLocalAddr`):
+   - Step 1 (`Route(Host)`) only resolves the request down to a `ClientSession` — a single client connection may have **multiple** registered tunnels (multi-tunnel YAML config), each with its own local backend.
+   - The server's `resolveTunnelID(client, host, path)` disambiguates which of the client's tunnels the request is actually for, matching in priority order: custom hostname → per-tunnel subdomain → longest path-prefix. The result populates `StreamRequest.TunnelID`.
+   - The client's `resolveLocalAddr(tunnelID)` looks up that `TunnelID` in its `activeTunnels` map to find the tunnel-specific `LocalHost`/`LocalPort`, falling back to the top-level client config only when `TunnelID` is empty or unrecognized (single-tunnel backward compatibility).
+   - This ensures that in multi-tunnel mode, traffic for each subdomain/hostname/path is forwarded to its own configured local port instead of all traffic collapsing onto the first-registered tunnel.
+
 ### WebSocket Proxy
 
 WebSocket upgrade requests are handled specially (`handler.go: handleWebSocket`):
@@ -418,6 +433,12 @@ TCP tunnels are used for non-HTTP protocols (gRPC, database connections, etc.):
 ```
 
 TCP tunnels do not go through the Inspector since there is no HTTP semantics to parse.
+
+The `StreamRequest` for a TCP connection carries the originating `TunnelID` (set by `serveTCPTunnel`/`handleTCPConnection`, one dedicated listener per registered TCP tunnel), so the client's `resolveLocalAddr` dispatches to the correct local backend in multi-tunnel mode — the same mechanism used for HTTP (see "Multi-tunnel dispatch" above).
+
+### Port Allocation Failure Handling
+
+`TCPPortAllocator` draws from a bounded port range (default `10000-20000`, see `--tcp-port-range`). If registration requests a TCP tunnel and the allocator has no free port left, `handleRegister` **rejects the registration** with `RegisterResponse{Success: false}` and a descriptive error — it does not silently "succeed" with `TCPPort: 0` (which would previously report a working tunnel that could never actually accept a TCP connection). Any per-tunnel subdomain that was tentatively registered for the failed tunnel is rolled back to avoid leaking a claimed-but-unusable route.
 
 ---
 
@@ -547,20 +568,21 @@ Phase 4 provides the foundational P2P primitives, and Phase 4.5 completes end-to
 
 ### Reliable UDP Transport Layer
 
-The P2P module includes a custom ARQ-based reliable transport (`transport.go`):
+Production P2P data transfer is carried by `UDPMux` + `UDPStream` (`pkg/p2p/mux.go`, `pkg/p2p/stream.go`) — a custom ARQ-based reliable, ordered, multiplexed stream layer over a single UDP socket pair. (`transport.go` contains an older single-stream ARQ implementation retained only for its own tests; it is not wired into the client/server data path — see roadmap DP-16.)
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    Transport Layer                       │
+│                    UDPMux (1 per P2P peer connection)     │
 │                                                          │
 │  ┌────────────┐    ┌────────────┐    ┌────────────┐    │
-│  │  Sequence  │    │  ACK/NACK  │    │  Retrans   │    │
+│  │  Sequence  │    │  ACK       │    │  Retrans   │    │
 │  │  Numbering │    │  Handling  │    │  Timer     │    │
 │  └────────────┘    └────────────┘    └────────────┘    │
 │                                                          │
 │  ┌────────────┐    ┌────────────┐    ┌────────────┐    │
-│  │  Packet    │    │  Out-of-   │    │  FIN/ACK   │    │
-│  │  Assembly  │    │  Order Buf │    │  Close     │    │
+│  │  Send      │    │  Out-of-   │    │  FIN/RST   │    │
+│  │  Window    │    │  Order Buf │    │  Close     │    │
+│  │  (64 seg)  │    │  (per stream) │  │            │    │
 │  └────────────┘    └────────────┘    └────────────┘    │
 │                                                          │
 └─────────────────────────────────────────────────────────┘
@@ -568,6 +590,10 @@ The P2P module includes a custom ARQ-based reliable transport (`transport.go`):
                           ▼
                     UDP Connection
 ```
+
+Each `UDPStream` multiplexed on the mux has an independent receive buffer (`recvCh`, capacity 256 segments) and sliding send window (64 in-flight segments). The mux's single `readLoop` goroutine dispatches every incoming packet to the target stream's `handleData`.
+
+**Backpressure on a slow consumer** (`deliverLocked`): when the local application isn't draining `Read()` fast enough and `recvCh` is full, `deliverLocked` blocks for a short bounded timeout (200ms) rather than dropping the segment. If the timeout elapses, the segment's ACK is **withheld** — the sender's own retransmit timer then resends it, which naturally throttles the sender (implicit window-shrink) until the consumer catches up. If the consumer stays stuck long enough that `deliverLocked` times out `maxConsecutiveDeliverFailures` times in a row (25, ≈5s), the stream sends an RST and force-closes rather than retrying forever. This guarantees no segment is ever both dropped and ACKed — the old behavior that could silently desynchronize `recvSeq` from what was actually delivered to the application.
 
 ### Relay→P2P Hot Switching
 
@@ -639,8 +665,16 @@ Client ──── PingRequest (every 30s) ──────► Server
        ◄─── PingResponse ──────────────────
 
 Timeout: 10s
-On timeout: Mark connection abnormal, trigger reconnection
+On 3 consecutive failures: force-close the mux, which triggers reconnection
 ```
+
+### Connection-Loss Detection (`Mux.CloseNotify()`)
+
+Reconnection is only useful if connection loss is actually detected. `tunnel.Mux` exposes a `CloseNotify() <-chan struct{}` channel that is closed exactly once, either when `Close()` is called explicitly or when the underlying TCP connection dies (read/write error in the mux's internal loops).
+
+`Client.handleConnection()` blocks on a `select` across `mux.CloseNotify()`, `ctx.Done()`, and the client's own shutdown channel — **not just `ctx.Done()`** — so a dead mux unblocks the handler immediately instead of leaving a "half-alive" connection that looks `connected` but can no longer carry traffic. Once unblocked by `CloseNotify()`, the client clears its `connected` flag and returns control to `connectWithRetry()`, which re-enters the exponential-backoff loop above and re-registers every previously active tunnel (including all tunnels in multi-tunnel mode).
+
+`heartbeatLoop()` also selects on `mux.CloseNotify()` so it exits promptly rather than only checking mux health when its ticker fires. After **3 consecutive** ping failures, it proactively calls `mux.Close()` — this is what turns a silently-stalled connection (TCP still "open" but no longer responsive) into a detected connection loss, closing the loop with the mechanism above.
 
 ### Connection Pool
 
@@ -1133,11 +1167,13 @@ Dead node cleanup ensures stale routes are eventually removed so cross-node look
 Browser → DNS → Server:80/443
   → TLS termination
   → Router.Route(Host, Path) → find ClientSession
+  → resolveTunnelID(client, Host, Path) → disambiguate which registered tunnel (multi-tunnel)
   → Mux.OpenStream() → new Stream
-  → sendStreamRequest(metadata)
+  → sendStreamRequest(metadata incl. TunnelID)
   → r.Write(stream) [raw HTTP request]
   ─── Mux frame encoding → TCP connection → reaches Client ───
   → handleStream() → read StreamRequest metadata
+  → resolveLocalAddr(TunnelID) → this tunnel's LocalHost:LocalPort
   → forwardToLocal()
     → (Inspector enabled?) forwardHTTPWithInspect()
       → http.ReadRequest() parse

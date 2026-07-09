@@ -754,3 +754,131 @@ func TestHTTPHandler_ForwardHTTP_LargeBody(t *testing.T) {
 	assert.Equal(t, len(largeBody), rec.Body.Len(),
 		"response body should not be truncated")
 }
+
+// --- resolveTunnelID tests (DP-21/DP-22: multi-tunnel routing) ---
+
+// TestHTTPHandler_ResolveTunnelID_SingleTunnel verifies that a client with
+// exactly one registered tunnel always resolves to it, regardless of the
+// requested host/path — this preserves legacy single-tunnel behavior.
+func TestHTTPHandler_ResolveTunnelID_SingleTunnel(t *testing.T) {
+	server := newTestServer()
+	router := NewRouter("test.example.com")
+	handler := NewHTTPHandler(router, server)
+
+	client := &ClientSession{
+		ID: "single",
+		Tunnels: []*TunnelInfo{
+			{ID: "tunnel-1", Subdomain: "myapp"},
+		},
+	}
+
+	assert.Equal(t, "tunnel-1", handler.resolveTunnelID(client, "anything.else.com", "/whatever"))
+}
+
+// TestHTTPHandler_ResolveTunnelID_MultiTunnel verifies that a client with
+// several registered tunnels is routed to the correct one based on
+// hostname, subdomain, or path prefix matching (in that precedence order).
+func TestHTTPHandler_ResolveTunnelID_MultiTunnel(t *testing.T) {
+	server := newTestServer()
+	router := NewRouter("test.example.com")
+	handler := NewHTTPHandler(router, server)
+
+	client := &ClientSession{
+		ID:        "multi",
+		Subdomain: "default",
+		Tunnels: []*TunnelInfo{
+			{ID: "web-tunnel", Subdomain: "web"},
+			{ID: "api-tunnel", Hostname: "api.custom.com"},
+			{ID: "admin-tunnel", PathPrefix: "/admin"},
+		},
+	}
+
+	// Subdomain match.
+	assert.Equal(t, "web-tunnel", handler.resolveTunnelID(client, "web.test.example.com", "/"))
+
+	// Custom hostname match (takes precedence over subdomain).
+	assert.Equal(t, "api-tunnel", handler.resolveTunnelID(client, "api.custom.com", "/anything"))
+
+	// Path-prefix match.
+	assert.Equal(t, "admin-tunnel", handler.resolveTunnelID(client, "unrelated.test.example.com", "/admin/dashboard"))
+
+	// No match: unrecognized host/path combination.
+	assert.Equal(t, "", handler.resolveTunnelID(client, "unrelated.test.example.com", "/nowhere"))
+}
+
+// TestHTTPHandler_ResolveTunnelID_NoTunnels verifies the degenerate case
+// where a client has no tunnels registered yet.
+func TestHTTPHandler_ResolveTunnelID_NoTunnels(t *testing.T) {
+	server := newTestServer()
+	router := NewRouter("test.example.com")
+	handler := NewHTTPHandler(router, server)
+
+	client := &ClientSession{ID: "empty"}
+	assert.Equal(t, "", handler.resolveTunnelID(client, "anything.test.example.com", "/"))
+}
+
+// TestHTTPHandler_ForwardHTTP_MultiTunnel_RoutesToCorrectTunnelID verifies
+// the end-to-end fix for DP-21/DP-22: when a client has multiple tunnels,
+// the server tags the StreamRequest with the TunnelID matching the
+// requested host, so the client (in production) can dispatch to the right
+// local backend instead of always using the first tunnel's port.
+func TestHTTPHandler_ForwardHTTP_MultiTunnel_RoutesToCorrectTunnelID(t *testing.T) {
+	server := newTestServer()
+	router := NewRouter("test.example.com")
+	handler := NewHTTPHandler(router, server)
+
+	clientMux, serverMux := newMuxPair(t)
+	defer clientMux.Close()
+	defer serverMux.Close()
+
+	session := &ClientSession{
+		ID:  "multi-route-session",
+		Mux: serverMux,
+		Tunnels: []*TunnelInfo{
+			{ID: "web-tunnel", Subdomain: "web"},
+			{ID: "api-tunnel", Subdomain: "api"},
+		},
+	}
+	_ = router.RegisterSubdomain("web", session)
+	_ = router.RegisterSubdomain("api", session)
+
+	clientDone := make(chan struct{})
+	go func() {
+		defer close(clientDone)
+		stream, acceptErr := clientMux.AcceptStream()
+		if acceptErr != nil {
+			return
+		}
+		defer stream.Close()
+
+		msg, readErr := proto.ReadControlMessage(stream)
+		if readErr != nil || msg.StreamRequest == nil {
+			return
+		}
+		if msg.StreamRequest.TunnelID != "api-tunnel" {
+			return
+		}
+
+		resp := &http.Response{
+			StatusCode:    http.StatusOK,
+			Status:        "200 OK",
+			Proto:         "HTTP/1.1",
+			ProtoMajor:    1,
+			ProtoMinor:    1,
+			Header:        http.Header{"X-Matched-Tunnel": {"api-tunnel"}},
+			Body:          io.NopCloser(bytes.NewReader(nil)),
+			ContentLength: 0,
+		}
+		_ = resp.Write(stream)
+	}()
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "api.test.example.com"
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+	<-clientDone
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "api-tunnel", rec.Header().Get("X-Matched-Tunnel"))
+}

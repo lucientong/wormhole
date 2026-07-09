@@ -644,7 +644,12 @@ func (c *Client) ReloadTunnels(ctx context.Context, newDefs []TunnelDef) {
 	}
 }
 
-// handleConnection handles an active connection.
+// handleConnection handles an active connection. It blocks until the
+// connection is lost (mux closed, e.g. due to network failure) or the
+// application shuts down (ctx.Done() / c.closeCh), whichever happens
+// first. This is what allows connectWithRetry's reconnection loop to
+// actually run after a connection drop — previously this only unblocked
+// on application shutdown, so a dead mux never triggered a reconnect.
 func (c *Client) handleConnection(ctx context.Context) {
 	c.closeWg.Add(2)
 	go c.acceptStreams(ctx)
@@ -657,8 +662,24 @@ func (c *Client) handleConnection(ctx context.Context) {
 		})
 	}
 
-	// Wait for connection to close
-	<-ctx.Done()
+	c.mu.Lock()
+	mux := c.mux
+	c.mu.Unlock()
+
+	// Wait for whichever comes first: connection loss, app shutdown, or
+	// explicit Close(). mux may be nil only in tests that skip connect().
+	if mux != nil {
+		select {
+		case <-mux.CloseNotify():
+		case <-ctx.Done():
+		case <-c.closeCh:
+		}
+	} else {
+		select {
+		case <-ctx.Done():
+		case <-c.closeCh:
+		}
+	}
 
 	c.mu.Lock()
 	if c.mux != nil {
@@ -697,30 +718,51 @@ func (c *Client) acceptStreams(ctx context.Context) {
 }
 
 // handleStream handles an incoming stream from the server.
+//
+// A P2P peer-notification stream (opened by the server's notifyPeerOfP2P)
+// may carry a P2PCandidates message — Symmetric+Symmetric NAT port
+// prediction — ahead of the terminal P2POfferResponse, both length-prefixed
+// via proto.WriteControlMessage. We therefore loop-read until we hit a
+// message that concludes the exchange (StreamRequest or P2POfferResponse),
+// rather than assuming a single read yields the whole exchange (DP-24).
 func (c *Client) handleStream(ctx context.Context, stream *tunnel.Stream) {
 	defer stream.Close()
 
-	// Read length-prefixed stream request.
-	msg, err := proto.ReadControlMessage(stream)
-	if err != nil {
-		log.Error().Err(err).Msg("Read stream request failed")
-		return
-	}
+	var p2pCandidates []string
 
-	// Handle different message types.
-	switch {
-	case msg.StreamRequest != nil:
-		req := msg.StreamRequest
-		atomic.AddUint64(&c.stats.Requests, 1)
-		// Forward to local service.
-		c.forwardToLocal(ctx, stream, req)
+	for {
+		msg, err := proto.ReadControlMessage(stream)
+		if err != nil {
+			if len(p2pCandidates) == 0 {
+				log.Error().Err(err).Msg("Read stream request failed")
+			}
+			return
+		}
 
-	case msg.P2POfferResponse != nil:
-		// Server is notifying us about a peer that wants to connect.
-		c.handleP2PNotification(ctx, msg.P2POfferResponse)
+		switch {
+		case msg.StreamRequest != nil:
+			req := msg.StreamRequest
+			atomic.AddUint64(&c.stats.Requests, 1)
+			// Forward to local service.
+			c.forwardToLocal(ctx, stream, req)
+			return
 
-	default:
-		log.Warn().Int("type", int(msg.Type)).Msg("Unexpected message type in stream")
+		case msg.P2PCandidates != nil:
+			// Not yet consumed by the hole-punching algorithm (tracked in
+			// P3-3); retained here purely so the exchange doesn't stall or
+			// get misclassified while waiting for the offer response.
+			p2pCandidates = append(p2pCandidates, msg.P2PCandidates.Candidates...)
+			continue
+
+		case msg.P2POfferResponse != nil:
+			// Server is notifying us about a peer that wants to connect.
+			c.handleP2PNotification(ctx, msg.P2POfferResponse, p2pCandidates)
+			return
+
+		default:
+			log.Warn().Int("type", int(msg.Type)).Msg("Unexpected message type in stream")
+			return
+		}
 	}
 }
 
@@ -740,6 +782,37 @@ func (c *Client) forwardToLocal(ctx context.Context, conn streamConn, req *proto
 	c.forwardRawTCP(ctx, conn, req)
 }
 
+// resolveLocalAddr returns the local host/port that a given stream request
+// should be forwarded to. In multi-tunnel mode, the server tags each
+// StreamRequest with the TunnelID of the tunnel it matched (see
+// HTTPHandler.resolveTunnelID server-side); we look that ID up in
+// activeTunnels to find the corresponding ActiveTunnel.Def. When the
+// TunnelID is empty or unknown (single-tunnel/legacy mode, or a transient
+// mismatch during reconnection), fall back to the top-level config's
+// LocalHost/LocalPort so existing single-tunnel behavior is preserved.
+func (c *Client) resolveLocalAddr(tunnelID string) (host string, port int) {
+	if tunnelID != "" {
+		c.activeTunnelsMu.RLock()
+		for _, at := range c.activeTunnels {
+			if at.TunnelID == tunnelID {
+				host, port = at.Def.LocalHost, at.Def.LocalPort
+				c.activeTunnelsMu.RUnlock()
+				if host == "" {
+					host = defaultLocalHost
+				}
+				return host, port
+			}
+		}
+		c.activeTunnelsMu.RUnlock()
+	}
+
+	host = c.config.LocalHost
+	if host == "" {
+		host = defaultLocalHost
+	}
+	return host, c.config.LocalPort
+}
+
 // forwardRawTCP forwards a stream to the local service using raw TCP proxy.
 func (c *Client) forwardRawTCP(ctx context.Context, conn streamConn, req *proto.StreamRequest) {
 	c.dialAndProxy(ctx, conn, conn, req)
@@ -754,7 +827,8 @@ func (c *Client) forwardRawTCPWithReader(ctx context.Context, reader io.Reader, 
 // dialAndProxy connects to the local service and proxies data bidirectionally
 // between the given reader/writer pair and the local connection.
 func (c *Client) dialAndProxy(ctx context.Context, inReader io.Reader, outWriter io.Writer, sreq *proto.StreamRequest) {
-	localAddr := net.JoinHostPort(c.config.LocalHost, fmt.Sprintf("%d", c.config.LocalPort))
+	localHost, localPort := c.resolveLocalAddr(sreq.TunnelID)
+	localAddr := net.JoinHostPort(localHost, fmt.Sprintf("%d", localPort))
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	localConn, err := dialer.DialContext(ctx, "tcp", localAddr)
 	if err != nil {
@@ -795,7 +869,8 @@ func (c *Client) dialAndProxy(ctx context.Context, inReader io.Reader, outWriter
 // forwards it to the local service via http.Transport, captures the
 // request/response pair in the inspector, and writes the response back.
 func (c *Client) forwardHTTPWithInspect(ctx context.Context, stream streamConn, sreq *proto.StreamRequest) {
-	localAddr := net.JoinHostPort(c.config.LocalHost, fmt.Sprintf("%d", c.config.LocalPort))
+	localHost, localPort := c.resolveLocalAddr(sreq.TunnelID)
+	localAddr := net.JoinHostPort(localHost, fmt.Sprintf("%d", localPort))
 
 	start := time.Now()
 
@@ -892,31 +967,59 @@ func (c *Client) forwardHTTPWithInspect(ctx context.Context, stream streamConn, 
 	c.inspector.Capture(httpReq, reqBody, resp, respBody, duration, nil)
 }
 
-// heartbeatLoop sends periodic heartbeats.
+// maxConsecutiveHeartbeatFailures is the number of consecutive failed
+// pings after which the mux is force-closed to trigger reconnection.
+// A single failed ping can be a transient hiccup, but repeated failures
+// indicate a half-dead connection that will otherwise linger forever
+// (acceptStreams/heartbeatLoop keep running against a connection that
+// never delivers data).
+const maxConsecutiveHeartbeatFailures = 3
+
+// heartbeatLoop sends periodic heartbeats. After several consecutive
+// failures it force-closes the mux so handleConnection's CloseNotify
+// wait unblocks and connectWithRetry can re-dial. It also watches the
+// mux's own CloseNotify channel directly so it exits promptly if the mux
+// dies for any other reason (e.g. the peer closing the connection),
+// rather than waiting for the next heartbeat tick — this matters because
+// handleConnection blocks on closeWg.Wait(), which includes this loop.
 func (c *Client) heartbeatLoop(ctx context.Context) {
 	defer c.closeWg.Done()
+
+	c.mu.Lock()
+	mux := c.mux
+	c.mu.Unlock()
+	if mux == nil {
+		return
+	}
 
 	ticker := time.NewTicker(c.config.HeartbeatInterval)
 	defer ticker.Stop()
 
 	var pingID uint64
+	var consecutiveFailures int
 
 	for {
 		select {
 		case <-ticker.C:
-			c.mu.Lock()
-			mux := c.mux
-			c.mu.Unlock()
-
-			if mux == nil || mux.IsClosed() {
+			if mux.IsClosed() {
 				return
 			}
 
 			pingID++
 			if err := c.sendPing(ctx, pingID); err != nil {
-				log.Error().Err(err).Msg("Heartbeat failed")
+				consecutiveFailures++
+				log.Error().Err(err).Int("consecutive_failures", consecutiveFailures).Msg("Heartbeat failed")
+				if consecutiveFailures >= maxConsecutiveHeartbeatFailures {
+					log.Warn().Msg("Too many consecutive heartbeat failures, closing connection to trigger reconnect")
+					_ = mux.Close()
+					return
+				}
+				continue
 			}
+			consecutiveFailures = 0
 
+		case <-mux.CloseNotify():
+			return
 		case <-ctx.Done():
 			return
 		case <-c.closeCh:
@@ -1022,21 +1125,31 @@ func (c *Client) sendP2POffer(ctx context.Context) {
 		return
 	}
 
-	// Read response.
-	buf := make([]byte, 4096)
-	n, readErr := stream.Read(buf)
-	if readErr != nil {
-		log.Debug().Err(readErr).Msg("Failed to read P2P offer response")
-		return
+	// Read response. The server may first send zero or more P2PCandidates
+	// messages (Symmetric+Symmetric NAT port prediction, see
+	// handleP2POffer server-side) before the terminal P2POfferResponse.
+	// Both are length-prefixed via proto.WriteControlMessage, so we
+	// loop-read framed messages rather than relying on a single raw
+	// stream.Read() to capture the whole exchange (DP-24).
+	var candidates []string
+	var resp *proto.P2POfferResponse
+	for resp == nil {
+		msg, readErr := proto.ReadControlMessage(stream)
+		if readErr != nil {
+			log.Debug().Err(readErr).Msg("Failed to read P2P offer response")
+			return
+		}
+		switch {
+		case msg.P2PCandidates != nil:
+			candidates = append(candidates, msg.P2PCandidates.Candidates...)
+		case msg.P2POfferResponse != nil:
+			resp = msg.P2POfferResponse
+		default:
+			log.Debug().Int("type", int(msg.Type)).Msg("Unexpected message type in P2P offer response")
+			return
+		}
 	}
 
-	msg, decodeErr := proto.DecodeControlMessage(buf[:n])
-	if decodeErr != nil || msg.P2POfferResponse == nil {
-		log.Debug().Msg("Invalid P2P offer response")
-		return
-	}
-
-	resp := msg.P2POfferResponse
 	if resp.Success && resp.PeerAddr != "" {
 		// Derive session cipher from peer's public key.
 		if resp.PeerPublicKey != "" {
@@ -1050,6 +1163,7 @@ func (c *Client) sendP2POffer(ctx context.Context) {
 			Str("peer_addr", resp.PeerAddr).
 			Str("peer_nat", resp.PeerNATType).
 			Bool("encrypted", c.p2pCipher != nil).
+			Int("predicted_candidates", len(candidates)).
 			Msg("P2P peer found, attempting connection")
 
 		// Offer sender is the initiator for stream-ID allocation.
@@ -1270,8 +1384,11 @@ func (c *Client) IsP2PMode() bool {
 }
 
 // handleP2PNotification handles incoming P2P notifications from the server.
-// This is called when another client wants to establish a P2P connection with us.
-func (c *Client) handleP2PNotification(ctx context.Context, resp *proto.P2POfferResponse) {
+// This is called when another client wants to establish a P2P connection
+// with us. candidates carries any predicted peer ports received alongside
+// the offer response (Symmetric+Symmetric NAT port prediction); consuming
+// them in the hole-punch attempt itself is tracked in P3-3.
+func (c *Client) handleP2PNotification(ctx context.Context, resp *proto.P2POfferResponse, candidates []string) {
 	if !resp.Success || resp.PeerAddr == "" {
 		return
 	}
@@ -1280,6 +1397,7 @@ func (c *Client) handleP2PNotification(ctx context.Context, resp *proto.P2POffer
 		Str("peer_addr", resp.PeerAddr).
 		Str("peer_nat", resp.PeerNATType).
 		Bool("has_peer_key", resp.PeerPublicKey != "").
+		Int("predicted_candidates", len(candidates)).
 		Msg("Received P2P notification from server, attempting connection")
 
 	// Generate our ECDH key pair if not already done.

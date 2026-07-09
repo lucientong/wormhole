@@ -236,6 +236,15 @@ func (m *Mux) IsClosed() bool {
 	return atomic.LoadUint32(&m.closed) == 1
 }
 
+// CloseNotify returns a channel that is closed when the multiplexer is
+// closed, either explicitly via Close() or because the underlying
+// connection died. Callers can select on this channel to detect connection
+// loss without polling IsClosed(). The channel is closed exactly once and
+// never sends a value.
+func (m *Mux) CloseNotify() <-chan struct{} {
+	return m.closeCh
+}
+
 // LocalAddr returns the local network address.
 func (m *Mux) LocalAddr() net.Addr {
 	return m.conn.LocalAddr()

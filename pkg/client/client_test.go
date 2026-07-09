@@ -966,6 +966,46 @@ func TestClient_HeartbeatLoop_MuxClosed(t *testing.T) {
 	}
 }
 
+// TestClient_HeartbeatLoop_ClosesMuxAfterConsecutiveFailures verifies that
+// after maxConsecutiveHeartbeatFailures consecutive ping failures, the
+// heartbeat loop force-closes the mux (DP-28), which is what allows
+// handleConnection's CloseNotify wait to unblock and trigger a reconnect
+// (DP-01).
+func TestClient_HeartbeatLoop_ClosesMuxAfterConsecutiveFailures(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.HeartbeatInterval = 20 * time.Millisecond
+	cfg.HeartbeatTimeout = 30 * time.Millisecond
+	c := NewClient(cfg)
+
+	clientMux, serverMux := newClientMuxPair(t)
+	defer serverMux.Close()
+	c.mu.Lock()
+	c.mux = clientMux
+	c.mu.Unlock()
+
+	// Server side never accepts/responds to any stream, so every ping
+	// times out after HeartbeatTimeout and counts as a failure.
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c.closeWg.Add(1)
+	go c.heartbeatLoop(ctx)
+
+	done := make(chan struct{})
+	go func() {
+		c.closeWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		assert.True(t, clientMux.IsClosed(), "mux should be closed after consecutive heartbeat failures")
+	case <-time.After(5 * time.Second):
+		t.Fatal("heartbeatLoop should close the mux and exit after consecutive failures")
+	}
+}
+
 // --- connectWithRetry tests ---
 
 // TestClient_ConnectWithRetry_MaxAttempts verifies that connectWithRetry
@@ -1040,6 +1080,45 @@ func TestClient_ConnectWithRetry_CloseCh(t *testing.T) {
 
 	err := <-errCh
 	assert.NoError(t, err)
+}
+
+// TestClient_HandleConnection_UnblocksOnMuxClose verifies the DP-01 fix:
+// handleConnection must return as soon as the mux dies (e.g. due to a
+// network failure), not only when ctx is canceled. This is what allows
+// connectWithRetry's loop to actually attempt a reconnect after a dropped
+// connection instead of hanging forever.
+func TestClient_HandleConnection_UnblocksOnMuxClose(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.HeartbeatInterval = time.Hour // Don't let heartbeat interfere.
+	c := NewClient(cfg)
+
+	clientMux, serverMux := newClientMuxPair(t)
+	defer serverMux.Close()
+	c.mu.Lock()
+	c.mux = clientMux
+	c.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.handleConnection(ctx)
+	}()
+
+	// Simulate a network failure: close the mux out-of-band, without
+	// canceling ctx and without going through c.Close().
+	_ = clientMux.Close()
+
+	select {
+	case <-done:
+		// Expected: handleConnection unblocks on mux death.
+	case <-time.After(3 * time.Second):
+		t.Fatal("handleConnection should return promptly when the mux is closed externally")
+	}
+
+	assert.Equal(t, uint32(0), c.connected)
 }
 
 // --- handleConnection + acceptStreams tests ---
@@ -1173,7 +1252,7 @@ func TestClient_HandleP2PNotification_KeyDerivation(t *testing.T) {
 
 	// handleP2PNotification will start attemptP2P in a goroutine,
 	// which will fail (no real peer). We just verify key derivation works.
-	c.handleP2PNotification(context.Background(), resp)
+	c.handleP2PNotification(context.Background(), resp, nil)
 
 	// Give a moment for the goroutine to start.
 	time.Sleep(50 * time.Millisecond)
@@ -1196,7 +1275,7 @@ func TestClient_HandleP2PNotification_NoSuccess(t *testing.T) {
 	}
 
 	// Should return immediately without generating keys.
-	c.handleP2PNotification(context.Background(), resp)
+	c.handleP2PNotification(context.Background(), resp, nil)
 
 	c.mu.Lock()
 	assert.Nil(t, c.p2pKeyPair)
@@ -1303,6 +1382,62 @@ func TestClient_ForwardToLocal_InspectorDisabled(t *testing.T) {
 
 	_ = serverStream.Close()
 	<-done
+}
+
+// --- resolveLocalAddr tests (DP-21: multi-tunnel local dispatch) ---
+
+// TestClient_ResolveLocalAddr_KnownTunnelID verifies that a TunnelID
+// matching an active multi-tunnel entry resolves to that tunnel's own
+// LocalHost/LocalPort, not the top-level single-tunnel config.
+func TestClient_ResolveLocalAddr_KnownTunnelID(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.LocalHost = "127.0.0.1"
+	cfg.LocalPort = 9999 // Should NOT be used when TunnelID matches.
+	c := NewClient(cfg)
+
+	c.activeTunnelsMu.Lock()
+	c.activeTunnels["web"] = &ActiveTunnel{
+		Def:      TunnelDef{Name: "web", LocalHost: "127.0.0.1", LocalPort: 3000},
+		TunnelID: "web-tunnel-id",
+	}
+	c.activeTunnels["api"] = &ActiveTunnel{
+		Def:      TunnelDef{Name: "api", LocalHost: "10.0.0.5", LocalPort: 8080},
+		TunnelID: "api-tunnel-id",
+	}
+	c.activeTunnelsMu.Unlock()
+
+	host, port := c.resolveLocalAddr("api-tunnel-id")
+	assert.Equal(t, "10.0.0.5", host)
+	assert.Equal(t, 8080, port)
+
+	host, port = c.resolveLocalAddr("web-tunnel-id")
+	assert.Equal(t, "127.0.0.1", host)
+	assert.Equal(t, 3000, port)
+}
+
+// TestClient_ResolveLocalAddr_UnknownOrEmptyTunnelID verifies the fallback
+// path: an empty TunnelID (legacy single-tunnel mode) or one that doesn't
+// match any active tunnel falls back to the top-level config.
+func TestClient_ResolveLocalAddr_UnknownOrEmptyTunnelID(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.LocalHost = "127.0.0.1"
+	cfg.LocalPort = 4000
+	c := NewClient(cfg)
+
+	host, port := c.resolveLocalAddr("")
+	assert.Equal(t, "127.0.0.1", host)
+	assert.Equal(t, 4000, port)
+
+	c.activeTunnelsMu.Lock()
+	c.activeTunnels["web"] = &ActiveTunnel{
+		Def:      TunnelDef{Name: "web", LocalHost: "127.0.0.1", LocalPort: 3000},
+		TunnelID: "web-tunnel-id",
+	}
+	c.activeTunnelsMu.Unlock()
+
+	host, port = c.resolveLocalAddr("unknown-tunnel-id")
+	assert.Equal(t, "127.0.0.1", host)
+	assert.Equal(t, 4000, port)
 }
 
 // --- dialAndProxy success path tests ---
@@ -1641,6 +1776,62 @@ func TestClient_HandleStream_P2POfferResponse(t *testing.T) {
 	c.mu.Lock()
 	assert.NotNil(t, c.p2pKeyPair, "key pair should be generated from P2POfferResponse")
 	assert.NotNil(t, c.p2pCipher, "cipher should be derived from P2POfferResponse")
+	c.mu.Unlock()
+
+	_ = serverStream.Close()
+}
+
+// TestClient_HandleStream_P2PCandidatesThenOfferResponse verifies the
+// DP-24 fix: when the server writes a P2PCandidates message followed by
+// the terminal P2POfferResponse on the same notification stream (both
+// length-prefixed via proto.WriteControlMessage), handleStream loop-reads
+// past the candidates message instead of misclassifying/dropping it, and
+// still correctly processes the terminal offer response.
+func TestClient_HandleStream_P2PCandidatesThenOfferResponse(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.P2PEnabled = true
+	c := NewClient(cfg)
+
+	clientMux, serverMux := newClientMuxPair(t)
+
+	peerKP, err := p2p.GenerateKeyPair()
+	require.NoError(t, err)
+	peerPubB64 := base64.StdEncoding.EncodeToString(peerKP.Public)
+
+	serverStream, err := serverMux.OpenStream()
+	require.NoError(t, err)
+
+	// Server writes candidates first, then the terminal offer response —
+	// mirroring notifyPeerOfP2P's Symmetric+Symmetric NAT port prediction path.
+	candidates := []string{"1.2.3.4:40001", "1.2.3.4:40002", "1.2.3.4:40003"}
+	candidatesMsg := proto.NewP2PCandidates("tunnel-1", candidates)
+	require.NoError(t, proto.WriteControlMessage(serverStream, candidatesMsg))
+
+	resp := proto.NewP2POfferResponse(true, "", "10.0.0.1:5000", "Symmetric", peerPubB64)
+	require.NoError(t, proto.WriteControlMessage(serverStream, resp))
+
+	clientStream, err := clientMux.AcceptStream()
+	require.NoError(t, err)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.handleStream(context.Background(), clientStream)
+	}()
+
+	select {
+	case <-done:
+		// handleStream should loop past the candidates message and
+		// process the terminal P2POfferResponse.
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleStream with candidates+offer response timed out")
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	c.mu.Lock()
+	assert.NotNil(t, c.p2pKeyPair, "key pair should be generated from the terminal P2POfferResponse")
+	assert.NotNil(t, c.p2pCipher, "cipher should be derived from the terminal P2POfferResponse")
 	c.mu.Unlock()
 
 	_ = serverStream.Close()
