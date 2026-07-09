@@ -413,7 +413,7 @@ Admin API 默认绑定 `127.0.0.1`。如需远程访问，使用 `--admin-host 0
 - [x] Phase 9（v0.5.2）：声明式隧道配置 — YAML 配置文件、多隧道、SIGHUP 热重载、`tunnels` 子命令
 - [x] Phase 10（v0.5.3）：OIDC / OAuth SSO — OIDC Discovery、JWKS JWT 校验、Device Code Flow、`wormhole login`
 - [x] Phase 11（v0.6.0）：HA / 多节点控制面 — `StateStore` 接口、Redis 后端、集群心跳、跨节点 HTTP 路由
-- [x] Phase 12（v0.6.1）：可靠的连接丢失检测（`Mux.CloseNotify()` + 心跳触发强制重连）、真正生效的多隧道路由（`TunnelID` 端到端接线分发）、修复 P2P 信令帧不匹配、P2P 接收缓冲背压（带超时的阻塞交付 + 消费者卡死时 RST）、TCP 端口分配失败拒绝注册
+- [x] Phase 12（v0.6.1）：可靠的连接丢失检测（`Mux.CloseNotify()` + 心跳触发强制重连）、真正生效的多隧道路由（`TunnelID` 端到端接线分发）、修复 P2P 信令帧不匹配、P2P 接收缓冲背压（带超时的阻塞交付 + 消费者卡死时 RST）、TCP 端口分配失败拒绝注册、可靠的 P2P 建流握手（SYN 重传 + SYN-ACK，此前只要一个 SYN 包在丢包环境下丢失，连接就会悄无声息地"半开"卡死）、修复 WebSocket inspector 的数据竞争
 
 ## 贡献
 

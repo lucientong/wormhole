@@ -595,7 +595,7 @@ Auto-generated subdomains use 64-bit cryptographic randomness (`crypto/rand`), p
 - [x] Phase 9 (v0.5.2): Declarative tunnel config — YAML config file, multi-tunnel, SIGHUP hot-reload, `tunnels` subcommand
 - [x] Phase 10 (v0.5.3): OIDC / OAuth SSO — OIDC Discovery, JWKS JWT validation, Device Code Flow, `wormhole login`
 - [x] Phase 11 (v0.6.0): HA / Multi-node control plane — `StateStore` interface, Redis backend, cluster heartbeat, cross-node HTTP routing
-- [x] Phase 12 (v0.6.1): Correctness closure — reliable reconnection detection (`Mux.CloseNotify()` + heartbeat-triggered force-close), true multi-tunnel routing (per-tunnel `TunnelID` dispatch end-to-end), fixed P2P signaling frame mismatch, P2P receive-buffer backpressure (bounded blocking delivery + RST on stuck consumers), and TCP port-allocation-failure rejection
+- [x] Phase 12 (v0.6.1): Correctness closure — reliable reconnection detection (`Mux.CloseNotify()` + heartbeat-triggered force-close), true multi-tunnel routing (per-tunnel `TunnelID` dispatch end-to-end), fixed P2P signaling frame mismatch, P2P receive-buffer backpressure (bounded blocking delivery + RST on stuck consumers), TCP port-allocation-failure rejection, a reliable P2P stream handshake (SYN retransmission + SYN-ACK, previously a single lost SYN packet under packet loss would leave a connection silently half-open forever), and a WebSocket inspector data race fix
 
 ## Contributing
 

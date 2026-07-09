@@ -361,15 +361,18 @@ func (s *UDPStream) deliverLocked(seq uint32, data []byte) bool {
 	}
 }
 
-// handleAck removes the acknowledged segment from the send buffer and
-// releases a flow-control credit to unblock a waiting Write.
+// handleAck removes the acknowledged segment from the send buffer and,
+// for data segments, releases a flow-control credit to unblock a waiting
+// Write. seq 0 is reserved for the SYN handshake pseudo-segment (see
+// registerPendingSYN) — acknowledging it only clears the pending SYN retry
+// state and does not carry a flow-control credit.
 func (s *UDPStream) handleAck(seq uint32) {
 	s.sendBufLock.Lock()
 	_, existed := s.sendBuf[seq]
 	delete(s.sendBuf, seq)
 	s.sendBufLock.Unlock()
 
-	if existed {
+	if existed && seq > 0 {
 		// Release one send credit so the window advances.
 		select {
 		case s.sendCreditCh <- struct{}{}:
@@ -377,6 +380,17 @@ func (s *UDPStream) handleAck(seq uint32) {
 			// Channel full — window already has maximum credits; ignore.
 		}
 	}
+}
+
+// registerPendingSYN records the just-sent SYN under seq 0 in the send
+// buffer so it's retried by UDPMux.retransmitLoop exactly like a data
+// segment, until the peer's SYN-ACK (an ordinary muxTypeAck for seq 0)
+// arrives or maxRetransmits is exhausted. Real data segments always use
+// seq >= 1 (see Write), so seq 0 can never collide with them.
+func (s *UDPStream) registerPendingSYN() {
+	s.sendBufLock.Lock()
+	s.sendBuf[0] = &streamPacket{seq: 0, sentAt: time.Now()}
+	s.sendBufLock.Unlock()
 }
 
 // handleFin processes a FIN from the peer: signals EOF on the read side.
@@ -393,7 +407,11 @@ func (s *UDPStream) handleFin() {
 // ---------------------------------------------------------------------------
 
 // retransmit resends unacknowledged packets that have exceeded the timeout.
-// If a packet exceeds maxRetransmits, the stream is force-closed (connection lost).
+// If a packet exceeds maxRetransmits, the stream is dead: we notify the peer
+// with an RST (best effort) and force-close locally. Without the RST, the
+// peer would never learn the sender gave up and could block in Read()
+// indefinitely waiting for data that will never arrive (previously observed
+// as flaky timeouts in TestStress_PacketLoss30Pct).
 func (s *UDPStream) retransmit(timeout time.Duration, maxRetransmits int) {
 	if atomic.LoadUint32(&s.closed) == 1 {
 		return
@@ -410,12 +428,25 @@ func (s *UDPStream) retransmit(timeout time.Duration, maxRetransmits int) {
 		if pkt.retransmits >= maxRetransmits {
 			log.Warn().Uint32("stream_id", s.id).Uint32("seq", seq).
 				Msg("P2P stream: max retransmits reached, closing stream")
-			delete(s.sendBuf, seq)
+			s.sendBuf = make(map[uint32]*streamPacket)
+			if err := s.mux.sendPacket(s.id, muxTypeRST, 0, nil); err != nil {
+				log.Warn().Err(err).Uint32("stream_id", s.id).
+					Msg("P2P stream: failed to notify peer of RST after max retransmits")
+			}
 			go s.forceClose()
-			continue
+			return
 		}
 		pkt.retransmits++
 		pkt.sentAt = now
+		if seq == 0 {
+			// Pending SYN handshake (see registerPendingSYN) — resend the
+			// SYN itself, not a data segment.
+			if err := s.mux.sendPacket(s.id, muxTypeSYN, 0, nil); err != nil {
+				log.Warn().Err(err).Uint32("stream_id", s.id).
+					Msg("P2P stream: SYN retransmit failed")
+			}
+			continue
+		}
 		// Re-send by re-calling sendPacket with the stored plaintext.
 		if err := s.mux.sendPacket(s.id, muxTypeData, seq, pkt.data); err != nil {
 			log.Warn().Err(err).Uint32("stream_id", s.id).Uint32("seq", seq).

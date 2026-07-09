@@ -258,9 +258,24 @@ func (c *WSClient) handleMessage(data []byte) {
 }
 
 // sendMessage sends a message to this client.
+//
+// It holds hub.mu (read) across the membership check and the channel send so
+// that this can never race with WSHub.Close()/removeClient() closing
+// c.send: both of those only close the channel while holding hub.mu for
+// writing, and only after removing the client from hub.clients. Checking
+// membership under the same RLock guarantees we never send on (or race
+// with a close of) a channel that's being — or has already been — torn
+// down.
 func (c *WSClient) sendMessage(msg WSMessage) {
 	data, err := json.Marshal(msg)
 	if err != nil {
+		return
+	}
+
+	c.hub.mu.RLock()
+	defer c.hub.mu.RUnlock()
+
+	if _, ok := c.hub.clients[c]; !ok {
 		return
 	}
 	select {

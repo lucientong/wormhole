@@ -115,6 +115,15 @@ func NewUDPMux(conn net.PacketConn, peerAddr *net.UDPAddr, config TransportConfi
 }
 
 // OpenStream creates a new outbound stream and performs the SYN handshake.
+//
+// The SYN is sent reliably: it's tracked under seq 0 in the stream's send
+// buffer, exactly like a data segment, so UDPMux.retransmitLoop keeps
+// retrying it until the peer's SYN-ACK arrives or maxRetransmits is
+// exhausted. Without this, a single lost SYN packet under a lossy network
+// would leave the peer completely unaware of the stream — every subsequent
+// data segment would be silently dropped by dispatch() as "unknown
+// stream", and the accepting side would block in AcceptStream()/Read()
+// forever instead of surfacing a connection failure.
 func (m *UDPMux) OpenStream() (*UDPStream, error) {
 	if atomic.LoadUint32(&m.closed) == 1 {
 		return nil, ErrMuxClosed
@@ -128,6 +137,8 @@ func (m *UDPMux) OpenStream() (*UDPStream, error) {
 	m.streamsLock.Lock()
 	m.streams[streamID] = s
 	m.streamsLock.Unlock()
+
+	s.registerPendingSYN()
 
 	// Send SYN.
 	if err := m.sendPacket(streamID, muxTypeSYN, 0, nil); err != nil {
@@ -310,7 +321,12 @@ func (m *UDPMux) dispatch(streamID uint32, pktType byte, seq uint32, payload []b
 		m.streamsLock.Lock()
 		if _, exists := m.streams[streamID]; exists {
 			m.streamsLock.Unlock()
-			return // duplicate SYN, ignore
+			// Duplicate SYN: we already accepted this stream, which means
+			// our previous SYN-ACK was most likely lost in transit. Re-ack
+			// so the initiator's retransmit loop can retire its pending
+			// SYN instead of exhausting maxRetransmits.
+			_ = m.sendPacket(streamID, muxTypeAck, 0, nil)
+			return
 		}
 		s := newUDPStream(streamID, m)
 		m.streams[streamID] = s
@@ -320,6 +336,9 @@ func (m *UDPMux) dispatch(streamID uint32, pktType byte, seq uint32, payload []b
 
 		select {
 		case m.acceptCh <- s:
+			// SYN-ACK: confirms receipt so the initiator's retransmit loop
+			// retires the pending SYN (see UDPStream.registerPendingSYN).
+			_ = m.sendPacket(streamID, muxTypeAck, 0, nil)
 		default:
 			// backlog full – close stream immediately.
 			log.Warn().Uint32("stream_id", streamID).Msg("P2P mux: accept backlog full, rejecting stream")
