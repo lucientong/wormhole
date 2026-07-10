@@ -32,7 +32,7 @@ const (
 	// forwarded between nodes by proxyToNode (S1), so a receiving node can
 	// tell a genuine peer hop apart from an external caller that happens
 	// to reach ClusterNodeAddr directly.
-	clusterSecretHeader = "X-Wormhole-Cluster-Secret" //nolint:gosec // header name, not a credential
+	clusterSecretHeader = "X-Wormhole-Cluster-Secret" // #nosec G101 -- header name, not a credential
 )
 
 // startClusterHeartbeat starts a background goroutine that:
