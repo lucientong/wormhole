@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -42,6 +43,46 @@ func TestMemoryStateStore_LookupMissing(t *testing.T) {
 	}
 	if got != nil {
 		t.Errorf("expected nil, got %+v", got)
+	}
+}
+
+// TestMemoryStateStore_RegisterRoute_SubdomainConflict verifies S3/H6:
+// registering the same subdomain from a different clientID is rejected
+// with ErrSubdomainConflict instead of silently overwriting the owner.
+func TestMemoryStateStore_RegisterRoute_SubdomainConflict(t *testing.T) {
+	s := NewMemoryStateStore()
+
+	if err := s.RegisterRoute(RouteEntry{ClientID: "c1", Subdomain: "sub1", NodeID: "n1"}); err != nil {
+		t.Fatalf("first RegisterRoute: %v", err)
+	}
+
+	err := s.RegisterRoute(RouteEntry{ClientID: "c2", Subdomain: "sub1", NodeID: "n2"})
+	if !errors.Is(err, ErrSubdomainConflict) {
+		t.Fatalf("expected ErrSubdomainConflict, got %v", err)
+	}
+
+	// The original owner must be unaffected by the rejected attempt.
+	got, lookupErr := s.LookupBySubdomain("sub1")
+	if lookupErr != nil {
+		t.Fatalf("LookupBySubdomain: %v", lookupErr)
+	}
+	if got == nil || got.ClientID != "c1" {
+		t.Fatalf("expected sub1 to still be owned by c1, got %+v", got)
+	}
+}
+
+// TestMemoryStateStore_RegisterRoute_SameClientRefresh verifies that
+// re-registering the same (ClientID, Subdomain) pair — e.g. a TTL refresh —
+// is idempotent and never treated as a conflict.
+func TestMemoryStateStore_RegisterRoute_SameClientRefresh(t *testing.T) {
+	s := NewMemoryStateStore()
+
+	entry := RouteEntry{ClientID: "c1", Subdomain: "sub1", NodeID: "n1"}
+	if err := s.RegisterRoute(entry); err != nil {
+		t.Fatalf("first RegisterRoute: %v", err)
+	}
+	if err := s.RegisterRoute(entry); err != nil {
+		t.Fatalf("refresh RegisterRoute: %v", err)
 	}
 }
 

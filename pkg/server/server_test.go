@@ -2,9 +2,18 @@ package server
 
 import (
 	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -69,6 +78,75 @@ func TestNewServer_NoAuthConfigured(t *testing.T) {
 	s := NewServer(cfg)
 	require.NotNil(t, s)
 	assert.Nil(t, s.authenticator)
+}
+
+// TestNewServer_OIDCWiredToAuthenticator is a regression test for a bug
+// found while working on P3-4: OIDC validator initialization ran before
+// s.authenticator was constructed, so the `s.authenticator != nil` guard
+// was always false and --oidc-issuer silently had no effect server-side.
+// This builds a real signed RS256 JWT and confirms it validates
+// successfully through s.authenticator — which is only possible if the
+// OIDC validator was actually attached.
+func TestNewServer_OIDCWiredToAuthenticator(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	var oidcSrv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"issuer":   oidcSrv.URL,
+			"jwks_uri": oidcSrv.URL + "/.well-known/jwks.json",
+		})
+	})
+	mux.HandleFunc("/.well-known/jwks.json", func(w http.ResponseWriter, _ *http.Request) {
+		pub := &key.PublicKey
+		nB64 := base64.RawURLEncoding.EncodeToString(pub.N.Bytes())
+		eB64 := base64.RawURLEncoding.EncodeToString(big.NewInt(int64(pub.E)).Bytes())
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"keys": []map[string]string{
+				{"kty": "RSA", "kid": "key-1", "alg": "RS256", "use": "sig", "n": nB64, "e": eB64},
+			},
+		})
+	})
+	oidcSrv = httptest.NewServer(mux)
+	defer oidcSrv.Close()
+
+	cfg := DefaultConfig()
+	cfg.RequireAuth = true
+	cfg.AuthSecret = "supersecretkey1234567890"
+	cfg.OIDCIssuer = oidcSrv.URL
+	cfg.OIDCClientID = "test-client"
+
+	s := NewServer(cfg)
+	require.NotNil(t, s.authenticator)
+
+	hdr := map[string]string{"alg": "RS256", "kid": "key-1", "typ": "JWT"}
+	hdrJSON, _ := json.Marshal(hdr)
+	hdrB64 := base64.RawURLEncoding.EncodeToString(hdrJSON)
+
+	payload := map[string]interface{}{
+		"iss":   oidcSrv.URL,
+		"aud":   "test-client",
+		"sub":   "user@example.com",
+		"email": "user@example.com",
+		"iat":   time.Now().Unix(),
+		"exp":   time.Now().Add(time.Hour).Unix(),
+	}
+	payloadJSON, _ := json.Marshal(payload)
+	payloadB64 := base64.RawURLEncoding.EncodeToString(payloadJSON)
+
+	sigInput := hdrB64 + "." + payloadB64
+	h := sha256.Sum256([]byte(sigInput))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, h[:])
+	require.NoError(t, err)
+	jwt := sigInput + "." + base64.RawURLEncoding.EncodeToString(sig)
+
+	claims, err := s.authenticator.ValidateToken(jwt)
+	require.NoError(t, err, "OIDC-issued JWT must validate — this fails if OIDC was never wired to the authenticator")
+	assert.Equal(t, "user@example.com", claims.TeamName)
 }
 
 func TestServer_IsP2PCompatible(t *testing.T) {
@@ -598,6 +676,176 @@ func TestServer_HandleRegister_HTTP(t *testing.T) {
 	assert.Equal(t, uint64(1), atomic.LoadUint64(&s.stats.ActiveTunnels))
 }
 
+// TestServer_HandleRegister_RBAC_ViewerRejected verifies S2: a client
+// authenticated with RoleViewer (read-only) must not be able to register a
+// tunnel once RequireAuth is enabled, even though it already has an open,
+// authenticated connection.
+func TestServer_HandleRegister_RBAC_ViewerRejected(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MuxConfig.KeepAliveInterval = 0
+	cfg.RequireAuth = true
+	s := NewServer(cfg)
+
+	clientMux, serverMux := newMuxPair(t)
+
+	client := &ClientSession{
+		ID:        "viewer-client",
+		Subdomain: "myapp",
+		Mux:       serverMux,
+		Role:      auth.RoleViewer,
+		CreatedAt: time.Now(),
+		LastSeen:  time.Now(),
+	}
+	s.clientLock.Lock()
+	s.clients[client.ID] = client
+	s.clientLock.Unlock()
+
+	errCh := make(chan error, 1)
+	go func() {
+		stream, openErr := clientMux.OpenStream()
+		if openErr != nil {
+			errCh <- openErr
+			return
+		}
+		defer stream.Close()
+
+		req := proto.NewRegisterRequest(8080, proto.ProtocolHTTP, "myapp", "", "")
+		data, encErr := req.Encode()
+		if encErr != nil {
+			errCh <- encErr
+			return
+		}
+		if _, writeErr := stream.Write(data); writeErr != nil {
+			errCh <- writeErr
+			return
+		}
+
+		buf := make([]byte, 4096)
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			errCh <- readErr
+			return
+		}
+
+		msg, decErr := proto.DecodeControlMessage(buf[:n])
+		if decErr != nil {
+			errCh <- decErr
+			return
+		}
+		if msg.RegisterResponse == nil {
+			errCh <- errors.New("expected register response")
+			return
+		}
+		if msg.RegisterResponse.Success {
+			errCh <- errors.New("expected registration to be rejected for viewer role")
+			return
+		}
+		errCh <- nil
+	}()
+
+	stream, err := serverMux.AcceptStream()
+	require.NoError(t, err)
+	defer stream.Close()
+
+	buf := make([]byte, 4096)
+	n, err := stream.Read(buf)
+	require.NoError(t, err)
+
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	require.NoError(t, err)
+	require.NotNil(t, msg.RegisterRequest)
+
+	s.handleRegister(client, stream, msg.RegisterRequest)
+	require.NoError(t, <-errCh)
+
+	// No tunnel should have been added.
+	client.mu.Lock()
+	assert.Empty(t, client.Tunnels)
+	client.mu.Unlock()
+}
+
+// TestServer_HandleRegister_RBAC_MemberAllowed verifies that RoleMember
+// (the default authenticated role) is unaffected by the S2 RBAC check.
+func TestServer_HandleRegister_RBAC_MemberAllowed(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MuxConfig.KeepAliveInterval = 0
+	cfg.RequireAuth = true
+	s := NewServer(cfg)
+
+	clientMux, serverMux := newMuxPair(t)
+
+	client := &ClientSession{
+		ID:        "member-client",
+		Subdomain: "myapp2",
+		Mux:       serverMux,
+		Role:      auth.RoleMember,
+		CreatedAt: time.Now(),
+		LastSeen:  time.Now(),
+	}
+	s.clientLock.Lock()
+	s.clients[client.ID] = client
+	s.clientLock.Unlock()
+	_ = s.router.RegisterSubdomain("myapp2", client)
+
+	errCh := make(chan error, 1)
+	go func() {
+		stream, openErr := clientMux.OpenStream()
+		if openErr != nil {
+			errCh <- openErr
+			return
+		}
+		defer stream.Close()
+
+		req := proto.NewRegisterRequest(8080, proto.ProtocolHTTP, "myapp2", "", "")
+		data, encErr := req.Encode()
+		if encErr != nil {
+			errCh <- encErr
+			return
+		}
+		if _, writeErr := stream.Write(data); writeErr != nil {
+			errCh <- writeErr
+			return
+		}
+
+		buf := make([]byte, 4096)
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			errCh <- readErr
+			return
+		}
+
+		msg, decErr := proto.DecodeControlMessage(buf[:n])
+		if decErr != nil {
+			errCh <- decErr
+			return
+		}
+		if msg.RegisterResponse == nil || !msg.RegisterResponse.Success {
+			errCh <- errors.New("expected registration to succeed for member role")
+			return
+		}
+		errCh <- nil
+	}()
+
+	stream, err := serverMux.AcceptStream()
+	require.NoError(t, err)
+	defer stream.Close()
+
+	buf := make([]byte, 4096)
+	n, err := stream.Read(buf)
+	require.NoError(t, err)
+
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	require.NoError(t, err)
+	require.NotNil(t, msg.RegisterRequest)
+
+	s.handleRegister(client, stream, msg.RegisterRequest)
+	require.NoError(t, <-errCh)
+
+	client.mu.Lock()
+	assert.Len(t, client.Tunnels, 1)
+	client.mu.Unlock()
+}
+
 func TestServer_HandlePing(t *testing.T) {
 	s := newTestServerForIntegration()
 
@@ -979,6 +1227,59 @@ func TestServer_StartAndShutdown(t *testing.T) {
 	err := <-errCh
 	assert.NoError(t, err)
 	assert.True(t, s.isClosed())
+}
+
+// TestServer_Start_TunnelTLSRequiredFailsClosed verifies S4: if
+// RequireAuth is set and the tunnel control channel's TLS config can't be
+// built (e.g. bad manual cert paths), Start must fail rather than silently
+// continue serving the control channel in plaintext.
+func TestServer_Start_TunnelTLSRequiredFailsClosed(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.HTTPAddr = "127.0.0.1:0"
+	cfg.AdminAddr = "127.0.0.1:0"
+	cfg.RequireAuth = true
+	cfg.AuthTokens = []string{"tok"}
+	cfg.TunnelTLSEnabled = true
+	cfg.AutoTLS = false
+	cfg.TLSCertFile = "/nonexistent/cert.pem"
+	cfg.TLSKeyFile = "/nonexistent/key.pem"
+
+	s := NewServer(cfg)
+	err := s.Start(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "tunnel control channel TLS required")
+}
+
+// TestServer_Start_TunnelTLSOptionalFallsBackToPlaintext verifies that,
+// without RequireAuth, a broken tunnel TLS config degrades to plaintext
+// with a logged error instead of failing the whole server (matching the
+// pre-S4 WrapListener behavior for the HTTP listener).
+func TestServer_Start_TunnelTLSOptionalFallsBackToPlaintext(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.HTTPAddr = "127.0.0.1:0"
+	cfg.AdminAddr = "127.0.0.1:0"
+	cfg.MuxConfig.KeepAliveInterval = 0
+	cfg.RequireAuth = false
+	cfg.TunnelTLSEnabled = true
+	cfg.AutoTLS = false
+	cfg.TLSCertFile = "/nonexistent/cert.pem"
+	cfg.TLSKeyFile = "/nonexistent/key.pem"
+
+	s := NewServer(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.Start(ctx)
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+	assert.False(t, s.isClosed())
+
+	cancel()
+	err := <-errCh
+	assert.NoError(t, err)
 }
 
 func TestServer_Shutdown_Idempotent(t *testing.T) {
@@ -2758,6 +3059,95 @@ func TestServer_HandleClose_Success(t *testing.T) {
 
 	// Verify active tunnel counter decremented.
 	assert.Equal(t, uint64(1), atomic.LoadUint64(&s.stats.ActiveTunnels))
+}
+
+// TestServer_HandleClose_RBAC_ViewerRejected verifies S2: a RoleViewer
+// client cannot close/delete a tunnel once RequireAuth is enabled.
+func TestServer_HandleClose_RBAC_ViewerRejected(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MuxConfig.KeepAliveInterval = 0
+	cfg.RequireAuth = true
+	s := NewServer(cfg)
+
+	clientMux, serverMux := newMuxPair(t)
+
+	client := &ClientSession{
+		ID:        "viewer-close-client",
+		Subdomain: "closeapp",
+		Mux:       serverMux,
+		Role:      auth.RoleViewer,
+		CreatedAt: time.Now(),
+		LastSeen:  time.Now(),
+		Tunnels: []*TunnelInfo{
+			{ID: "tunnel-to-close", LocalPort: 8080, Protocol: proto.ProtocolHTTP, PublicURL: "http://closeapp.example.com", CreatedAt: time.Now()},
+		},
+	}
+	s.clientLock.Lock()
+	s.clients[client.ID] = client
+	s.clientLock.Unlock()
+
+	errCh := make(chan error, 1)
+	go func() {
+		stream, openErr := clientMux.OpenStream()
+		if openErr != nil {
+			errCh <- openErr
+			return
+		}
+		defer stream.Close()
+
+		req := proto.NewCloseRequest("tunnel-to-close", "user requested")
+		data, encErr := req.Encode()
+		if encErr != nil {
+			errCh <- encErr
+			return
+		}
+		if _, writeErr := stream.Write(data); writeErr != nil {
+			errCh <- writeErr
+			return
+		}
+
+		buf := make([]byte, 4096)
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			errCh <- readErr
+			return
+		}
+
+		msg, decErr := proto.DecodeControlMessage(buf[:n])
+		if decErr != nil {
+			errCh <- decErr
+			return
+		}
+		if msg.CloseResponse == nil {
+			errCh <- errors.New("expected close response")
+			return
+		}
+		if msg.CloseResponse.Success {
+			errCh <- errors.New("expected close to be rejected for viewer role")
+			return
+		}
+		errCh <- nil
+	}()
+
+	stream, err := serverMux.AcceptStream()
+	require.NoError(t, err)
+	defer stream.Close()
+
+	buf := make([]byte, 4096)
+	n, err := stream.Read(buf)
+	require.NoError(t, err)
+
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	require.NoError(t, err)
+	require.NotNil(t, msg.CloseRequest)
+
+	s.handleClose(client, stream, msg.CloseRequest)
+	require.NoError(t, <-errCh)
+
+	// The tunnel must still be present — the close was rejected.
+	client.mu.Lock()
+	assert.Len(t, client.Tunnels, 1)
+	client.mu.Unlock()
 }
 
 func TestServer_HandleClose_TunnelNotFound(t *testing.T) {

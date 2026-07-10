@@ -67,14 +67,20 @@ func (a *AdminAPI) Handler() http.Handler {
 	mux.HandleFunc("/audit", a.requireAdminAuth(a.handleAudit))
 	mux.HandleFunc("/audit/export", a.requireAdminAuth(a.handleAuditExport))
 
-	// Expose Prometheus metrics endpoint (no auth required for scraping).
+	// Expose Prometheus metrics endpoint. S11: metrics can leak operational
+	// details (client counts, throughput, team/tunnel activity patterns),
+	// so it goes through the same requireAdminAuth gate as every other
+	// admin endpoint — Bearer token when --admin-token is set, loopback-only
+	// otherwise. Configure Prometheus's scrape config with `bearer_token`
+	// (or run the scraper on the same host) to keep working after enabling
+	// --admin-token.
 	if a.server.metrics != nil {
-		mux.Handle("/metrics", promhttp.HandlerFor(
+		mux.Handle("/metrics", a.requireAdminAuth(promhttp.HandlerFor(
 			a.server.metrics.Registry(),
 			promhttp.HandlerOpts{
 				EnableOpenMetrics: true,
 			},
-		))
+		).ServeHTTP))
 	}
 
 	// Wrap with request body size limiter to mitigate DoS via large payloads.
@@ -111,6 +117,11 @@ type StatsResponse struct {
 	AllocatedPorts      int    `json:"allocated_ports"`
 	MaxClients          int    `json:"max_clients"`
 	MaxTunnelsPerClient int    `json:"max_tunnels_per_client"`
+	// AuditStoreErrors counts failed AuditStore.Store persistence attempts
+	// (A4); non-zero and growing means audit events are being lost from
+	// persistent storage (they still reach the JSON-line writer, if any).
+	// Omitted when audit logging is disabled.
+	AuditStoreErrors *uint64 `json:"audit_store_errors,omitempty"`
 }
 
 // ClientInfo is the per-client info returned by the API.
@@ -171,6 +182,10 @@ func (a *AdminAPI) handleStats(w http.ResponseWriter, _ *http.Request) {
 		AllocatedPorts:      allocatedPorts,
 		MaxClients:          a.server.config.MaxClients,
 		MaxTunnelsPerClient: a.server.config.MaxTunnelsPerClient,
+	}
+	if a.server.auditLogger != nil {
+		errCount := a.server.auditLogger.StoreErrors()
+		resp.AuditStoreErrors = &errCount
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -385,6 +400,10 @@ func (a *AdminAPI) handleUnblockIP(w http.ResponseWriter, r *http.Request) {
 
 	log.Info().Str("ip", req.IP).Msg("IP unblocked via admin API")
 
+	if a.server.auditLogger != nil {
+		a.server.auditLogger.LogIPUnblocked(req.IP, true)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]string{
 		fieldMessage: "IP unblocked successfully",
 		"ip":         req.IP,
@@ -498,6 +517,11 @@ type GenerateTokenResponse struct {
 	Team    string `json:"team"`
 	Role    string `json:"role"`
 	Expires string `json:"expires,omitempty"`
+	// Warning carries a non-fatal issue that occurred while generating this
+	// token — e.g. a refresh-and-revoke request (F5) where the new token
+	// was issued successfully but revoking the old one failed. The token
+	// itself is always valid when this response is returned.
+	Warning string `json:"warning,omitempty"`
 }
 
 // handleGenerateToken handles POST /tokens/generate.
@@ -553,6 +577,10 @@ func (a *AdminAPI) handleGenerateToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Info().Str("team", req.Team).Str("role", req.Role).Msg("Token generated via admin API")
+
+	if a.server.auditLogger != nil {
+		a.server.auditLogger.LogTokenGenerated(req.Team, role)
+	}
 
 	writeJSON(w, http.StatusOK, GenerateTokenResponse{
 		Token:   token,
@@ -887,6 +915,7 @@ func (a *AdminAPI) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 
 	var newToken string
 	var err error
+	var revokeWarning string
 
 	switch {
 	case req.ExtendBy != "":
@@ -898,8 +927,15 @@ func (a *AdminAPI) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 		}
 		newToken, err = a.server.authenticator.ExtendTokenExpiry(req.Token, duration) //nolint:contextcheck
 	case req.RevokeOld:
-		// Refresh and revoke old token.
+		// Refresh and revoke old token. F5: RefreshAndRevokeToken may now
+		// return a valid newToken alongside a non-nil error when the new
+		// token was issued but revoking the old one failed — don't discard
+		// a perfectly good token in that case, just surface the warning.
 		newToken, err = a.server.authenticator.RefreshAndRevokeToken(req.Token) //nolint:contextcheck
+		if err != nil && newToken != "" {
+			revokeWarning = err.Error()
+			err = nil
+		}
 	default:
 		// Simple refresh.
 		newToken, err = a.server.authenticator.RefreshToken(req.Token) //nolint:contextcheck
@@ -917,15 +953,19 @@ func (a *AdminAPI) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 		expires = claims.ExpiresAt.Format(time.RFC3339)
 	}
 
-	log.Info().
+	logEvent := log.Info().
 		Str("team", claims.TeamName).
-		Bool("revoke_old", req.RevokeOld).
-		Msg("Token refreshed via admin API")
+		Bool("revoke_old", req.RevokeOld)
+	if revokeWarning != "" {
+		logEvent = logEvent.Str("revoke_warning", revokeWarning)
+	}
+	logEvent.Msg("Token refreshed via admin API")
 
 	writeJSON(w, http.StatusOK, GenerateTokenResponse{
 		Token:   newToken,
 		Team:    claims.TeamName,
 		Role:    string(claims.Role),
 		Expires: expires,
+		Warning: revokeWarning,
 	})
 }

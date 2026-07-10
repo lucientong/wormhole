@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -62,6 +63,13 @@ type AuditLogger struct {
 	store   AuditStore
 	mu      sync.Mutex
 	enabled bool
+
+	// storeErrors counts failed AuditStore.Store calls (A4). This package
+	// deliberately has no logging dependency of its own, so a failure
+	// can't be logged here; StoreErrors() lets callers (e.g. the server,
+	// which does have a logger) surface/alert on persistent store
+	// failures instead of them being silently and permanently invisible.
+	storeErrors atomic.Uint64
 }
 
 // AuditLoggerConfig configures the audit logger.
@@ -105,10 +113,14 @@ func (l *AuditLogger) Log(event AuditEvent) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// Persist to store (non-blocking; errors are silently dropped to avoid
-	// impacting the hot path).
+	// Persist to store. A failure here must not block or fail the
+	// caller's hot path (auditing is best-effort), but it also must not
+	// vanish without a trace (A4) — count it so StoreErrors() can be
+	// monitored/alerted on.
 	if l.store != nil {
-		_ = l.store.Store(event)
+		if err := l.store.Store(event); err != nil {
+			l.storeErrors.Add(1)
+		}
 	}
 
 	// Encode as JSON and write to writer.
@@ -119,6 +131,15 @@ func (l *AuditLogger) Log(event AuditEvent) {
 
 	_, _ = l.writer.Write(data)
 	_, _ = l.writer.Write([]byte("\n"))
+}
+
+// StoreErrors returns the number of AuditEvent persistence failures
+// (AuditStore.Store returning an error) since this logger was created
+// (A4). A non-zero, growing value indicates the audit store is
+// unreachable or broken and events are being lost from persistent
+// storage (they're still written to the JSON-line writer, if any).
+func (l *AuditLogger) StoreErrors() uint64 {
+	return l.storeErrors.Load()
 }
 
 // LogAuthSuccess logs a successful authentication event.

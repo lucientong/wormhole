@@ -261,6 +261,11 @@ func decodeJWTParts(tokenStr string) (headerJSON, payloadJSON, sigBytes []byte, 
 	return headerJSON, payloadJSON, sigBytes, parts[0] + "." + parts[1], header.Alg, header.Kid, nil
 }
 
+// clockSkewLeeway tolerates small clock differences between this server and
+// the OIDC provider when validating time-based claims (exp/nbf), per common
+// JWT library practice (e.g. jwt-go, jose).
+const clockSkewLeeway = 60 * time.Second
+
 // buildClaims validates the JWT payload against the validator's config and
 // converts it to a Claims struct.
 func (v *OIDCValidator) buildClaims(_, payloadJSON []byte) (*Claims, error) {
@@ -270,20 +275,29 @@ func (v *OIDCValidator) buildClaims(_, payloadJSON []byte) (*Claims, error) {
 		Sub   string          `json:"sub"`
 		Exp   int64           `json:"exp"`
 		Iat   int64           `json:"iat"`
+		Nbf   int64           `json:"nbf"`
 		Email string          `json:"email"`
 	}
 	if err := json.Unmarshal(payloadJSON, &payload); err != nil {
 		return nil, fmt.Errorf("%w: cannot parse JWT payload", ErrInvalidToken)
 	}
 
-	if payload.Iss != v.config.Issuer {
+	// S7: normalize both sides (trailing slash) before comparing — some
+	// providers include or omit the trailing slash inconsistently between
+	// their discovery document and issued tokens.
+	if normalizeIssuer(payload.Iss) != normalizeIssuer(v.config.Issuer) {
 		return nil, fmt.Errorf("%w: issuer mismatch (got %q, want %q)", ErrInvalidToken, payload.Iss, v.config.Issuer)
 	}
 	if !audienceContains(payload.Aud, v.config.Audience) {
 		return nil, fmt.Errorf("%w: audience mismatch", ErrInvalidToken)
 	}
-	if payload.Exp > 0 && time.Now().Unix() > payload.Exp {
+	now := time.Now()
+	if payload.Exp > 0 && now.After(time.Unix(payload.Exp, 0).Add(clockSkewLeeway)) {
 		return nil, ErrTokenExpired
+	}
+	// S7: reject tokens that aren't valid yet (nbf), with the same leeway.
+	if payload.Nbf > 0 && now.Before(time.Unix(payload.Nbf, 0).Add(-clockSkewLeeway)) {
+		return nil, fmt.Errorf("%w: token not yet valid (nbf)", ErrInvalidToken)
 	}
 
 	var rawClaims map[string]json.RawMessage
@@ -333,6 +347,16 @@ func mapRole(rawClaims map[string]json.RawMessage, mapping OIDCClaimMapping) Rol
 // verifyJWTSignature verifies a JWT signature using the given algorithm and key.
 func verifyJWTSignature(alg string, key crypto.PublicKey, signingInput, sig []byte) error {
 	switch alg {
+	case "none", "":
+		// S6: explicitly reject the "none" algorithm (and a missing alg,
+		// which some vulnerable parsers treat the same way) rather than
+		// relying on it falling through to the generic "unsupported
+		// algorithm" default below. This is the classic JWT `alg:none`
+		// signature-bypass attack (CVE-2015-9235 and friends) — call it
+		// out by name so the rejection is unambiguous and independently
+		// tested, instead of being an incidental side effect of the
+		// switch's default case.
+		return errors.New("alg \"none\" is not permitted")
 	case jwtAlgRS256:
 		sum := sha256.Sum256(signingInput)
 		return verifyRSA(key, crypto.SHA256, sum[:], sig)
@@ -466,6 +490,12 @@ func parseECJWK(k jwkKey) (*ecdsa.PublicKey, error) {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+// normalizeIssuer strips a trailing "/" so that "https://issuer.example.com"
+// and "https://issuer.example.com/" compare as equal (S7).
+func normalizeIssuer(iss string) string {
+	return strings.TrimRight(iss, "/")
+}
 
 func audienceContains(audJSON json.RawMessage, want string) bool {
 	if len(audJSON) == 0 {

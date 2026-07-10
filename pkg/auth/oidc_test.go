@@ -182,6 +182,103 @@ func TestOIDCValidator_CustomRoleClaim(t *testing.T) {
 	assert.Equal(t, "admin@example.com", claims.TeamName)
 }
 
+// TestOIDCValidator_RejectsAlgNone verifies the classic JWT `alg:none`
+// signature-bypass attack (S6): a token forged with a real `kid` (so the
+// JWKS lookup succeeds) but `alg: none` and an empty signature must be
+// rejected, not accidentally accepted because no signature check ran.
+func TestOIDCValidator_RejectsAlgNone(t *testing.T) {
+	key := testGenRSAKey(t)
+	srv := testFakeOIDCServer(t, key)
+
+	v, err := NewOIDCValidator(OIDCConfig{Issuer: srv.URL, ClientID: "my-client"})
+	require.NoError(t, err)
+
+	hdr := map[string]string{"alg": "none", "kid": "key-1", "typ": "JWT"}
+	hdrJSON, _ := json.Marshal(hdr)
+	hdrB64 := base64.RawURLEncoding.EncodeToString(hdrJSON)
+
+	payload := map[string]interface{}{
+		"iss": srv.URL, "aud": "my-client", "sub": "attacker",
+		claimEmail: "attacker@example.com",
+		"iat":      time.Now().Unix(),
+		"exp":      time.Now().Add(time.Hour).Unix(),
+	}
+	payloadJSON, _ := json.Marshal(payload)
+	payloadB64 := base64.RawURLEncoding.EncodeToString(payloadJSON)
+
+	// Empty signature segment — the entire point of the attack.
+	forged := hdrB64 + "." + payloadB64 + "."
+
+	_, err = v.ValidateToken(forged)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "none")
+}
+
+func TestVerifyJWTSignature_RejectsAlgNoneAndEmpty(t *testing.T) {
+	err := verifyJWTSignature("none", nil, []byte("signing-input"), []byte{})
+	require.Error(t, err)
+
+	err = verifyJWTSignature("", nil, []byte("signing-input"), []byte{})
+	require.Error(t, err)
+}
+
+// TestOIDCValidator_IssuerTrailingSlashNormalized verifies S7: issuer
+// comparison tolerates a trailing slash difference between the configured
+// issuer and the token's `iss` claim.
+func TestOIDCValidator_IssuerTrailingSlashNormalized(t *testing.T) {
+	key := testGenRSAKey(t)
+	srv := testFakeOIDCServer(t, key)
+
+	v, err := NewOIDCValidator(OIDCConfig{Issuer: srv.URL, ClientID: "my-client"})
+	require.NoError(t, err)
+
+	// Token issuer has a trailing slash the configured issuer doesn't.
+	jwt := testBuildJWT(t, key, srv.URL+"/", "my-client", "user@example.com", map[string]interface{}{
+		claimEmail: "user@example.com",
+	}, time.Now().Add(1*time.Hour).Unix())
+
+	_, err = v.ValidateToken(jwt)
+	require.NoError(t, err)
+}
+
+// TestOIDCValidator_NotYetValid verifies S7: a token whose `nbf` is in the
+// future (beyond the clock-skew leeway) is rejected.
+func TestOIDCValidator_NotYetValid(t *testing.T) {
+	key := testGenRSAKey(t)
+	srv := testFakeOIDCServer(t, key)
+
+	v, err := NewOIDCValidator(OIDCConfig{Issuer: srv.URL, ClientID: "my-client"})
+	require.NoError(t, err)
+
+	jwt := testBuildJWT(t, key, srv.URL, "my-client", "user@example.com", map[string]interface{}{
+		claimEmail: "user@example.com",
+		"nbf":      time.Now().Add(1 * time.Hour).Unix(),
+	}, time.Now().Add(2*time.Hour).Unix())
+
+	_, err = v.ValidateToken(jwt)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not yet valid")
+}
+
+// TestOIDCValidator_NbfWithinLeewayAccepted verifies the clock-skew leeway
+// tolerates a small `nbf` overshoot instead of rejecting valid tokens
+// issued by a provider whose clock is slightly ahead.
+func TestOIDCValidator_NbfWithinLeewayAccepted(t *testing.T) {
+	key := testGenRSAKey(t)
+	srv := testFakeOIDCServer(t, key)
+
+	v, err := NewOIDCValidator(OIDCConfig{Issuer: srv.URL, ClientID: "my-client"})
+	require.NoError(t, err)
+
+	jwt := testBuildJWT(t, key, srv.URL, "my-client", "user@example.com", map[string]interface{}{
+		claimEmail: "user@example.com",
+		"nbf":      time.Now().Add(30 * time.Second).Unix(),
+	}, time.Now().Add(time.Hour).Unix())
+
+	_, err = v.ValidateToken(jwt)
+	require.NoError(t, err)
+}
+
 func TestOIDCValidator_NotAJWT(t *testing.T) {
 	key := testGenRSAKey(t)
 	srv := testFakeOIDCServer(t, key)

@@ -41,6 +41,11 @@ type AuditStore interface {
 	Store(event AuditEvent) error
 	// Query retrieves events matching the given filter.
 	Query(q AuditQuery) ([]AuditEvent, error)
+	// DeleteOlderThan removes all events with Timestamp strictly before
+	// cutoff, returning the number of events removed (A5). Used by the
+	// server's periodic retention sweep to keep long-running, persistently
+	// backed audit logs from growing without bound.
+	DeleteOlderThan(cutoff time.Time) (int64, error)
 	// Close releases any held resources.
 	Close() error
 }
@@ -113,6 +118,40 @@ func (m *MemoryAuditStore) Query(q AuditQuery) ([]AuditEvent, error) {
 		}
 	}
 	return matched, nil
+}
+
+// DeleteOlderThan removes buffered events older than cutoff. The ring
+// buffer already self-limits by count, so this is mainly useful for
+// keeping Query() results free of stale entries when a long retention
+// count is configured alongside a retention-day policy; it compacts the
+// buffer in place.
+func (m *MemoryAuditStore) DeleteOlderThan(cutoff time.Time) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	kept := make([]AuditEvent, 0, m.count)
+	var removed int64
+	for i := 0; i < m.count; i++ {
+		idx := (m.head - 1 - i + m.cap) % m.cap
+		ev := m.buf[idx]
+		if ev.Timestamp.Before(cutoff) {
+			removed++
+			continue
+		}
+		kept = append(kept, ev)
+	}
+
+	// Reset the ring buffer and re-insert the kept events in chronological
+	// order (kept is currently newest-first, so iterate in reverse).
+	m.head = 0
+	m.count = 0
+	for i := len(kept) - 1; i >= 0; i-- {
+		m.buf[m.head] = kept[i]
+		m.head = (m.head + 1) % m.cap
+		m.count++
+	}
+
+	return removed, nil
 }
 
 // Close is a no-op for the in-memory store.
@@ -301,6 +340,23 @@ func (s *SQLiteAuditStore) Query(q AuditQuery) ([]AuditEvent, error) {
 		return nil, err
 	}
 	return events, nil
+}
+
+// DeleteOlderThan removes all rows with a timestamp strictly before
+// cutoff (A5), returning the number of rows deleted.
+func (s *SQLiteAuditStore) DeleteOlderThan(cutoff time.Time) (int64, error) {
+	res, err := s.db.ExecContext(context.Background(),
+		`DELETE FROM audit_events WHERE timestamp < ?`,
+		cutoff.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("delete expired audit events: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count deleted audit events: %w", err)
+	}
+	return n, nil
 }
 
 // Close closes the underlying database.

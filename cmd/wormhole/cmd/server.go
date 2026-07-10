@@ -17,32 +17,33 @@ import (
 const defaultDomain = "localhost"
 
 var (
-	serverPort             int
-	serverHost             string
-	serverDomain           string
-	serverTLSEnabled       bool
-	serverTLSCert          string
-	serverTLSKey           string
-	serverHTTPPort         int
-	serverAdminPort        int
-	serverRequireAuth      bool
-	serverAuthTokens       []string
-	serverAuthSecret       string
-	serverAdminToken       string
-	serverPersistence      string
-	serverPersistencePath  string
-	serverTunnelTLS        bool
-	serverAdminHost        string
-	serverMaxClients       int
-	serverMaxTunnelsPerCli int
-	serverAuditEnabled     bool
-	serverAuditPersistence string
-	serverAuditPath        string
-	serverAuditBufferSize  int
-	serverOIDCIssuer       string
-	serverOIDCClientID     string
-	serverOIDCTeamClaim    string
-	serverOIDCRoleClaim    string
+	serverPort               int
+	serverHost               string
+	serverDomain             string
+	serverTLSEnabled         bool
+	serverTLSCert            string
+	serverTLSKey             string
+	serverHTTPPort           int
+	serverAdminPort          int
+	serverRequireAuth        bool
+	serverAuthTokens         []string
+	serverAuthSecret         string
+	serverAdminToken         string
+	serverPersistence        string
+	serverPersistencePath    string
+	serverTunnelTLS          bool
+	serverAdminHost          string
+	serverMaxClients         int
+	serverMaxTunnelsPerCli   int
+	serverAuditEnabled       bool
+	serverAuditPersistence   string
+	serverAuditPath          string
+	serverAuditBufferSize    int
+	serverAuditRetentionDays int
+	serverOIDCIssuer         string
+	serverOIDCClientID       string
+	serverOIDCTeamClaim      string
+	serverOIDCRoleClaim      string
 
 	// Cluster / HA flags.
 	serverClusterNodeID        string
@@ -108,7 +109,7 @@ func init() {
 	serverCmd.Flags().StringVar(&serverAdminToken, "admin-token", "", "Token for admin API authentication")
 	serverCmd.Flags().StringVar(&serverPersistence, "persistence", "memory", "Storage backend: memory (default) or sqlite")
 	serverCmd.Flags().StringVar(&serverPersistencePath, "persistence-path", "", "Path to SQLite database (default: ~/.wormhole/wormhole.db)")
-	serverCmd.Flags().BoolVar(&serverTunnelTLS, "tunnel-tls", false, "Enable TLS for the tunnel control listener (default: same as --tls)")
+	serverCmd.Flags().BoolVar(&serverTunnelTLS, "tunnel-tls", false, "Enable TLS for the tunnel control listener (default: same as --tls, or true when --require-auth is set with a real --domain)")
 	serverCmd.Flags().StringVar(&serverAdminHost, "admin-host", "127.0.0.1", "Host for admin API (default: 127.0.0.1 for safety)")
 	serverCmd.Flags().IntVar(&serverMaxClients, "max-clients", 1000, "Maximum concurrent clients (0 = unlimited)")
 	serverCmd.Flags().IntVar(&serverMaxTunnelsPerCli, "max-tunnels-per-client", 0, "Maximum tunnels per client (0 = unlimited)")
@@ -116,6 +117,7 @@ func init() {
 	serverCmd.Flags().StringVar(&serverAuditPersistence, "audit-persistence", "memory", "Audit storage backend: memory (default) or sqlite")
 	serverCmd.Flags().StringVar(&serverAuditPath, "audit-path", "", "Path to SQLite audit database (default: ~/.wormhole/audit.db)")
 	serverCmd.Flags().IntVar(&serverAuditBufferSize, "audit-buffer-size", 10_000, "In-memory audit ring buffer size (events)")
+	serverCmd.Flags().IntVar(&serverAuditRetentionDays, "audit-retention-days", 90, "Delete audit events older than this many days (0 = keep forever)")
 	serverCmd.Flags().StringVar(&serverOIDCIssuer, "oidc-issuer", "", "OIDC issuer URL for JWT validation (e.g. https://accounts.google.com)")
 	serverCmd.Flags().StringVar(&serverOIDCClientID, "oidc-client-id", "", "OAuth2 client ID for OIDC audience validation")
 	serverCmd.Flags().StringVar(&serverOIDCTeamClaim, "oidc-team-claim", "email", "JWT claim to use as team name (default: email)")
@@ -128,6 +130,44 @@ func init() {
 	serverCmd.Flags().StringVar(&serverClusterRedisAddr, "cluster-redis-addr", "", "Redis address for cluster state (e.g. localhost:6379)")
 	serverCmd.Flags().StringVar(&serverClusterRedisPassword, "cluster-redis-password", "", "Redis AUTH password")
 	serverCmd.Flags().IntVar(&serverClusterRedisDB, "cluster-redis-db", 0, "Redis database number")
+}
+
+// applyTunnelTLSDefaults implements S4: it decides whether the tunnel
+// control channel should default to TLS, independently of the operator's
+// --tunnel-tls flag, and enables AutoTLS when needed to serve it.
+//
+// Defaults (only applied when --tunnel-tls was not explicitly passed):
+//   - Mirror --tls, as before.
+//   - Additionally default to true when --require-auth is set and a real
+//     domain is configured — the control channel carries auth tokens, so
+//     requiring auth without encrypting it would let those tokens leak to
+//     any on-path observer. A real domain is required because AutoTLS (the
+//     only certificate source available here) can't issue for "localhost".
+//
+// If, after defaulting, --require-auth is still on but the channel ends up
+// plaintext (no domain, no manual cert/key), a warning is logged so the
+// operator knows tokens are transmitted unencrypted.
+func applyTunnelTLSDefaults(cmd *cobra.Command, config *server.Config) {
+	hasRealDomain := config.Domain != "" && config.Domain != defaultDomain
+
+	config.TunnelTLSEnabled = serverTunnelTLS
+	if !cmd.Flags().Changed("tunnel-tls") {
+		config.TunnelTLSEnabled = config.TLSEnabled || (config.RequireAuth && hasRealDomain)
+	}
+
+	// Enable auto-TLS when either the HTTP or the tunnel listener needs
+	// TLS, a real domain is set, and no manual cert/key was provided.
+	if (config.TLSEnabled || config.TunnelTLSEnabled) && hasRealDomain &&
+		config.TLSCertFile == "" && config.TLSKeyFile == "" {
+		config.AutoTLS = true
+	}
+
+	if config.RequireAuth && !config.TunnelTLSEnabled {
+		log.Warn().Msg("--require-auth is enabled but the tunnel control channel is not using TLS " +
+			"(no domain for auto-TLS and no --cert/--key provided) — authentication tokens will be " +
+			"transmitted in plaintext. Set --domain to a real hostname or pass --cert/--key, or use " +
+			"--tunnel-tls with manual certs, to encrypt the control channel.")
+	}
 }
 
 // buildServerConfig assembles a server.Config from CLI flags.
@@ -157,17 +197,7 @@ func buildServerConfig(cmd *cobra.Command) server.Config {
 	config.MaxClients = serverMaxClients
 	config.MaxTunnelsPerClient = serverMaxTunnelsPerCli
 
-	// Tunnel TLS defaults to the global TLS setting unless explicitly overridden.
-	config.TunnelTLSEnabled = serverTunnelTLS
-	if !cmd.Flags().Changed("tunnel-tls") {
-		config.TunnelTLSEnabled = config.TLSEnabled
-	}
-
-	// Enable auto-TLS when TLS is enabled, a real domain is set, and no manual cert/key provided.
-	if config.TLSEnabled && config.Domain != "" && config.Domain != defaultDomain &&
-		config.TLSCertFile == "" && config.TLSKeyFile == "" {
-		config.AutoTLS = true
-	}
+	applyTunnelTLSDefaults(cmd, &config)
 
 	if serverPersistence == "sqlite" {
 		config.Persistence = server.PersistenceSQLite
@@ -176,6 +206,7 @@ func buildServerConfig(cmd *cobra.Command) server.Config {
 	config.AuditEnabled = serverAuditEnabled
 	config.AuditPath = serverAuditPath
 	config.AuditBufferSize = serverAuditBufferSize
+	config.AuditRetentionDays = serverAuditRetentionDays
 	if serverAuditPersistence == "sqlite" {
 		config.AuditPersistence = server.PersistenceSQLite
 	}

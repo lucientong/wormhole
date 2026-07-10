@@ -3,12 +3,24 @@ package auth
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// failingAuditStore is a minimal AuditStore whose Store method always
+// fails, used to exercise AuditLogger's A4 error-counting path.
+type failingAuditStore struct{}
+
+func (failingAuditStore) Store(AuditEvent) error { return errors.New("store unavailable") }
+func (failingAuditStore) Query(AuditQuery) ([]AuditEvent, error) {
+	return nil, errors.New("store unavailable")
+}
+func (failingAuditStore) DeleteOlderThan(time.Time) (int64, error) { return 0, nil }
+func (failingAuditStore) Close() error                             { return nil }
 
 func TestAuditLogger_Disabled(t *testing.T) {
 	var buf bytes.Buffer
@@ -43,6 +55,40 @@ func TestAuditLogger_AuthSuccess(t *testing.T) {
 	assert.Equal(t, "sess1", event.SessionID)
 	assert.Equal(t, "app1", event.Subdomain)
 	assert.False(t, event.Timestamp.IsZero())
+}
+
+// TestAuditLogger_StoreErrors_CountsFailures verifies A4: a persistently
+// failing AuditStore is counted rather than silently and invisibly
+// swallowed, and logging still succeeds to the JSON-line writer.
+func TestAuditLogger_StoreErrors_CountsFailures(t *testing.T) {
+	var buf bytes.Buffer
+	logger := NewAuditLogger(AuditLoggerConfig{
+		Enabled: true,
+		Writer:  &buf,
+		Store:   failingAuditStore{},
+	})
+
+	assert.Equal(t, uint64(0), logger.StoreErrors())
+
+	logger.LogAuthSuccess("192.168.1.1", "team1", RoleMember, "sess1", "app1")
+	logger.LogAuthFailure("192.168.1.1", "bad token")
+
+	assert.Equal(t, uint64(2), logger.StoreErrors())
+	// The writer path is independent of the store and must still work.
+	assert.NotEmpty(t, buf.String())
+}
+
+// TestAuditLogger_StoreErrors_NoStoreConfigured verifies that without a
+// Store configured, StoreErrors stays at zero (there's nothing to fail).
+func TestAuditLogger_StoreErrors_NoStoreConfigured(t *testing.T) {
+	var buf bytes.Buffer
+	logger := NewAuditLogger(AuditLoggerConfig{
+		Enabled: true,
+		Writer:  &buf,
+	})
+
+	logger.LogAuthSuccess("192.168.1.1", "team1", RoleMember, "sess1", "app1")
+	assert.Equal(t, uint64(0), logger.StoreErrors())
 }
 
 func TestAuditLogger_AuthFailure(t *testing.T) {

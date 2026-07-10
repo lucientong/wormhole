@@ -241,7 +241,7 @@ wormhole server \
 | `--admin-host` | Host for admin API (security: loopback only by default) | `127.0.0.1` |
 | `--domain` | Domain for tunnel URLs (env: `WORMHOLE_DOMAIN`) | `localhost` |
 | `--tls` | Enable TLS (auto-cert if domain is set) | false |
-| `--tunnel-tls` | Enable TLS for tunnel control listener (defaults to `--tls`) | same as `--tls` |
+| `--tunnel-tls` | Enable TLS for tunnel control listener (defaults to `--tls`, and also defaults to `true` when `--require-auth` is set with a real `--domain` — see [Security](#security)) | see description |
 | `--cert` | Path to TLS certificate file | None |
 | `--key` | Path to TLS private key file | None |
 | `--require-auth` | Require authentication for connections | false |
@@ -254,6 +254,7 @@ wormhole server \
 | `--audit-persistence` | Audit storage backend: memory or sqlite | memory |
 | `--audit-path` | Path to SQLite audit database | `~/.wormhole/audit.db` |
 | `--audit-buffer-size` | In-memory audit ring buffer size (events) | 10000 |
+| `--audit-retention-days` | Delete audit events older than this many days (0 = keep forever) | 90 |
 | `--oidc-issuer` | OIDC issuer URL for JWT validation | None |
 | `--oidc-client-id` | OAuth2 client ID for OIDC audience validation | None |
 | `--oidc-team-claim` | JWT claim to use as team name | `email` |
@@ -530,12 +531,14 @@ Wormhole is designed with security in mind, but as a tunneling tool that exposes
 | **P2P E2E Encryption** | X25519 ECDH key exchange + AES-256-GCM for direct P2P connections |
 | **HMAC-SHA256 Tokens** | Signed team tokens with expiration and revocation support |
 | **OIDC / SSO** | OIDC Discovery + JWKS JWT validation; claims-based team/role mapping; no password ever stored |
-| **RBAC** | Role-based access control (admin / member / viewer) |
+| **RBAC** | Role-based access control (admin / member / viewer); write operations (register/close a tunnel) require `PermissionWrite` — `viewer` tokens are rejected server-side, not just hidden in the UI |
 | **Rate Limiting** | Automatic IP blocking after repeated authentication failures |
 | **Token Revocation** | Individual token blacklist + team-level bulk revocation (version-based) with persistent storage |
 | **Constant-time Auth** | Admin token comparison uses `crypto/subtle` to prevent timing attacks |
 | **Request Limits** | MaxHeaderBytes and request body size limits to mitigate DoS |
-| **Audit Logging** | Immutable structured event log (auth, tunnel, P2P) with SQLite persistence and Admin API export |
+| **Audit Logging** | Immutable structured event log (auth, tunnel, P2P) with SQLite persistence, Admin API export, and a configurable retention sweep (`--audit-retention-days`, default 90) |
+| **Metrics Protection** | `/metrics` requires the same admin authentication as the rest of the Admin API — it is never exposed unauthenticated |
+| **Atomic Subdomain Reservation** | Subdomain claims are reserved atomically (local map / Redis `SETNX`); a genuine conflict with a live owner rejects the connecting client instead of silently overwriting the existing route |
 
 ### Production Deployment Checklist
 
@@ -563,6 +566,10 @@ wormhole server \
 - [ ] **Restrict admin port access**: Admin binds to `127.0.0.1` by default. If remote access is needed, use `--admin-host 0.0.0.0 --admin-token <token>`.
 
 ### Security Considerations
+
+#### Tunnel Control-Channel TLS
+
+`--tunnel-tls` controls TLS on the tunnel *control* listener (where auth tokens travel), independently of `--tls` (which controls the HTTP data-plane listener). If you don't pass `--tunnel-tls` explicitly, it defaults to `--tls`'s value — **and additionally defaults to `true` whenever `--require-auth` is set together with a real `--domain`**, since requiring authentication while leaving the channel that carries those tokens unencrypted defeats the purpose. If auth is required but no domain/cert is available to source a certificate from, the server logs a loud warning and starts anyway (a broken TLS *config* on that scenario, e.g. bad cert paths, fails the server startup instead of silently falling back to plaintext).
 
 #### P2P Mode
 
@@ -592,6 +599,7 @@ The traffic inspector captures and displays HTTP request/response data. In produ
 - **Do not enable the inspector** on public-facing deployments
 - The inspector binds to **`127.0.0.1`** by default — use `--inspector-host 0.0.0.0` to allow external access (not recommended)
 - CORS is restricted to localhost origins by default
+- Sensitive headers (`Authorization`, `Cookie`, `Set-Cookie`, `Proxy-Authorization`, `X-Api-Key`, etc.) are redacted in captured requests/responses regardless of these settings, and the default per-record body capture limit is 256KB
 
 #### Admin API Without Token
 
@@ -624,6 +632,7 @@ Auto-generated subdomains use 64-bit cryptographic randomness (`crypto/rand`), p
 - [x] Phase 12 (v0.6.1): Correctness closure — reliable reconnection detection (`Mux.CloseNotify()` + heartbeat-triggered force-close), true multi-tunnel routing (per-tunnel `TunnelID` dispatch end-to-end), fixed P2P signaling frame mismatch, P2P receive-buffer backpressure (bounded blocking delivery + RST on stuck consumers), TCP port-allocation-failure rejection, a reliable P2P stream handshake (SYN retransmission + SYN-ACK, previously a single lost SYN packet under packet loss would leave a connection silently half-open forever), and a WebSocket inspector data race fix
 - [x] Phase 13 (v0.6.1): End-to-end SSO — `wormhole login` credentials are now auto-loaded by `wormhole client` (no more manual `--token`/`jq`), expired access tokens are silently renewed via `refresh_token` (including mid-session, across reconnects), the device-flow token poll now includes `client_id` per RFC 8628, and `wormhole client` with no `--local`/`--config` falls back to `~/.wormhole/wormhole.yml`
 - [x] Phase 14 (v0.6.2): P2P data plane access + transport optimization — new `wormhole connect <subdomain>` command lets two `wormhole` clients hole-punch and exchange real traffic entirely peer-to-peer (server only signals, never relays a byte); `UDPStream` upgraded from a fixed 200ms retransmit timer to RFC 6298-style adaptive RTO with per-segment exponential backoff; send/receive path copies reduced (direct in-place encryption, no redundant buffer copies); removed the superseded `pkg/p2p/transport.go` ARQ implementation
+- [x] Phase 15 (v0.6.3): Security hardening — RBAC write-permission checks (viewers can no longer register/close tunnels); tunnel control-channel TLS decoupled from the HTTP listener's TLS setting and defaulted on whenever `--require-auth` is combined with a real domain (fails closed instead of silently falling back to plaintext); subdomain registration is now an atomic, cluster-wide reservation (local + Redis `SETNX`-based) that rejects connections on genuine conflicts instead of silently overwriting the previous owner; fixed a token-expiry data race and scheduled periodic revoked-token cleanup; OIDC now explicitly rejects `alg: none` and validates `nbf` with clock-skew leeway; Inspector redacts sensitive headers (`Authorization`/`Cookie`/`Set-Cookie`/etc.) and lowered its default body-capture limit; `/metrics` now requires admin auth; audit logging gained successful-auth/IP-blocked/token-generated/IP-unblocked events plus a configurable retention sweep (`--audit-retention-days`) and a `audit_store_errors` counter on `/stats` so persistence failures are no longer silent
 
 ## Contributing
 

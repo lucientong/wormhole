@@ -25,7 +25,28 @@ func TestNewRecord(t *testing.T) {
 	assert.Equal(t, "/api/users", record.Path)
 	assert.NotZero(t, record.Timestamp)
 	assert.Equal(t, "application/json", record.Headers["Content-Type"])
-	assert.Equal(t, "Bearer token123", record.Headers["Authorization"])
+	// S14: sensitive headers must be redacted, not stored verbatim.
+	assert.Equal(t, redactedHeaderValue, record.Headers["Authorization"])
+}
+
+// TestNewRecord_RedactsSensitiveHeaders verifies S14 across the full set of
+// sensitive headers, case-insensitively, while leaving ordinary headers
+// untouched.
+func TestNewRecord_RedactsSensitiveHeaders(t *testing.T) {
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	req.Header.Set("Cookie", "session=abc123")
+	req.Header.Set("X-Api-Key", "sk-live-secret")
+	req.Header.Set("proxy-authorization", "Basic dXNlcjpwYXNz") // lowercase, must still match.
+	req.Header.Set("X-Request-ID", "req-42")
+
+	record := NewRecord("test-redact", req)
+
+	assert.Equal(t, redactedHeaderValue, record.Headers["Authorization"])
+	assert.Equal(t, redactedHeaderValue, record.Headers["Cookie"])
+	assert.Equal(t, redactedHeaderValue, record.Headers["X-Api-Key"])
+	assert.Equal(t, redactedHeaderValue, record.Headers["Proxy-Authorization"])
+	assert.Equal(t, "req-42", record.Headers["X-Request-Id"])
 }
 
 func TestNewRecord_NoHeaders(t *testing.T) {
@@ -83,6 +104,27 @@ func TestRecord_SetResponse(t *testing.T) {
 	assert.Equal(t, string(body), record.Response.Body)
 	assert.Equal(t, int64(len(body)), record.Response.BodySize)
 	assert.Equal(t, 200, record.Status)
+}
+
+// TestRecord_SetResponse_RedactsSensitiveHeaders verifies S14 for
+// response headers — e.g. a Set-Cookie issuing a new session token must
+// not be captured verbatim.
+func TestRecord_SetResponse_RedactsSensitiveHeaders(t *testing.T) {
+	record := &Record{ID: "test"}
+
+	resp := &http.Response{
+		StatusCode: 200,
+		Status:     "200 OK",
+		Header: http.Header{
+			"Content-Type": []string{"application/json"},
+			"Set-Cookie":   []string{"session=newtoken; Path=/"},
+		},
+	}
+	record.SetResponse(resp, nil, 1024)
+
+	require.NotNil(t, record.Response)
+	assert.Equal(t, "application/json", record.Response.Headers["Content-Type"])
+	assert.Equal(t, redactedHeaderValue, record.Response.Headers["Set-Cookie"])
 }
 
 func TestRecord_SetResponse_Truncated(t *testing.T) {
@@ -158,7 +200,7 @@ func TestGenerateID_Uniqueness(t *testing.T) {
 func TestDefaultConfig_Inspector(t *testing.T) {
 	cfg := DefaultConfig()
 	assert.Equal(t, 1000, cfg.MaxRecords)
-	assert.Equal(t, int64(1024*1024), cfg.MaxBodySize)
+	assert.Equal(t, int64(256*1024), cfg.MaxBodySize) // S14: lowered from 1MB.
 	assert.True(t, cfg.EnableCapture)
 }
 

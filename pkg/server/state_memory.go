@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -25,6 +26,15 @@ func NewMemoryStateStore() *MemoryStateStore {
 func (m *MemoryStateStore) RegisterRoute(entry RouteEntry) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// S3/H6: reject when the subdomain is already owned by a different
+	// client instead of silently overwriting it (last-writer-wins).
+	for clientID, existing := range m.routes {
+		if existing.Subdomain == entry.Subdomain && clientID != entry.ClientID {
+			return fmt.Errorf("%w: subdomain %q", ErrSubdomainConflict, entry.Subdomain)
+		}
+	}
+
 	m.routes[entry.ClientID] = entry
 	return nil
 }

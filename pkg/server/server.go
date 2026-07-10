@@ -94,6 +94,18 @@ type ClientSession struct {
 	mu sync.Mutex
 }
 
+// remoteAddr returns the client's remote network address for audit
+// logging, or "" if unavailable (e.g. in unit tests with no real Mux).
+func (c *ClientSession) remoteAddr() string {
+	if c.Mux == nil {
+		return ""
+	}
+	if addr := c.Mux.RemoteAddr(); addr != nil {
+		return addr.String()
+	}
+	return ""
+}
+
 // TunnelInfo contains information about a tunnel.
 type TunnelInfo struct {
 	ID        string
@@ -145,28 +157,6 @@ func NewServer(config Config) *Server {
 	if config.EnableMetrics {
 		s.metrics = NewMetrics()
 		log.Info().Msg("Prometheus metrics enabled")
-	}
-
-	// Initialize OIDC validator (if configured).
-	if config.OIDCIssuer != "" && s.authenticator != nil {
-		oidcCfg := auth.OIDCConfig{
-			Issuer:   config.OIDCIssuer,
-			ClientID: config.OIDCClientID,
-			ClaimMapping: auth.OIDCClaimMapping{
-				TeamClaim:   config.OIDCTeamClaim,
-				RoleClaim:   config.OIDCRoleClaim,
-				DefaultRole: auth.RoleMember,
-			},
-		}
-		if v, err := auth.NewOIDCValidator(oidcCfg); err != nil {
-			log.Fatal().Err(err).Msg("Failed to initialize OIDC validator")
-		} else {
-			s.authenticator.SetOIDCValidator(v)
-			log.Info().
-				Str("issuer", config.OIDCIssuer).
-				Str("client_id", config.OIDCClientID).
-				Msg("OIDC JWT validation enabled")
-		}
 	}
 
 	// Initialize audit logger.
@@ -239,6 +229,32 @@ func NewServer(config Config) *Server {
 				Dur("block_duration", config.RateLimitBlockDuration).
 				Msg("Authentication rate limiting enabled")
 		}
+
+		// Initialize OIDC validator (if configured). This must come after
+		// s.authenticator is constructed above — it previously ran before
+		// the authenticator existed, so the `s.authenticator != nil` guard
+		// was always false and OIDC was silently never wired up server-side
+		// no matter what --oidc-issuer was set to (uncovered by any test).
+		if config.OIDCIssuer != "" && s.authenticator != nil {
+			oidcCfg := auth.OIDCConfig{
+				Issuer:   config.OIDCIssuer,
+				ClientID: config.OIDCClientID,
+				ClaimMapping: auth.OIDCClaimMapping{
+					TeamClaim:   config.OIDCTeamClaim,
+					RoleClaim:   config.OIDCRoleClaim,
+					DefaultRole: auth.RoleMember,
+				},
+			}
+			if v, err := auth.NewOIDCValidator(oidcCfg); err != nil {
+				log.Fatal().Err(err).Msg("Failed to initialize OIDC validator")
+			} else {
+				s.authenticator.SetOIDCValidator(v)
+				log.Info().
+					Str("issuer", config.OIDCIssuer).
+					Str("client_id", config.OIDCClientID).
+					Msg("OIDC JWT validation enabled")
+			}
+		}
 	}
 
 	return s
@@ -262,9 +278,25 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	s.tunnelListener = tunnelLn
 
-	// Wrap tunnel listener with TLS if configured.
+	// Wrap tunnel listener with TLS if configured (S4: decoupled from
+	// Config.TLSEnabled — see TunnelTLSConfig's doc comment). When
+	// RequireAuth is set, a TLS config error is fatal rather than a
+	// silent fallback to plaintext: auth tokens travel over this
+	// channel, and continuing unencrypted would violate the guarantee
+	// operators asked for by combining --require-auth with --tunnel-tls
+	// (or the RequireAuth-driven default enabled below in
+	// buildServerConfig).
 	if s.config.TunnelTLSEnabled {
-		s.tunnelListener = s.tlsManager.WrapListener(tunnelLn)
+		wrapped, tlsErr := s.tlsManager.WrapTunnelListenerStrict(tunnelLn)
+		if tlsErr != nil {
+			if s.config.RequireAuth {
+				_ = tunnelLn.Close()
+				return fmt.Errorf("tunnel control channel TLS required (RequireAuth is enabled) but could not be configured: %w", tlsErr)
+			}
+			log.Error().Err(tlsErr).Msg("Failed to enable tunnel TLS, continuing with plaintext control channel")
+		} else {
+			s.tunnelListener = wrapped
+		}
 	}
 
 	// Start HTTP listener (with optional TLS).
@@ -285,14 +317,37 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	s.adminListener = adminLn
 
-	// Start ACME HTTP-01 challenge server if AutoTLS is enabled.
-	if s.config.TLSEnabled && s.config.AutoTLS {
+	// Start ACME HTTP-01 challenge server if AutoTLS is enabled. This is
+	// needed whenever *either* the HTTP or the tunnel listener sources its
+	// certificate from AutoTLS (S4 can enable AutoTLS purely to serve the
+	// tunnel control channel, with TLSEnabled/HTTP TLS left off) — Let's
+	// Encrypt's HTTP-01 challenge has to be answered regardless of which
+	// listener ultimately presents the resulting certificate.
+	if s.config.AutoTLS && (s.config.TLSEnabled || s.config.TunnelTLSEnabled) {
 		s.closeWg.Add(1)
 		go s.serveACMEChallenge()
 	}
 
 	// Start cluster heartbeat (no-op for single-node / nil store).
 	s.startClusterHeartbeat(ctx)
+
+	// S10: periodically purge expired entries from the token revocation
+	// blacklist. CleanupRevokedTokens() existed and was fully implemented,
+	// but nothing ever called it, so the blacklist (and, with SQLite
+	// persistence, its backing table) grew without bound over the life of
+	// a long-running server.
+	if s.authenticator != nil {
+		s.closeWg.Add(1)
+		go s.runRevokedTokenCleanup()
+	}
+
+	// A5: periodically purge audit events older than the configured
+	// retention window, so long-running servers with --audit enabled don't
+	// grow the (potentially SQLite-backed) audit log without bound.
+	if s.auditLogger != nil && s.config.AuditRetentionDays > 0 {
+		s.closeWg.Add(1)
+		go s.runAuditRetention()
+	}
 
 	// Start accept loops.
 	s.closeWg.Add(3)
@@ -433,6 +488,14 @@ func (s *Server) handleClient(conn net.Conn) {
 		return
 	}
 
+	// A1: record successful authentication events, not just failures — the
+	// audit log previously only ever saw auth_failure entries, making it
+	// impossible to answer "who successfully authenticated, from where,
+	// and when" from the audit trail.
+	if s.config.RequireAuth && s.auditLogger != nil {
+		s.auditLogger.LogAuthSuccess(clientIP, teamName, role, sessionID, subdomain)
+	}
+
 	// Generate subdomain (if not set by auth).
 	if subdomain == "" {
 		subdomain = generateSubdomain()
@@ -449,27 +512,22 @@ func (s *Server) handleClient(conn net.Conn) {
 		LastSeen:  time.Now(),
 	}
 
+	// Register route via Router and (if clustered) the shared state store
+	// *before* exposing the client anywhere else. F6/H6/S3: a subdomain
+	// conflict here previously only got logged, and the connection was
+	// allowed to proceed — but the client had already been told (in the
+	// AuthResponse) that it owns `subdomain`, so it would silently receive
+	// zero traffic for it while believing it was live. Reject the
+	// connection instead so the client's reconnect/retry logic kicks in.
+	if !s.registerClientRoute(client, clientIP) {
+		_ = mux.Close()
+		return
+	}
+
 	// Register client.
 	s.clientLock.Lock()
 	s.clients[sessionID] = client
 	s.clientLock.Unlock()
-
-	// Register route via Router.
-	if err := s.router.RegisterSubdomain(subdomain, client); err != nil {
-		log.Error().Err(err).Str("subdomain", subdomain).Msg("Failed to register subdomain")
-	}
-
-	// Register route in cluster state store (for cross-node routing).
-	if s.stateStore != nil {
-		if err := s.stateStore.RegisterRoute(RouteEntry{
-			ClientID:  sessionID,
-			Subdomain: subdomain,
-			NodeID:    s.config.ClusterNodeID,
-			NodeAddr:  s.config.ClusterNodeAddr,
-		}); err != nil {
-			log.Warn().Err(err).Str("subdomain", subdomain).Msg("Cluster: failed to register route in state store")
-		}
-	}
 
 	atomic.AddUint64(&s.stats.ActiveClients, 1)
 	atomic.AddUint64(&s.stats.TotalClients, 1)
@@ -506,6 +564,53 @@ func (s *Server) handleClient(conn net.Conn) {
 		Msg("Client disconnected")
 }
 
+// registerClientRoute reserves client.Subdomain in the local Router and, if
+// clustered, the shared state store. It returns false if the subdomain is
+// already claimed by another client (locally or cluster-wide), in which
+// case the caller must reject the connection rather than let it proceed
+// silently unrouted (F6/H6/S3 — see handleClient's call site for context).
+func (s *Server) registerClientRoute(client *ClientSession, clientIP string) bool {
+	subdomain, sessionID := client.Subdomain, client.ID
+
+	if err := s.router.RegisterSubdomain(subdomain, client); err != nil {
+		log.Error().Err(err).Str("subdomain", subdomain).Str("session_id", sessionID).
+			Msg("Subdomain registration conflict — rejecting connection")
+		if s.auditLogger != nil {
+			s.auditLogger.LogAuthFailure(clientIP, fmt.Sprintf("subdomain %q already in use", subdomain))
+		}
+		return false
+	}
+
+	// H6/S3: RegisterRoute atomically reserves the subdomain cluster-wide
+	// (Redis SETNX) instead of last-writer-wins; a genuine conflict with a
+	// live owner on another node must reject the connection too, for the
+	// same reason as the local check above.
+	if s.stateStore == nil {
+		return true
+	}
+	err := s.stateStore.RegisterRoute(RouteEntry{
+		ClientID:  sessionID,
+		Subdomain: subdomain,
+		NodeID:    s.config.ClusterNodeID,
+		NodeAddr:  s.config.ClusterNodeAddr,
+	})
+	if err == nil {
+		return true
+	}
+	if !errors.Is(err, ErrSubdomainConflict) {
+		log.Warn().Err(err).Str("subdomain", subdomain).Msg("Cluster: failed to register route in state store")
+		return true
+	}
+
+	log.Error().Err(err).Str("subdomain", subdomain).Str("session_id", sessionID).
+		Msg("Cluster: subdomain already claimed by another node — rejecting connection")
+	s.router.UnregisterSubdomain(subdomain)
+	if s.auditLogger != nil {
+		s.auditLogger.LogAuthFailure(clientIP, fmt.Sprintf("subdomain %q already claimed cluster-wide", subdomain))
+	}
+	return false
+}
+
 // handleClientAuth performs the authentication handshake for a new client.
 // Returns (teamName, role, subdomain, ok). If ok is false, the caller should close the mux.
 func (s *Server) handleClientAuth(mux *tunnel.Mux, sessionID, clientIP, remoteAddr string) (string, auth.Role, string, bool) {
@@ -522,6 +627,12 @@ func (s *Server) handleClientAuth(mux *tunnel.Mux, sessionID, clientIP, remoteAd
 			blocked := s.rateLimiter.RecordFailure(clientIP)
 			if blocked {
 				log.Warn().Str("ip", clientIP).Msg("IP blocked due to repeated auth failures")
+				// A2: this was previously never recorded in the audit
+				// trail — only the auth_failure events were, with no
+				// signal that they had escalated into an IP-level block.
+				if s.auditLogger != nil {
+					s.auditLogger.LogIPBlocked(clientIP, s.config.RateLimitMaxFailures)
+				}
 			}
 		}
 
@@ -699,10 +810,49 @@ func (s *Server) handleClientStream(client *ClientSession, stream *tunnel.Stream
 	}
 }
 
+// requireWritePermission enforces RBAC (S2) on tunnel-mutating control
+// messages. Role/permission checks previously only ran at the connection
+// handshake (PermissionConnect) — once connected, a RoleViewer token could
+// still register or close tunnels and claim subdomains, because
+// handleRegister/handleClose never consulted auth.HasPermission at all.
+// When authentication is disabled, client.Role is always empty and every
+// operation is allowed, matching pre-P3-4 behavior.
+func (s *Server) requireWritePermission(client *ClientSession) bool {
+	if !s.config.RequireAuth {
+		return true
+	}
+	return auth.HasPermission(&auth.Claims{Role: client.Role}, auth.PermissionWrite)
+}
+
+// rejectInsufficientPermission logs and audits an RBAC rejection, shared by
+// handleRegister and handleClose.
+func (s *Server) rejectInsufficientPermission(client *ClientSession, action string) {
+	log.Warn().
+		Str("client", client.ID).
+		Str("role", string(client.Role)).
+		Str("action", action).
+		Msg("Rejected: role lacks write permission")
+	if s.auditLogger != nil {
+		s.auditLogger.LogAuthFailure(client.remoteAddr(), fmt.Sprintf("role %s lacks write permission for %s", client.Role, action))
+	}
+}
+
 // handleRegister handles a tunnel registration request.
 //
 //nolint:gocyclo // registration coordinates TLS, TCP, routing and audit in one flow
 func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, req *proto.RegisterRequest) {
+	// S2: RoleViewer (and any other role without PermissionWrite) must not
+	// be able to register tunnels or claim subdomains — previously RBAC was
+	// only checked once, at the PermissionConnect stage of the handshake.
+	if !s.requireWritePermission(client) {
+		s.rejectInsufficientPermission(client, "register tunnel")
+		resp := proto.NewRegisterResponse(false, "insufficient permissions: role lacks write access", "", "", 0)
+		if data, err := resp.Encode(); err == nil {
+			_, _ = stream.Write(data)
+		}
+		return
+	}
+
 	// Check per-client tunnel limit.
 	if s.config.MaxTunnelsPerClient > 0 {
 		client.mu.Lock()
@@ -902,6 +1052,14 @@ func (s *Server) handleStats(client *ClientSession, stream *tunnel.Stream, _ *pr
 // It finds the specified tunnel, cleans up its routes and TCP port,
 // removes it from the client session, and returns a CloseResponse.
 func (s *Server) handleClose(client *ClientSession, stream *tunnel.Stream, req *proto.CloseRequest) {
+	// S2: closing/deleting a tunnel is a write operation just like
+	// registering one — enforce the same RBAC gate.
+	if !s.requireWritePermission(client) {
+		s.rejectInsufficientPermission(client, "close tunnel")
+		writeCloseResponse(stream, client.ID, false)
+		return
+	}
+
 	if req == nil || req.TunnelID == "" {
 		log.Warn().Str("client", client.ID).Msg("Close request with empty tunnel ID")
 		writeCloseResponse(stream, client.ID, false)
@@ -1347,6 +1505,73 @@ func (s *Server) serveACMEChallenge() {
 
 	if err := challengeServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Error().Err(err).Msg("ACME challenge server error")
+	}
+}
+
+// revokedTokenCleanupInterval controls how often runRevokedTokenCleanup
+// sweeps expired entries from the token revocation blacklist (S10).
+const revokedTokenCleanupInterval = 10 * time.Minute
+
+// runRevokedTokenCleanup periodically calls Auth.CleanupRevokedTokens()
+// until the server shuts down.
+func (s *Server) runRevokedTokenCleanup() {
+	defer s.closeWg.Done()
+
+	ticker := time.NewTicker(revokedTokenCleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.closeCh:
+			return
+		case <-ticker.C:
+			if n := s.authenticator.CleanupRevokedTokens(); n > 0 {
+				log.Debug().Int("cleaned", n).Msg("Cleaned up expired revoked-token entries")
+			}
+		}
+	}
+}
+
+// auditRetentionSweepInterval controls how often runAuditRetention checks
+// for audit events past the configured retention window (A5).
+const auditRetentionSweepInterval = 1 * time.Hour
+
+// runAuditRetention periodically deletes audit events older than
+// Config.AuditRetentionDays until the server shuts down. It runs once
+// immediately on startup (so a server that's rarely restarted doesn't wait
+// a full sweep interval before its first cleanup) and then on every tick.
+func (s *Server) runAuditRetention() {
+	defer s.closeWg.Done()
+
+	sweep := func() {
+		store := s.auditLogger.Store()
+		if store == nil {
+			return
+		}
+		cutoff := time.Now().AddDate(0, 0, -s.config.AuditRetentionDays)
+		n, err := store.DeleteOlderThan(cutoff)
+		if err != nil {
+			log.Warn().Err(err).Msg("Audit retention sweep failed")
+			return
+		}
+		if n > 0 {
+			log.Info().Int64("deleted", n).Int("retention_days", s.config.AuditRetentionDays).
+				Msg("Audit retention: purged expired events")
+		}
+	}
+
+	sweep()
+
+	ticker := time.NewTicker(auditRetentionSweepInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.closeCh:
+			return
+		case <-ticker.C:
+			sweep()
+		}
 	}
 }
 

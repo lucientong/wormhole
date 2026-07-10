@@ -227,6 +227,80 @@ func TestTLSManager_CertCacheDir(t *testing.T) {
 	assert.Contains(t, cacheDir, "certs")
 }
 
+// TestTLSManager_TunnelTLSConfig_Disabled verifies that TunnelTLSConfig is
+// gated on TunnelTLSEnabled independently of TLSEnabled (S4).
+func TestTLSManager_TunnelTLSConfig_Disabled(t *testing.T) {
+	config := DefaultConfig()
+	config.TLSEnabled = true // HTTP TLS on, tunnel TLS off.
+	config.TunnelTLSEnabled = false
+	m := NewTLSManager(config)
+
+	tlsConfig, err := m.TunnelTLSConfig()
+	assert.NoError(t, err)
+	assert.Nil(t, tlsConfig)
+}
+
+// TestTLSManager_TunnelTLSConfig_ManualFiles verifies that TunnelTLSConfig
+// can be satisfied even when the HTTP-facing TLSEnabled is false — i.e. the
+// two listeners' TLS settings are fully decoupled (S4).
+func TestTLSManager_TunnelTLSConfig_ManualFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	certFile := filepath.Join(tmpDir, "cert.pem")
+	keyFile := filepath.Join(tmpDir, "key.pem")
+	generateTestCert(t, certFile, keyFile)
+
+	config := DefaultConfig()
+	config.TLSEnabled = false
+	config.TunnelTLSEnabled = true
+	config.AutoTLS = false
+	config.TLSCertFile = certFile
+	config.TLSKeyFile = keyFile
+	m := NewTLSManager(config)
+
+	tlsConfig, err := m.TunnelTLSConfig()
+	require.NoError(t, err)
+	require.NotNil(t, tlsConfig)
+	assert.Len(t, tlsConfig.Certificates, 1)
+}
+
+// TestTLSManager_WrapTunnelListenerStrict_PropagatesError verifies that,
+// unlike WrapListener, WrapTunnelListenerStrict surfaces TLS configuration
+// errors to the caller instead of silently falling back to plaintext, so
+// server startup can fail closed when RequireAuth demands an encrypted
+// control channel (S4).
+func TestTLSManager_WrapTunnelListenerStrict_PropagatesError(t *testing.T) {
+	config := DefaultConfig()
+	config.TunnelTLSEnabled = true
+	config.AutoTLS = false
+	config.TLSCertFile = "/nonexistent/cert.pem"
+	config.TLSKeyFile = "/nonexistent/key.pem"
+	m := NewTLSManager(config)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	wrapped, err := m.WrapTunnelListenerStrict(ln)
+	assert.Error(t, err)
+	assert.Equal(t, ln, wrapped)
+}
+
+// TestTLSManager_WrapTunnelListenerStrict_NoTLS verifies the passthrough
+// case returns the original listener with no error.
+func TestTLSManager_WrapTunnelListenerStrict_NoTLS(t *testing.T) {
+	config := DefaultConfig()
+	config.TunnelTLSEnabled = false
+	m := NewTLSManager(config)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	wrapped, err := m.WrapTunnelListenerStrict(ln)
+	assert.NoError(t, err)
+	assert.Equal(t, ln, wrapped)
+}
+
 func TestTLSManager_WrapListener_NoTLS(t *testing.T) {
 	config := DefaultConfig()
 	config.TLSEnabled = false

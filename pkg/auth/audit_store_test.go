@@ -124,6 +124,44 @@ func TestMemoryAuditStore_TimeFilter(t *testing.T) {
 	assert.Equal(t, "recent", results[0].SessionID)
 }
 
+// TestMemoryAuditStore_DeleteOlderThan verifies A5: events older than the
+// cutoff are purged while recent events and query correctness (including
+// ordering) are preserved.
+func TestMemoryAuditStore_DeleteOlderThan(t *testing.T) {
+	store := NewMemoryAuditStore(100)
+	defer store.Close()
+
+	now := time.Now()
+	require.NoError(t, store.Store(AuditEvent{Timestamp: now.Add(-72 * time.Hour), Type: EventAuthSuccess, SessionID: "very-old"}))
+	require.NoError(t, store.Store(AuditEvent{Timestamp: now.Add(-25 * time.Hour), Type: EventAuthSuccess, SessionID: "old"}))
+	require.NoError(t, store.Store(AuditEvent{Timestamp: now.Add(-1 * time.Hour), Type: EventAuthSuccess, SessionID: "recent"}))
+
+	removed, err := store.DeleteOlderThan(now.Add(-24 * time.Hour))
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), removed)
+
+	remaining, err := store.Query(AuditQuery{Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, remaining, 1)
+	assert.Equal(t, "recent", remaining[0].SessionID)
+}
+
+func TestMemoryAuditStore_DeleteOlderThan_NoneExpired(t *testing.T) {
+	store := NewMemoryAuditStore(100)
+	defer store.Close()
+
+	require.NoError(t, store.Store(testEvent(EventAuthSuccess, "s1", -1)))
+	require.NoError(t, store.Store(testEvent(EventAuthSuccess, "s2", -2)))
+
+	removed, err := store.DeleteOlderThan(time.Now().Add(-1 * time.Hour))
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), removed)
+
+	remaining, err := store.Query(AuditQuery{Limit: 10})
+	require.NoError(t, err)
+	assert.Len(t, remaining, 2)
+}
+
 // ─── SQLiteAuditStore ────────────────────────────────────────────────────────
 
 func TestSQLiteAuditStore_StoreAndQuery(t *testing.T) {
@@ -213,4 +251,29 @@ func TestSQLiteAuditStore_DetailsRoundtrip(t *testing.T) {
 	assert.Equal(t, "tun-abc", results[0].TunnelID)
 	assert.Equal(t, "http", results[0].Protocol)
 	assert.Equal(t, "https://example.com", results[0].Details["public_url"])
+}
+
+// TestSQLiteAuditStore_DeleteOlderThan verifies A5 for the SQLite backend.
+func TestSQLiteAuditStore_DeleteOlderThan(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "audit-test-*.db")
+	require.NoError(t, err)
+	f.Close()
+
+	store, err := NewSQLiteAuditStore(SQLiteAuditStoreConfig{Path: f.Name()})
+	require.NoError(t, err)
+	defer store.Close()
+
+	now := time.Now()
+	require.NoError(t, store.Store(AuditEvent{Timestamp: now.Add(-72 * time.Hour), Type: EventAuthSuccess, SessionID: "very-old"}))
+	require.NoError(t, store.Store(AuditEvent{Timestamp: now.Add(-25 * time.Hour), Type: EventAuthSuccess, SessionID: "old"}))
+	require.NoError(t, store.Store(AuditEvent{Timestamp: now.Add(-1 * time.Hour), Type: EventAuthSuccess, SessionID: "recent"}))
+
+	removed, err := store.DeleteOlderThan(now.Add(-24 * time.Hour))
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), removed)
+
+	remaining, err := store.Query(AuditQuery{Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, remaining, 1)
+	assert.Equal(t, "recent", remaining[0].SessionID)
 }

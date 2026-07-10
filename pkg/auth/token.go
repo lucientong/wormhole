@@ -160,6 +160,15 @@ func NewSimple(allowedTokens []string) *Auth {
 
 // GenerateTeamToken generates a new signed token for the given team and role.
 func (a *Auth) GenerateTeamToken(teamName string, role Role) (string, error) {
+	return a.generateTeamToken(teamName, role, a.config.TokenExpiry)
+}
+
+// generateTeamToken is the shared implementation behind GenerateTeamToken,
+// ExtendTokenExpiry, and RefreshToken. The expiry is passed explicitly
+// rather than read from a.config.TokenExpiry so that callers computing a
+// custom expiry (e.g. ExtendTokenExpiry) never have to mutate the shared,
+// concurrently-read Auth.config — doing so was a data race (S9).
+func (a *Auth) generateTeamToken(teamName string, role Role, expiry time.Duration) (string, error) {
 	if teamName == "" {
 		return "", ErrInvalidTeamName
 	}
@@ -198,8 +207,8 @@ func (a *Auth) GenerateTeamToken(teamName string, role Role) (string, error) {
 		Version:  tokenVersion,
 		Nonce:    nonce,
 	}
-	if a.config.TokenExpiry > 0 {
-		payload.ExpiresAt = now.Add(a.config.TokenExpiry).Unix()
+	if expiry > 0 {
+		payload.ExpiresAt = now.Add(expiry).Unix()
 	}
 
 	// Encode payload to JSON.
@@ -555,6 +564,12 @@ func (a *Auth) RefreshToken(token string) (string, error) {
 
 // RefreshAndRevokeToken generates a new token and revokes the old one atomically.
 // This is the recommended way to refresh tokens when rotation is desired.
+//
+// If the old token cannot be revoked after the new one has already been
+// issued, this returns the new token alongside a wrapped error (rather than
+// silently swallowing the failure, per F5) so callers can decide whether to
+// surface a warning, retry the revocation, or treat it as fatal. The new
+// token itself is always valid and usable even when this error is non-nil.
 func (a *Auth) RefreshAndRevokeToken(oldToken string) (string, error) {
 	claims, err := a.ValidateToken(oldToken)
 	if err != nil {
@@ -569,10 +584,8 @@ func (a *Auth) RefreshAndRevokeToken(oldToken string) (string, error) {
 
 	// Revoke the old token (if it has an ID).
 	if claims.TokenID != "" {
-		if err := a.RevokeToken(claims.TokenID, claims.ExpiresAt); err != nil {
-			// Log but don't fail — the new token is already generated.
-			// In a production system, you might want to handle this differently.
-			_ = err
+		if revokeErr := a.RevokeToken(claims.TokenID, claims.ExpiresAt); revokeErr != nil {
+			return newToken, fmt.Errorf("new token issued but failed to revoke old token %s: %w", claims.TokenID, revokeErr)
 		}
 	}
 
@@ -587,23 +600,22 @@ func (a *Auth) ExtendTokenExpiry(token string, extension time.Duration) (string,
 		return "", err
 	}
 
-	// Temporarily override the config expiry to extend.
-	originalExpiry := a.config.TokenExpiry
+	// Compute the extended expiry as a local value and pass it straight
+	// through to generateTeamToken instead of temporarily mutating the
+	// shared a.config.TokenExpiry (S9): the latter was read concurrently by
+	// every other in-flight GenerateTeamToken/ValidateToken call without any
+	// lock, so two overlapping ExtendTokenExpiry calls (or one racing with a
+	// plain GenerateTeamToken) could hand out tokens with the wrong expiry.
+	var expiry time.Duration
 	if !claims.ExpiresAt.IsZero() {
 		// Extend from the original expiry time.
-		remaining := time.Until(claims.ExpiresAt)
-		a.config.TokenExpiry = remaining + extension
+		expiry = time.Until(claims.ExpiresAt) + extension
 	} else {
 		// Token had no expiry, set one now.
-		a.config.TokenExpiry = extension
+		expiry = extension
 	}
 
-	newToken, err := a.GenerateTeamToken(claims.TeamName, claims.Role)
-
-	// Restore original config.
-	a.config.TokenExpiry = originalExpiry
-
-	return newToken, err
+	return a.generateTeamToken(claims.TeamName, claims.Role, expiry)
 }
 
 // Close releases any resources held by the Auth instance.

@@ -44,36 +44,41 @@ func (m *TLSManager) TLSConfig() (*tls.Config, error) {
 }
 
 // autoTLSConfig sets up automatic certificate management via Let's Encrypt.
+// The underlying autocert.Manager is created once and reused across calls
+// (e.g. from both TLSConfig() and TunnelTLSConfig() when S4 enables TLS on
+// both the HTTP and tunnel control listeners) so they share one certificate
+// cache instead of racing to provision it independently.
 func (m *TLSManager) autoTLSConfig() (*tls.Config, error) {
 	if m.config.Domain == "" || m.config.Domain == defaultDomain {
 		return nil, fmt.Errorf("auto-TLS requires a valid domain (got %q)", m.config.Domain)
 	}
 
-	// Determine cache directory.
-	cacheDir := m.certCacheDir()
-	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
-		return nil, fmt.Errorf("create cert cache dir: %w", err)
-	}
+	if m.manager == nil {
+		// Determine cache directory.
+		cacheDir := m.certCacheDir()
+		if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+			return nil, fmt.Errorf("create cert cache dir: %w", err)
+		}
 
-	m.manager = &autocert.Manager{
-		Prompt: autocert.AcceptTOS,
-		HostPolicy: autocert.HostWhitelist(
-			m.config.Domain,
-			"*."+m.config.Domain,
-		),
-		Cache: autocert.DirCache(cacheDir),
-		Email: m.config.AutoTLSEmail,
+		m.manager = &autocert.Manager{
+			Prompt: autocert.AcceptTOS,
+			HostPolicy: autocert.HostWhitelist(
+				m.config.Domain,
+				"*."+m.config.Domain,
+			),
+			Cache: autocert.DirCache(cacheDir),
+			Email: m.config.AutoTLSEmail,
+		}
+
+		log.Info().
+			Str("domain", m.config.Domain).
+			Str("email", m.config.AutoTLSEmail).
+			Str("cache_dir", cacheDir).
+			Msg("Auto-TLS enabled with Let's Encrypt")
 	}
 
 	tlsConfig := m.manager.TLSConfig()
 	tlsConfig.MinVersion = tls.VersionTLS12
-
-	log.Info().
-		Str("domain", m.config.Domain).
-		Str("email", m.config.AutoTLSEmail).
-		Str("cache_dir", cacheDir).
-		Msg("Auto-TLS enabled with Let's Encrypt")
-
 	return tlsConfig, nil
 }
 
@@ -126,6 +131,43 @@ func (m *TLSManager) WrapListener(ln net.Listener) net.Listener {
 	}
 
 	return tls.NewListener(ln, tlsConfig)
+}
+
+// TunnelTLSConfig returns a *tls.Config for the tunnel control listener,
+// gated on Config.TunnelTLSEnabled — independently of Config.TLSEnabled,
+// which only governs the HTTP data-path listener (S4).
+//
+// Before this existed, the tunnel listener was wrapped via the same
+// TLSConfig() used for HTTP, which internally short-circuits to (nil, nil)
+// whenever Config.TLSEnabled is false. That made "TunnelTLSEnabled=true,
+// TLSEnabled=false" — e.g. an operator who only wants to encrypt the
+// control channel where auth tokens travel, without necessarily
+// terminating HTTP TLS on this process (say, behind a TLS-terminating
+// reverse proxy) — a silent no-op: the tunnel listener stayed plaintext
+// with no error or warning.
+func (m *TLSManager) TunnelTLSConfig() (*tls.Config, error) {
+	if !m.config.TunnelTLSEnabled {
+		return nil, nil //nolint:nilnil // nil means no TLS
+	}
+	if m.config.AutoTLS {
+		return m.autoTLSConfig()
+	}
+	return m.manualTLSConfig()
+}
+
+// WrapTunnelListenerStrict wraps ln with TLS per TunnelTLSConfig(). Unlike
+// WrapListener, it returns the TLS-config error instead of swallowing it,
+// so callers that must not silently fall back to plaintext (S4: e.g. when
+// RequireAuth is set) can fail the listener startup instead.
+func (m *TLSManager) WrapTunnelListenerStrict(ln net.Listener) (net.Listener, error) {
+	tlsConfig, err := m.TunnelTLSConfig()
+	if err != nil {
+		return ln, err
+	}
+	if tlsConfig == nil {
+		return ln, nil
+	}
+	return tls.NewListener(ln, tlsConfig), nil
 }
 
 // certCacheDir returns the directory for caching Let's Encrypt certificates.

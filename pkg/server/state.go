@@ -1,8 +1,15 @@
 package server
 
 import (
+	"errors"
 	"time"
 )
+
+// ErrSubdomainConflict is returned by StateStore.RegisterRoute when the
+// requested subdomain is already held by a different, still-live client
+// (S3/H6). Callers should reject the connection rather than proceed with a
+// route the cluster considers ambiguous.
+var ErrSubdomainConflict = errors.New("subdomain already registered to another client")
 
 // RouteEntry describes a tunnel route registered in the cluster state.
 type RouteEntry struct {
@@ -43,6 +50,11 @@ type NodeInfo struct {
 // Multi-node deployments use RedisStateStore.
 type StateStore interface {
 	// RegisterRoute stores a client's route entry on this node.
+	// Implementations must atomically reserve entry.Subdomain: if it is
+	// already held by a different, still-live client, RegisterRoute must
+	// return ErrSubdomainConflict (wrapped or not) instead of silently
+	// overwriting the existing owner (S3/H6). Re-registering the same
+	// (ClientID, Subdomain) pair — e.g. a TTL refresh — must succeed.
 	RegisterRoute(entry RouteEntry) error
 
 	// UnregisterRoute removes all routes for a given client.

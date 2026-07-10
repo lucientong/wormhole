@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -91,6 +92,48 @@ func TestAdminAPI_Stats(t *testing.T) {
 	assert.Equal(t, uint64(1024), resp.BytesIn)
 	assert.Equal(t, uint64(2048), resp.BytesOut)
 	assert.Greater(t, resp.UptimeSeconds, int64(0))
+	assert.Nil(t, resp.AuditStoreErrors, "no audit logger configured, field should be omitted")
+}
+
+// failingAuditStore is a minimal auth.AuditStore whose Store method always
+// fails, used to verify A4's error-counting surfaces through /stats.
+type failingAuditStore struct{}
+
+func (failingAuditStore) Store(auth.AuditEvent) error { return errAuditStoreUnavailable }
+func (failingAuditStore) Query(auth.AuditQuery) ([]auth.AuditEvent, error) {
+	return nil, errAuditStoreUnavailable
+}
+func (failingAuditStore) DeleteOlderThan(time.Time) (int64, error) { return 0, nil }
+func (failingAuditStore) Close() error                             { return nil }
+
+var errAuditStoreUnavailable = errors.New("audit store unavailable")
+
+// TestAdminAPI_Stats_AuditStoreErrors verifies A4: persistent AuditStore
+// failures are surfaced as a monitorable counter on /stats rather than
+// being invisible.
+func TestAdminAPI_Stats_AuditStoreErrors(t *testing.T) {
+	server := newTestServer()
+	server.auditLogger = auth.NewAuditLogger(auth.AuditLoggerConfig{
+		Enabled: true,
+		Writer:  io.Discard,
+		Store:   failingAuditStore{},
+	})
+	server.auditLogger.LogAuthFailure("10.0.0.1", "bad token")
+	server.auditLogger.LogAuthFailure("10.0.0.1", "bad token")
+
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	req := loopbackRequest(http.MethodGet, "/stats", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var resp StatsResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.NotNil(t, resp.AuditStoreErrors)
+	assert.Equal(t, uint64(2), *resp.AuditStoreErrors)
 }
 
 func TestAdminAPI_Clients_Empty(t *testing.T) {

@@ -152,6 +152,12 @@ type Config struct {
 	// Only used when AuditPersistence is "memory". Defaults to 10 000.
 	AuditBufferSize int
 
+	// AuditRetentionDays is how many days of audit events to retain before
+	// they're purged by a periodic background sweep (A5). 0 disables the
+	// sweep entirely (unbounded retention — the previous, and still the
+	// in-memory ring buffer's, default behavior).
+	AuditRetentionDays int
+
 	// ─── Cluster / HA settings ────────────────────────────────────────────────
 
 	// ClusterNodeID is a unique identifier for this node in the cluster.

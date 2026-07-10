@@ -3,8 +3,46 @@ package inspector
 
 import (
 	"net/http"
+	"strings"
 	"time"
 )
+
+// sensitiveHeaders lists header names (case-insensitive) whose values are
+// replaced with a fixed redaction marker before being stored in a Record
+// (S14). The inspector's stated purpose is debugging request/response
+// shape and routing, not exfiltrating credentials — so bearer tokens,
+// session cookies, and API keys captured incidentally while inspecting
+// traffic must never be persisted or shown in the local dashboard/API in
+// the clear.
+var sensitiveHeaders = map[string]struct{}{
+	"authorization":       {},
+	"proxy-authorization": {},
+	"cookie":              {},
+	"set-cookie":          {},
+	"x-api-key":           {},
+	"x-auth-token":        {},
+	"x-csrf-token":        {},
+}
+
+// redactedHeaderValue replaces the value of any sensitive header.
+const redactedHeaderValue = "[redacted]"
+
+// captureHeaders copies HTTP headers into a flat map, redacting sensitive
+// ones (S14) instead of storing them verbatim.
+func captureHeaders(h http.Header) map[string]string {
+	headers := make(map[string]string, len(h))
+	for k, v := range h {
+		if len(v) == 0 {
+			continue
+		}
+		if _, sensitive := sensitiveHeaders[strings.ToLower(k)]; sensitive {
+			headers[k] = redactedHeaderValue
+			continue
+		}
+		headers[k] = v[0]
+	}
+	return headers
+}
 
 // Record represents a captured HTTP request/response pair.
 type Record struct {
@@ -70,12 +108,7 @@ func (r *Record) Summary() *RecordSummary {
 
 // NewRecord creates a new record from an HTTP request.
 func NewRecord(id string, req *http.Request) *Record {
-	headers := make(map[string]string)
-	for k, v := range req.Header {
-		if len(v) > 0 {
-			headers[k] = v[0]
-		}
-	}
+	headers := captureHeaders(req.Header)
 
 	return &Record{
 		ID:        id,
@@ -100,12 +133,7 @@ func (r *Record) SetRequestBody(body []byte, maxSize int64) {
 
 // SetResponse sets the response data on the record.
 func (r *Record) SetResponse(resp *http.Response, body []byte, maxSize int64) {
-	headers := make(map[string]string)
-	for k, v := range resp.Header {
-		if len(v) > 0 {
-			headers[k] = v[0]
-		}
-	}
+	headers := captureHeaders(resp.Header)
 
 	var respBody string
 	if int64(len(body)) > maxSize {

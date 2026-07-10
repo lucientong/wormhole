@@ -1000,7 +1000,7 @@ Key components:
   2. HMAC-SHA256 signed team tokens (with expiry + revocation)
   3. OIDC JWT tokens — `ValidateToken` tries OIDC if an `OIDCValidator` is configured and the token is JWT-shaped
 - Role-based access control (RBAC): admin, member, viewer roles
-- Mandatory authentication on connection handshake (`--require-auth`); viewer role cannot establish tunnels
+- Mandatory authentication on connection handshake (`--require-auth`); viewer role cannot establish tunnels — enforced server-side at the point of use (`handleRegister`/`handleClose` call `requireWritePermission`), not just hidden from a client-side menu
 - Admin API protected by separate token using `crypto/subtle.ConstantTimeCompare`
 - Token revocation support with persistent blacklist (SQLite backend)
 
@@ -1059,6 +1059,26 @@ wormhole login --issuer <url> --client-id <id>
 - HTML escaping on Host header routing (XSS prevention)
 - Subdomain restricted to single-level labels (no dots)
 - Path prefix normalization (leading/trailing `/`)
+
+### Security Hardening (P3-4)
+
+A dedicated review pass (`docs/personal/review-v0.6.md`) audited every security-relevant code path in v0.6.0 and closed the gaps below. Each item is independently unit-tested.
+
+| Area | Before | After |
+|------|--------|-------|
+| **RBAC enforcement point** | Only the CLI hid write actions from viewers; the server accepted any authenticated client's `RegisterRequest`/`CloseRequest` | `handleRegister`/`handleClose` call `requireWritePermission(client)` first; a `viewer` token is rejected with an explicit error and an audit event, regardless of what client sent the request |
+| **Tunnel control-channel TLS** | The tunnel listener was wrapped with the *same* `TLSConfig()` used for the HTTP listener, which short-circuits to "no TLS" whenever `Config.TLSEnabled` is false — so `TunnelTLSEnabled=true` alone was a silent no-op | `TLSManager.TunnelTLSConfig()`/`WrapTunnelListenerStrict()` are fully independent of the HTTP TLS config; `--require-auth` + a real domain now defaults `TunnelTLSEnabled` to `true`, and a TLS *config* error (not just "no cert configured") fails server startup outright when auth is required, instead of falling back to plaintext |
+| **Subdomain reservation** | `RegisterRoute` on both the in-memory router and the Redis-backed cluster store was last-writer-wins: two clients (or two nodes) racing for the same subdomain would silently overwrite each other, and the loser would keep believing it owned the route | Atomic reservation with four defined outcomes: free → reserved; same client re-registering → idempotent TTL refresh; a *live* different owner → `ErrSubdomainConflict` (connection rejected); a *stale* owner (its route entry already expired) → reclaimed. The Redis implementation uses `SetArgs{Mode: "NX"}` (the non-deprecated replacement for `SetNX`) |
+| **Token expiry mutation** | `ExtendTokenExpiry` temporarily overwrote the shared `Auth.config.TokenExpiry` field to reuse the token-generation code path, then restored it — a data race under concurrent requests | `generateTeamToken(teamName, role, expiry)` takes the expiry as an explicit parameter; nothing ever mutates shared config |
+| **Revoked-token cleanup** | `Auth.CleanupRevokedTokens()` existed and worked, but nothing ever called it — the revocation blacklist (and its SQLite table, if persistence is enabled) grew without bound | `Server.Start()` schedules `runRevokedTokenCleanup()`, a goroutine that sweeps expired blacklist entries every 10 minutes |
+| **OIDC `alg: none`** | An `alg: none`/empty-`alg` JWT fell through to the generic "unsupported algorithm" branch — functionally rejected, but not by an explicit, tested guard against the classic signature-bypass attack | `verifyJWTSignature` has a dedicated `case "none", ""` that rejects immediately, with a regression test |
+| **OIDC issuer/`nbf`** | Issuer comparison was a raw string match (trailing-slash mismatches between a provider's discovery document and its issued tokens could cause spurious rejections); `nbf` was never checked | `normalizeIssuer()` strips trailing slashes before comparing; `nbf` is validated with the same 60s `clockSkewLeeway` already used for `exp` |
+| **Inspector captures** | `Authorization`/`Cookie`/etc. headers were stored verbatim in captured records (visible via the inspector UI/API); default body-capture cap was 1MB | `captureHeaders()` redacts a fixed set of sensitive header names (case-insensitively) to a constant placeholder on both request and response capture; default `MaxBodySize` lowered to 256KB |
+| **`/metrics`** | Exposed with no authentication, unlike every other Admin API route | Wrapped with the same `requireAdminAuth` middleware as `/stats`, `/audit`, etc. |
+| **Audit gaps** | Only failures were logged (`LogAuthFailure`); successful auth, IP blocks, token generation, and IP unblocks left no audit trail; `RefreshAndRevokeToken` silently swallowed a failed revocation | `LogAuthSuccess`/`LogIPBlocked`/`LogTokenGenerated`/`LogIPUnblocked` added at their respective call sites; `RefreshAndRevokeToken` now returns the new token *and* a wrapped error on partial failure, surfaced to the caller as a `Warning` field instead of silently discarded |
+| **Audit retention** | No way to bound audit log growth over the life of a long-running server | `AuditStore.DeleteOlderThan(cutoff)` (implemented by both the memory and SQLite stores) + `--audit-retention-days` (default 90) + a periodic `runAuditRetention()` sweep |
+| **Audit store write failures** | `AuditLogger.Log()` discarded `l.store.Store(event)` errors (`_ = ...`) — a failing persistence backend (e.g. a full disk or locked SQLite file) dropped events with zero observable signal | An `atomic.Uint64` `storeErrors` counter increments on every failed `Store()` call; `AuditLogger.StoreErrors()` exposes it, and `GET /stats` surfaces it as `audit_store_errors` (omitted when audit logging is disabled) so the failure mode is monitorable/alertable instead of silent |
+| **Subdomain registration failure at connect time** | A local or cluster-wide subdomain conflict was only logged; the connection proceeded and the client was told (via `AuthResponse`) that it owned the subdomain, while traffic actually kept routing to whichever session held the entry | `registerClientRoute()` rejects and closes the connection on either a local or cluster conflict, so the client's own reconnect logic retries instead of running in a silently broken state |
 
 ---
 
@@ -1136,6 +1156,8 @@ type StateStore interface {
 ```
 
 `RouteEntry` carries `{ClientID, Subdomain, NodeID, NodeAddr}`. `NodeInfo` carries `{NodeID, NodeAddr, LastHeartbeat}`.
+
+`RegisterRoute` must atomically reserve `entry.Subdomain` (S3/H6): free → reserve; same `ClientID` re-registering → idempotent TTL refresh; held by a different, still-live client → return `ErrSubdomainConflict`; held by a stale (expired) entry → reclaim. `RedisStateStore` implements this with `SetArgs{Mode: "NX"}` on the `wormhole:sub:*` key, falling back to a liveness check against `wormhole:route:<owner>` on conflict; `MemoryStateStore` implements the same four-way semantics under its own lock.
 
 ### Backends
 

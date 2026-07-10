@@ -68,6 +68,23 @@ func NewRedisStateStore(cfg RedisStateStoreConfig) (*RedisStateStore, error) {
 	return &RedisStateStore{client: client}, nil
 }
 
+// newRedisStateStoreWithClient wraps an already-constructed *redis.Client
+// (e.g. one pointed at a miniredis instance in tests) without the
+// Ping/connect logic in NewRedisStateStore.
+func newRedisStateStoreWithClient(client *redis.Client) *RedisStateStore {
+	return &RedisStateStore{client: client}
+}
+
+// RegisterRoute atomically reserves entry.Subdomain via SETNX (S3/H6)
+// instead of a plain SET, which previously let two nodes racing to
+// register the same subdomain silently overwrite each other
+// (last-writer-wins). Semantics:
+//
+//   - Subdomain free                       → reserve it for entry.ClientID.
+//   - Subdomain already owned by entry.ClientID → idempotent TTL refresh.
+//   - Subdomain owned by another client whose route entry has expired
+//     (crashed without calling UnregisterRoute) → reclaim it.
+//   - Subdomain owned by another *live* client  → ErrSubdomainConflict.
 func (r *RedisStateStore) RegisterRoute(entry RouteEntry) error {
 	ctx := context.Background()
 
@@ -76,11 +93,67 @@ func (r *RedisStateStore) RegisterRoute(entry RouteEntry) error {
 		return fmt.Errorf("marshal route entry: %w", err)
 	}
 
-	pipe := r.client.Pipeline()
-	pipe.Set(ctx, redisRoutePrefix+entry.ClientID, data, defaultRouteTTL)
-	pipe.Set(ctx, redisSubdomainIdx+entry.Subdomain, entry.ClientID, defaultRouteTTL)
-	_, err = pipe.Exec(ctx)
-	return err
+	subKey := redisSubdomainIdx + entry.Subdomain
+	routeKey := redisRoutePrefix + entry.ClientID
+
+	// SetNX is deprecated in favor of Set/SetArgs with an NX condition; a
+	// plain "SET key value NX" reports "not set" as a nil reply rather than
+	// a Go error, which SetArgs surfaces as the redis.Nil sentinel.
+	_, err = r.client.SetArgs(ctx, subKey, entry.ClientID, redis.SetArgs{
+		Mode: "NX",
+		TTL:  defaultRouteTTL,
+	}).Result()
+	switch {
+	case err == nil:
+		// Reserved successfully.
+	case errors.Is(err, redis.Nil):
+		if resolveErr := r.resolveSubdomainConflict(ctx, subKey, entry); resolveErr != nil {
+			return resolveErr
+		}
+	default:
+		return fmt.Errorf("reserve subdomain %q: %w", entry.Subdomain, err)
+	}
+
+	if err := r.client.Set(ctx, routeKey, data, defaultRouteTTL).Err(); err != nil {
+		return fmt.Errorf("store route entry: %w", err)
+	}
+	return nil
+}
+
+// resolveSubdomainConflict is called when SetNX on the subdomain index key
+// found it already occupied. It distinguishes an idempotent refresh by the
+// current owner, a stale reservation left by a crashed node, and a genuine
+// conflict with another live owner.
+func (r *RedisStateStore) resolveSubdomainConflict(ctx context.Context, subKey string, entry RouteEntry) error {
+	existingOwner, err := r.client.Get(ctx, subKey).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return fmt.Errorf("check subdomain owner %q: %w", entry.Subdomain, err)
+	}
+
+	if existingOwner == entry.ClientID {
+		// Same client re-registering (e.g. retry) — just refresh the TTL.
+		if err := r.client.Expire(ctx, subKey, defaultRouteTTL).Err(); err != nil {
+			return fmt.Errorf("refresh subdomain ttl %q: %w", entry.Subdomain, err)
+		}
+		return nil
+	}
+
+	if existingOwner != "" {
+		ownerAlive, err := r.client.Exists(ctx, redisRoutePrefix+existingOwner).Result()
+		if err != nil {
+			return fmt.Errorf("check owner liveness %q: %w", entry.Subdomain, err)
+		}
+		if ownerAlive > 0 {
+			return fmt.Errorf("%w: subdomain %q is held by client %q", ErrSubdomainConflict, entry.Subdomain, existingOwner)
+		}
+	}
+
+	// Stale reservation (owner's route entry already expired/removed, or
+	// the key vanished between SetNX and Get) — reclaim it for entry.ClientID.
+	if err := r.client.Set(ctx, subKey, entry.ClientID, defaultRouteTTL).Err(); err != nil {
+		return fmt.Errorf("reclaim stale subdomain %q: %w", entry.Subdomain, err)
+	}
+	return nil
 }
 
 func (r *RedisStateStore) UnregisterRoute(clientID string) error {

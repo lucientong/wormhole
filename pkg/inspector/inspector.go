@@ -20,8 +20,14 @@ type Config struct {
 // DefaultConfig returns the default inspector configuration.
 func DefaultConfig() Config {
 	return Config{
-		MaxRecords:    1000,
-		MaxBodySize:   1024 * 1024, // 1MB
+		MaxRecords: 1000,
+		// S14: lowered from 1MB — the inspector is a debugging aid for
+		// request/response shape, not a full traffic recorder, and a
+		// smaller default cap reduces how much (potentially sensitive)
+		// body content sits in memory/the local dashboard by default.
+		// Callers that need to inspect large payloads can still raise
+		// this via Config.MaxBodySize.
+		MaxBodySize:   256 * 1024, // 256KB
 		EnableCapture: true,
 	}
 }
@@ -41,7 +47,7 @@ func New(config Config) *Inspector {
 		config.MaxRecords = 1000
 	}
 	if config.MaxBodySize <= 0 {
-		config.MaxBodySize = 1024 * 1024
+		config.MaxBodySize = 256 * 1024
 	}
 
 	return &Inspector{
