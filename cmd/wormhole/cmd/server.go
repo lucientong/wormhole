@@ -52,6 +52,10 @@ var (
 	serverClusterRedisAddr     string
 	serverClusterRedisPassword string
 	serverClusterRedisDB       int
+	serverClusterSecret        string
+	serverAuthRedisAddr        string
+	serverAuthRedisPassword    string
+	serverAuthRedisDB          int
 )
 
 // serverCmd represents the server command.
@@ -107,7 +111,7 @@ func init() {
 	serverCmd.Flags().StringSliceVar(&serverAuthTokens, "auth-tokens", nil, "Comma-separated list of valid authentication tokens")
 	serverCmd.Flags().StringVar(&serverAuthSecret, "auth-secret", "", "HMAC secret for signed tokens (min 16 chars)")
 	serverCmd.Flags().StringVar(&serverAdminToken, "admin-token", "", "Token for admin API authentication")
-	serverCmd.Flags().StringVar(&serverPersistence, "persistence", "memory", "Storage backend: memory (default) or sqlite")
+	serverCmd.Flags().StringVar(&serverPersistence, "persistence", "memory", "Storage backend for auth data: memory (default), sqlite, or redis (H5: shared team/revocation state across cluster nodes)")
 	serverCmd.Flags().StringVar(&serverPersistencePath, "persistence-path", "", "Path to SQLite database (default: ~/.wormhole/wormhole.db)")
 	serverCmd.Flags().BoolVar(&serverTunnelTLS, "tunnel-tls", false, "Enable TLS for the tunnel control listener (default: same as --tls, or true when --require-auth is set with a real --domain)")
 	serverCmd.Flags().StringVar(&serverAdminHost, "admin-host", "127.0.0.1", "Host for admin API (default: 127.0.0.1 for safety)")
@@ -130,6 +134,10 @@ func init() {
 	serverCmd.Flags().StringVar(&serverClusterRedisAddr, "cluster-redis-addr", "", "Redis address for cluster state (e.g. localhost:6379)")
 	serverCmd.Flags().StringVar(&serverClusterRedisPassword, "cluster-redis-password", "", "Redis AUTH password")
 	serverCmd.Flags().IntVar(&serverClusterRedisDB, "cluster-redis-db", 0, "Redis database number")
+	serverCmd.Flags().StringVar(&serverClusterSecret, "cluster-secret", "", "Shared secret validated on requests forwarded between cluster nodes (S1)")
+	serverCmd.Flags().StringVar(&serverAuthRedisAddr, "auth-redis-addr", "", "Redis address for shared auth/revocation state when --persistence=redis (default: --cluster-redis-addr)")
+	serverCmd.Flags().StringVar(&serverAuthRedisPassword, "auth-redis-password", "", "Redis AUTH password for --auth-redis-addr (default: --cluster-redis-password)")
+	serverCmd.Flags().IntVar(&serverAuthRedisDB, "auth-redis-db", 0, "Redis database number for --auth-redis-addr (default: --cluster-redis-db)")
 }
 
 // applyTunnelTLSDefaults implements S4: it decides whether the tunnel
@@ -199,9 +207,15 @@ func buildServerConfig(cmd *cobra.Command) server.Config {
 
 	applyTunnelTLSDefaults(cmd, &config)
 
-	if serverPersistence == "sqlite" {
+	switch serverPersistence {
+	case "sqlite":
 		config.Persistence = server.PersistenceSQLite
+	case "redis":
+		config.Persistence = server.PersistenceRedis
 	}
+	config.AuthRedisAddr = serverAuthRedisAddr
+	config.AuthRedisPassword = serverAuthRedisPassword
+	config.AuthRedisDB = serverAuthRedisDB
 
 	config.AuditEnabled = serverAuditEnabled
 	config.AuditPath = serverAuditPath
@@ -222,6 +236,7 @@ func buildServerConfig(cmd *cobra.Command) server.Config {
 	config.ClusterRedisAddr = serverClusterRedisAddr
 	config.ClusterRedisPassword = serverClusterRedisPassword
 	config.ClusterRedisDB = serverClusterRedisDB
+	config.ClusterSecret = serverClusterSecret
 
 	return config
 }

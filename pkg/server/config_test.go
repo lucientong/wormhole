@@ -51,7 +51,9 @@ func TestServerDefaultConfig_MuxConfig(t *testing.T) {
 func TestPersistenceType_Constants(t *testing.T) {
 	assert.Equal(t, PersistenceType("memory"), PersistenceMemory)
 	assert.Equal(t, PersistenceType("sqlite"), PersistenceSQLite)
+	assert.Equal(t, PersistenceType("redis"), PersistenceRedis)
 	assert.NotEqual(t, PersistenceMemory, PersistenceSQLite)
+	assert.NotEqual(t, PersistenceSQLite, PersistenceRedis)
 }
 
 func TestServerConfig_CustomValues(t *testing.T) {

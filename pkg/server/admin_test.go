@@ -60,6 +60,41 @@ func TestAdminAPI_Health(t *testing.T) {
 
 	assert.Equal(t, "healthy", resp.Status)
 	assert.NotEmpty(t, resp.Uptime)
+	assert.Nil(t, resp.Cluster, "no state store configured, cluster field should be omitted")
+}
+
+// TestAdminAPI_Health_Cluster verifies H9: /health surfaces cluster
+// state-store connectivity (node ID + whether the last heartbeat
+// succeeded) instead of leaving operators to infer a Redis outage purely
+// from log lines.
+func TestAdminAPI_Health_Cluster(t *testing.T) {
+	server := newTestServer()
+	server.config.ClusterNodeID = "node-a"
+	server.stateStore = NewMemoryStateStore()
+	server.stateStoreHealthy.Store(true)
+	api := NewAdminAPI(server)
+	handler := api.Handler()
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp HealthResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, "healthy", resp.Status)
+	require.NotNil(t, resp.Cluster)
+	assert.Equal(t, "node-a", resp.Cluster.NodeID)
+	assert.True(t, resp.Cluster.StateStoreHealthy)
+
+	// A failed heartbeat should flip both the per-field flag and the
+	// overall status to "degraded".
+	server.stateStoreHealthy.Store(false)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, "degraded", resp.Status)
+	assert.False(t, resp.Cluster.StateStoreHealthy)
 }
 
 func TestAdminAPI_Stats(t *testing.T) {

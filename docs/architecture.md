@@ -15,9 +15,12 @@
 - [HTTP Proxy Flow](#http-proxy-flow)
 - [TCP Tunnel Flow](#tcp-tunnel-flow)
 - [Inspector Traffic Capture](#inspector-traffic-capture)
-- [P2P Direct Connection (Phase 4)](#p2p-direct-connection-phase-4)
+- [P2P Direct Connection (Phase 4 & 4.5)](#p2p-direct-connection-phase-4--45)
 - [Connection Management](#connection-management)
 - [Security Model](#security-model)
+- [Multi-Tunnel Configuration & Hot-Reload](#multi-tunnel-configuration--hot-reload)
+- [HA / Multi-Node Control Plane](#ha--multi-node-control-plane)
+- [Data Flow Summary](#data-flow-summary)
 
 ---
 
@@ -93,8 +96,8 @@ Wormhole is a Client-Server architecture tunneling tool. The core idea is:
 | `TLSManager` | `pkg/server/tls.go` | TLS termination; Let's Encrypt auto-certs and manual certificates |
 | `AdminAPI` | `pkg/server/admin.go` | RESTful admin API including `/audit` and `/audit/export` |
 | `TCPPortAllocator` | `pkg/server/handler.go` | Allocates ports for TCP tunnels |
-| `StateStore` | `pkg/server/state*.go` | Cluster shared state (routes + nodes); Memory or Redis backend |
-| Cluster heartbeat | `pkg/server/cluster.go` | Periodic heartbeat, dead-node eviction, cross-node HTTP proxying |
+| `StateStore` | `pkg/server/state*.go` | Cluster shared state (subdomain/hostname/path routes + nodes); Memory or Redis backend |
+| Cluster heartbeat | `pkg/server/cluster.go` | Periodic heartbeat + route TTL refresh, dead-node eviction, cross-node HTTP proxying, shared-secret verification |
 
 ### Client-Side Components
 
@@ -1079,6 +1082,8 @@ A dedicated review pass (`docs/personal/review-v0.6.md`) audited every security-
 | **Audit retention** | No way to bound audit log growth over the life of a long-running server | `AuditStore.DeleteOlderThan(cutoff)` (implemented by both the memory and SQLite stores) + `--audit-retention-days` (default 90) + a periodic `runAuditRetention()` sweep |
 | **Audit store write failures** | `AuditLogger.Log()` discarded `l.store.Store(event)` errors (`_ = ...`) — a failing persistence backend (e.g. a full disk or locked SQLite file) dropped events with zero observable signal | An `atomic.Uint64` `storeErrors` counter increments on every failed `Store()` call; `AuditLogger.StoreErrors()` exposes it, and `GET /stats` surfaces it as `audit_store_errors` (omitted when audit logging is disabled) so the failure mode is monitorable/alertable instead of silent |
 | **Subdomain registration failure at connect time** | A local or cluster-wide subdomain conflict was only logged; the connection proceeded and the client was told (via `AuthResponse`) that it owned the subdomain, while traffic actually kept routing to whichever session held the entry | `registerClientRoute()` rejects and closes the connection on either a local or cluster conflict, so the client's own reconnect logic retries instead of running in a silently broken state |
+| **Inter-node proxy trust (S1, P3-5)** | `proxyToNode` forwarded requests between cluster nodes with no authentication — any host that could reach a node's HTTP port could forge `X-Wormhole-*` proxy headers and impersonate a peer node | `--cluster-secret` shared secret; `proxyToNode` attaches it as `X-Wormhole-Cluster-Secret`, `verifyClusterSecret` validates and strips it before the request reaches routing logic, rejecting mismatched/missing secrets when one is configured |
+| **Cross-node token revocation (H5, P3-5)** | With `--persistence sqlite` or the in-memory default, a token revoked on node A stayed valid on node B until that node's own store happened to converge (it never did, for two independent SQLite files) | `--persistence redis` (`auth.RedisStore`) puts teams and revoked-token state in the same shared Redis the cluster already uses for routing; a revocation is visible cluster-wide as soon as the write completes, with TTL-based auto-expiry instead of a cleanup sweep |
 
 ---
 
@@ -1146,7 +1151,10 @@ Used by `wormhole tunnels list` to display active tunnels.
 type StateStore interface {
     RegisterRoute(entry RouteEntry) error
     UnregisterRoute(clientID string) error
+    UnregisterRouteEntry(routeID string) error
     LookupBySubdomain(subdomain string) (*RouteEntry, error)
+    LookupByHostname(hostname string) (*RouteEntry, error)
+    LookupByPathPrefix(path string) (*RouteEntry, error)
     ListRoutes() ([]RouteEntry, error)
     NodeHeartbeat(info NodeInfo) error
     GetNodes() ([]NodeInfo, error)
@@ -1155,9 +1163,9 @@ type StateStore interface {
 }
 ```
 
-`RouteEntry` carries `{ClientID, Subdomain, NodeID, NodeAddr}`. `NodeInfo` carries `{NodeID, NodeAddr, LastHeartbeat}`.
+`RouteEntry` carries `{RouteID, ClientID, Subdomain, Hostname, PathPrefix, NodeID, NodeAddr, RegisteredAt}` — a single client can hold several `RouteEntry`s at once (one tunnel's subdomain, another's custom hostname, a third's path prefix), each independently addressable by `RouteID` for targeted unregistration (H3). `NodeInfo` carries `{NodeID, NodeAddr, LastHeartbeat}`.
 
-`RegisterRoute` must atomically reserve `entry.Subdomain` (S3/H6): free → reserve; same `ClientID` re-registering → idempotent TTL refresh; held by a different, still-live client → return `ErrSubdomainConflict`; held by a stale (expired) entry → reclaim. `RedisStateStore` implements this with `SetArgs{Mode: "NX"}` on the `wormhole:sub:*` key, falling back to a liveness check against `wormhole:route:<owner>` on conflict; `MemoryStateStore` implements the same four-way semantics under its own lock.
+`RegisterRoute` must atomically reserve the entry's routing key (subdomain, hostname, or path — whichever is set) (S3/H6): free → reserve; same `ClientID` re-registering → idempotent TTL refresh; held by a different, still-live client → return `ErrSubdomainConflict`; held by a stale (expired) entry → reclaim. `RedisStateStore` implements this with `SetArgs{Mode: "NX"}` on the relevant `wormhole:sub:*`/`wormhole:host:*`/`wormhole:path:*` key, falling back to a liveness check against `wormhole:route:<routeID>` on conflict; `MemoryStateStore` implements the same four-way semantics under its own lock via a shared `conflictsWith` helper.
 
 ### Backends
 
@@ -1171,36 +1179,65 @@ Redis key schema:
 
 | Key | TTL | Content |
 |-----|-----|---------|
-| `wormhole:route:<clientID>` | 5 min | `RouteEntry` JSON |
-| `wormhole:sub:<subdomain>` | 5 min | `clientID` pointer |
+| `wormhole:route:<routeID>` | 5 min | `RouteEntry` JSON |
+| `wormhole:sub:<subdomain>` | 5 min | `routeID` pointer |
+| `wormhole:host:<hostname>` | 5 min | `routeID` pointer |
+| `wormhole:path:<prefix>` | 5 min | `routeID` pointer |
+| `wormhole:clientroutes:<clientID>` | 5 min | SET of `routeID`s owned by this client, for bulk cleanup on disconnect |
 | `wormhole:node:<nodeID>` | 90 s | `NodeInfo` JSON |
 
-TTLs are refreshed on each heartbeat / tunnel register, and Redis auto-expires stale entries.
+`ListRoutes`/`GetNodes` (and the auth store's `ListTeams`/`CountRevokedTokens`) use `SCAN` cursors rather than `KEYS`, so large key spaces don't block the shared Redis instance (H7).
+
+### Route TTL Refresh (H1)
+
+A route registered once and never touched again would silently expire out of Redis after 5 minutes even though the client is still connected — the single most damaging HA gap found in the v0.6 review. `ClientSession.clusterRoutes` tracks every `RouteEntry` a session has registered cluster-wide (its primary subdomain, plus any extra subdomains/hostnames/path prefixes from `registerTunnelRoutes`), and `startClusterHeartbeat`'s 30s tick calls `refreshClusterRoutes` to re-run `RegisterRoute` for all of them — a `pipeline`-friendly batch that's functionally an `EXPIRE`/TTL-refresh rather than a fresh reservation, since the entry already belongs to this client.
 
 ### Cluster Heartbeat (`pkg/server/cluster.go`)
 
 ```
 startClusterHeartbeat(ctx)
   ├── tick every 30s → NodeHeartbeat(NodeInfo{NodeID, NodeAddr})
+  │                     sendHeartbeat tracks StateStore reachability → Server.stateStoreHealthy (H9)
+  ├── tick every 30s → refreshClusterRoutes(client) for every connected session (H1)
   └── tick every 60s → EvictDeadNodes(90s threshold)
                            └── MemoryStateStore: scan + delete dead nodes + owned routes
-                               RedisStateStore: no-op (Redis TTL handles eviction)
+                               RedisStateStore: no-op — Redis TTL is the single source of truth for eviction (H8)
 ```
 
 ### Cross-Node HTTP Routing
 
 ```
 HTTPHandler.ServeHTTP(r)
+  ├── verifyClusterSecret(r) → reject if --cluster-secret set and header missing/mismatched (S1)
   ├── router.Route(host, path) → local ClientSession?
   │     └── Yes → forwardHTTP / handleWebSocket (normal path)
-  └── No → server.lookupRemoteClient(subdomain)
+  └── No → server.lookupRemoteRoute(host, path, subdomain)   [hostname → longest path-prefix → subdomain]
               └── found remote RouteEntry?
                     ├── isLocalNode? → continue to 404 (stale entry)
                     └── No  → proxyToNode(route.NodeAddr, w, r)
+                                  └── attach X-Wormhole-Cluster-Secret header (S1)
                                   └── httputil.ReverseProxy → target node
 ```
 
-Dead node cleanup ensures stale routes are eventually removed so cross-node lookups don't cause persistent proxy errors.
+Hostname and path-prefix routes are indexed into Redis exactly like subdomains (H3), so a tunnel registered with `--hostname`/`--path` on node A is reachable through node B, not just its own subdomain.
+
+**Node identity (H4)**: `applyClusterNodeIDDefault` defaults `Config.ClusterNodeID` to `os.Hostname()` whenever a cluster backend is configured but no explicit ID was given, so two nodes never accidentally share an empty NodeID.
+
+**Stale ownership reclaim (H10)**: `router.go`'s `RegisterSubdomain`/`RegisterHostname`/`RegisterPath` check `isStaleOwner` (the existing owner's `Mux.IsClosed()`) before returning a conflict; `registerClientRoute` mirrors this on the cluster side, proactively unregistering the dead session's `StateStore` entries. A client that reconnects after a network blip gets its subdomain/hostname/path back immediately instead of a transient conflict error.
+
+**Health surfacing (H9)**: `GET /health` includes `cluster: {node_id, state_store_healthy}`; if the state store becomes unreachable, overall `status` flips from `"ok"` to `"degraded"` so monitoring picks it up without needing a separate Redis probe.
+
+### Inter-Node Authentication (S1)
+
+`--cluster-secret` is a shared secret across all nodes in a cluster. `proxyToNode` attaches it as `X-Wormhole-Cluster-Secret` on every proxied request; `verifyClusterSecret` (called first in `HTTPHandler.ServeHTTP`) rejects requests where the header is missing or doesn't match, and strips the header before continuing so it's never forwarded to the local tunnel client. Without a configured secret, no check is performed (backward-compatible with pre-S1 single-node/unsecured deployments) — operators running a real cluster should always set it, since without it a network peer could forge `X-Wormhole-*` proxy headers.
+
+### Shared Auth/Revocation State (H5)
+
+`--persistence redis` (`pkg/auth/store_redis.go`, `auth.RedisStore`) stores teams under `wormhole:auth:team:<name>` and revoked tokens under `wormhole:auth:revoked:<tokenID>` with a Redis TTL matching the token's remaining lifetime — a token revoked on node A is invisible on node B the moment the write completes, with no propagation delay and no periodic sweep needed (`CleanupExpiredRevocations` is a no-op on this backend, since TTL already deletes the key). `--auth-redis-addr/-password/-db` fall back to `--cluster-redis-*` when unset, so a single Redis instance can back both cluster routing state and auth/revocation state with one flag.
+
+### TCP Tunnels Under HA (H2)
+
+TCP tunnels are **node-local only**: a TCP tunnel's listener lives on whichever node the client happens to be connected to, and there is no cross-node TCP proxy (unlike the HTTP/WebSocket path, `StateStore` doesn't track TCP port ownership across nodes). Operators who need HA for TCP tunnels must put a TCP-aware load balancer (e.g. HAProxy in `mode tcp`, or an L4 DNS/anycast scheme) in front of the individual node addresses/ports themselves; Wormhole does not attempt to abstract this away. A full edge-port-proxy solution is tracked separately (see roadmap P3-6+) rather than bundled into this phase.
 
 ### Connection Limits
 

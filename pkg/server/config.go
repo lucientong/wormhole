@@ -14,6 +14,22 @@ const (
 	PersistenceMemory PersistenceType = "memory"
 	// PersistenceSQLite uses SQLite for persistent storage.
 	PersistenceSQLite PersistenceType = "sqlite"
+	// PersistenceRedis uses Redis for persistent, cluster-shared storage
+	// (H5): unlike memory or SQLite, a token revoked or a team's version
+	// bumped on one node is immediately visible to every other node,
+	// since they all query the same Redis keys instead of a per-node
+	// local store.
+	PersistenceRedis PersistenceType = "redis"
+)
+
+// ClusterStateBackend values selecting the shared-state backend used for
+// cross-node route/heartbeat coordination (see Config.ClusterStateBackend).
+const (
+	// ClusterBackendMemory keeps cluster state in a single process, i.e.
+	// effectively single-node; useful for tests and local development.
+	ClusterBackendMemory = "memory"
+	// ClusterBackendRedis shares cluster state across nodes via Redis.
+	ClusterBackendRedis = "redis"
 )
 
 // defaultDomain is the default Config.Domain value used for local
@@ -182,6 +198,30 @@ type Config struct {
 
 	// ClusterRedisDB is the Redis database number (default 0).
 	ClusterRedisDB int
+
+	// AuthRedisAddr is the Redis address for the auth Store when
+	// Persistence is "redis" (H5). Defaults to ClusterRedisAddr when
+	// empty, so a single --cluster-redis-addr is enough for the common
+	// case of sharing one Redis instance for both cluster routing state
+	// and shared auth/revocation state; set explicitly to use a
+	// different Redis instance for auth data.
+	AuthRedisAddr string
+
+	// AuthRedisPassword is the Redis AUTH password for the auth store.
+	// Defaults to ClusterRedisPassword when AuthRedisAddr is empty.
+	AuthRedisPassword string
+
+	// AuthRedisDB is the Redis database number for the auth store.
+	// Defaults to ClusterRedisDB when AuthRedisAddr is empty.
+	AuthRedisDB int
+
+	// ClusterSecret is a shared secret attached to requests forwarded
+	// between nodes by proxyToNode (S1). When set, a receiving node
+	// rejects any request carrying a mismatched cluster-secret header,
+	// distinguishing genuine peer hops from an external caller that
+	// reaches ClusterNodeAddr directly. Requests with no such header at
+	// all (ordinary external traffic) are unaffected either way.
+	ClusterSecret string
 }
 
 // DefaultConfig returns the default server configuration.

@@ -28,7 +28,7 @@ Wormhole folds network space like a wormhole, allowing developers to expose loca
 - 🪪 **SSO / OIDC** — OAuth2 Device Code Flow + OIDC JWT validation; `wormhole login` for CLI-based SSO
 - 📋 **Audit Logs** — Structured audit event log with SQLite persistence and CSV/JSON export API
 - 📁 **Declarative Config** — YAML config file, multi-tunnel, SIGHUP hot-reload, `wormhole tunnels list`
-- 🏗️ **HA / Multi-Node** — Pluggable `StateStore` with Redis backend; cross-node HTTP routing and cluster heartbeat
+- 🏗️ **HA / Multi-Node** — Pluggable `StateStore` with Redis backend; cross-node HTTP/hostname/path routing, TTL-refreshed heartbeat, shared cluster secret, and cross-node token revocation
 - 🐳 **Docker Ready** — Easy deployment with Docker and systemd
 
 ## Quick Start
@@ -142,7 +142,7 @@ That's it! Your local service is now accessible from the internet.
 - **OIDC/SSO**: OIDC Discovery + JWKS JWT validation; OAuth2 Device Code Flow for CLI-based login; credentials persisted to `~/.wormhole/credentials.json`
 - **Audit Log**: Structured events (auth, tunnel, P2P) stored in memory (ring buffer) or SQLite; queryable via Admin API with CSV/JSON export
 - **Multi-Tunnel Config**: YAML config file with multiple tunnel definitions; SIGHUP triggers diff-based hot-reload; local control API (`--ctrl-port`) for `wormhole tunnels list`
-- **HA / Multi-Node**: Pluggable `StateStore` interface; in-memory (single-node) or Redis backend; cluster heartbeat + dead-node eviction; cross-node HTTP proxying via `httputil.ReverseProxy`
+- **HA / Multi-Node**: Pluggable `StateStore` interface; in-memory (single-node) or Redis backend; cluster heartbeat re-registers (TTL-refreshes) every active route so long-lived tunnels never expire out of Redis; subdomain/hostname/path routes all indexed cluster-wide; `--cluster-secret` authenticates inter-node proxy traffic; `--persistence redis` shares team/token-revocation state across nodes for instant cross-node logout; `/health` reports live Redis connectivity; TCP tunnels remain node-local under HA (see [architecture doc](docs/architecture.md#ha--multi-node-control-plane))
 
 ### Components
 
@@ -248,7 +248,7 @@ wormhole server \
 | `--auth-tokens` | Comma-separated pre-shared tokens | None |
 | `--auth-secret` | HMAC secret for signed tokens (min 16 chars) | None |
 | `--admin-token` | Token to protect admin API | None |
-| `--persistence` | Storage backend: memory (default) or sqlite | memory |
+| `--persistence` | Storage backend: memory (default), sqlite, or redis | memory |
 | `--persistence-path` | Path to SQLite database | `~/.wormhole/wormhole.db` |
 | `--audit` | Enable structured audit logging | false |
 | `--audit-persistence` | Audit storage backend: memory or sqlite | memory |
@@ -260,11 +260,15 @@ wormhole server \
 | `--oidc-team-claim` | JWT claim to use as team name | `email` |
 | `--oidc-role-claim` | JWT claim to use as Wormhole role | None |
 | `--cluster-backend` | Cluster state backend: memory or redis | (disabled) |
-| `--cluster-node-id` | Unique ID for this node in the cluster | hostname |
+| `--cluster-node-id` | Unique ID for this node in the cluster | `os.Hostname()` |
 | `--cluster-node-addr` | Address other nodes use to reach this node | None |
 | `--cluster-redis-addr` | Redis address for cluster state | None |
 | `--cluster-redis-password` | Redis AUTH password | None |
 | `--cluster-redis-db` | Redis database number | 0 |
+| `--cluster-secret` | Shared secret validated on inter-node proxy requests (`X-Wormhole-Cluster-Secret`) | None |
+| `--auth-redis-addr` | Redis address for auth/team/revocation state (`--persistence redis`); falls back to `--cluster-redis-addr` | None |
+| `--auth-redis-password` | Redis AUTH password for the auth store; falls back to `--cluster-redis-password` | None |
+| `--auth-redis-db` | Redis database number for the auth store; falls back to `--cluster-redis-db` | 0 |
 
 ## API
 
@@ -385,11 +389,18 @@ wormhole server --require-auth --auth-secret "my-secret" --persistence sqlite
 wormhole server --require-auth --auth-secret "my-secret" \
   --persistence sqlite \
   --persistence-path /var/lib/wormhole/data.db
+
+# Redis-backed persistence: shares team/revocation state across HA nodes
+# (see "High Availability / Multi-Node" below); falls back to
+# --cluster-redis-addr if --auth-redis-addr isn't set
+wormhole server --require-auth --auth-secret "my-secret" \
+  --persistence redis \
+  --auth-redis-addr redis.internal:6379
 ```
 
 Persistent storage saves:
 - Team information
-- Revoked token blacklist
+- Revoked token blacklist (Redis: revocations auto-expire via TTL instead of needing a cleanup sweep)
 
 ### Audit Logging
 
@@ -416,24 +427,30 @@ curl -H "Authorization: Bearer <token>" \
 wormhole server \
   --cluster-backend redis \
   --cluster-redis-addr redis.internal:6379 \
-  --cluster-node-id node1 \
-  --cluster-node-addr 10.0.0.1:7000 \
-  --domain tunnel.example.com
+  --cluster-secret "$(openssl rand -hex 32)" \
+  --persistence redis \
+  --domain tunnel.example.com \
+  --cluster-node-addr 10.0.0.1:7000
 
-# Node 2 (same Redis, different node ID/addr)
+# Node 2 (same Redis + cluster secret, node ID defaults to os.Hostname())
 wormhole server \
   --cluster-backend redis \
   --cluster-redis-addr redis.internal:6379 \
-  --cluster-node-id node2 \
-  --cluster-node-addr 10.0.0.2:7000 \
-  --domain tunnel.example.com
+  --cluster-secret "$(openssl rand -hex 32)" \
+  --persistence redis \
+  --domain tunnel.example.com \
+  --cluster-node-addr 10.0.0.2:7000
 ```
 
 Each node:
-- Sends a heartbeat to Redis every 30 seconds
-- Evicts dead nodes (missed > 3 heartbeats) every 60 seconds
-- Looks up unknown subdomains in Redis and proxies HTTP requests to the owning node
+- Defaults `--cluster-node-id` to its hostname when unset, so nodes don't accidentally collide on the empty string
+- Sends a heartbeat to Redis every 30 seconds, and in the same cycle re-registers (TTL-refreshes) every route it currently owns — subdomain, hostname, and path-prefix routes alike — so long-lived tunnels never silently expire out of the shared state store
+- Looks up unknown subdomains/hostnames/paths in Redis and proxies HTTP requests to the owning node via `httputil.ReverseProxy`, attaching `--cluster-secret` as a header so peer nodes reject forged proxy traffic
+- With `--persistence redis`, revoking a token or updating a team on one node is instantly visible to every other node (no propagation delay); falls back to `--cluster-redis-addr`/`--cluster-redis-password`/`--cluster-redis-db` if `--auth-redis-*` isn't set separately
+- Reports Redis connectivity in `GET /health` (`cluster.state_store_healthy`); status flips to `"degraded"` if the state store becomes unreachable
+- On reconnect, reclaims a subdomain/hostname/path immediately if the previous owner's session has gone stale (mux closed), instead of returning a spurious conflict
 - Cleans up its routes from Redis on client disconnect
+- **TCP tunnels remain node-local**: a TCP tunnel is only reachable through the node the client is connected to (no cross-node TCP proxying, unlike HTTP/WS) — put node addresses/ports behind a TCP-aware load balancer (e.g. HAProxy `mode tcp`) if you need TCP HA
 
 ### Inspector API (Client)
 
@@ -633,6 +650,7 @@ Auto-generated subdomains use 64-bit cryptographic randomness (`crypto/rand`), p
 - [x] Phase 13 (v0.6.1): End-to-end SSO — `wormhole login` credentials are now auto-loaded by `wormhole client` (no more manual `--token`/`jq`), expired access tokens are silently renewed via `refresh_token` (including mid-session, across reconnects), the device-flow token poll now includes `client_id` per RFC 8628, and `wormhole client` with no `--local`/`--config` falls back to `~/.wormhole/wormhole.yml`
 - [x] Phase 14 (v0.6.2): P2P data plane access + transport optimization — new `wormhole connect <subdomain>` command lets two `wormhole` clients hole-punch and exchange real traffic entirely peer-to-peer (server only signals, never relays a byte); `UDPStream` upgraded from a fixed 200ms retransmit timer to RFC 6298-style adaptive RTO with per-segment exponential backoff; send/receive path copies reduced (direct in-place encryption, no redundant buffer copies); removed the superseded `pkg/p2p/transport.go` ARQ implementation
 - [x] Phase 15 (v0.6.3): Security hardening — RBAC write-permission checks (viewers can no longer register/close tunnels); tunnel control-channel TLS decoupled from the HTTP listener's TLS setting and defaulted on whenever `--require-auth` is combined with a real domain (fails closed instead of silently falling back to plaintext); subdomain registration is now an atomic, cluster-wide reservation (local + Redis `SETNX`-based) that rejects connections on genuine conflicts instead of silently overwriting the previous owner; fixed a token-expiry data race and scheduled periodic revoked-token cleanup; OIDC now explicitly rejects `alg: none` and validates `nbf` with clock-skew leeway; Inspector redacts sensitive headers (`Authorization`/`Cookie`/`Set-Cookie`/etc.) and lowered its default body-capture limit; `/metrics` now requires admin auth; audit logging gained successful-auth/IP-blocked/token-generated/IP-unblocked events plus a configurable retention sweep (`--audit-retention-days`) and a `audit_store_errors` counter on `/stats` so persistence failures are no longer silent
+- [x] Phase 16 (v0.6.4): HA phase 2 — cluster heartbeat now re-registers (TTL-refreshes) every route a node owns each cycle, fixing routes silently expiring out of Redis on long-lived connections; hostname/path-prefix routes are indexed into Redis and resolvable cross-node, not just subdomains; `ClusterNodeID` defaults to `os.Hostname()` when unset; new `--cluster-secret` authenticates inter-node proxy requests; new `--persistence redis` (`auth.RedisStore`) shares team/token-revocation state across nodes with instant cross-node invalidation; `KEYS` replaced with `SCAN` throughout the Redis-backed stores; `/health` now reports Redis connectivity (`cluster.state_store_healthy`, degrading overall status when unreachable); reconnecting clients reclaim a stale-owner subdomain/hostname/path immediately instead of hitting a spurious conflict; TCP tunnels documented as node-local under HA (no cross-node TCP proxying)
 
 ## Contributing
 

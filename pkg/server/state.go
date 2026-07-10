@@ -6,18 +6,38 @@ import (
 )
 
 // ErrSubdomainConflict is returned by StateStore.RegisterRoute when the
-// requested subdomain is already held by a different, still-live client
-// (S3/H6). Callers should reject the connection rather than proceed with a
-// route the cluster considers ambiguous.
+// requested subdomain/hostname/path is already held by a different, still-live
+// client (S3/H6). Callers should reject the connection rather than proceed with
+// a route the cluster considers ambiguous.
 var ErrSubdomainConflict = errors.New("subdomain already registered to another client")
 
-// RouteEntry describes a tunnel route registered in the cluster state.
+// RouteEntry describes a single routing-key reservation registered in the
+// cluster state: exactly one of Subdomain, Hostname, or PathPrefix should be
+// set, identifying which of the three routing dimensions this entry claims
+// (mirrors the three independent maps in the in-process Router).
+//
+// A single client can own more than one RouteEntry — e.g. its connect-time
+// subdomain plus a custom hostname and/or path prefix registered by an
+// individual tunnel (H3). RouteID distinguishes these reservations from each
+// other; it defaults to ClientID when empty, which preserves the original
+// one-entry-per-client behavior for the primary connect-time subdomain.
 type RouteEntry struct {
-	// ClientID is the unique identifier of the client session.
+	// RouteID uniquely identifies this reservation. Defaults to ClientID
+	// (via Key()) when left empty, so existing single-entry-per-client
+	// callers don't need to set it explicitly.
+	RouteID string
+
+	// ClientID is the unique identifier of the owning client session.
 	ClientID string
 
-	// Subdomain is the subdomain assigned to this client.
+	// Subdomain is set when this entry reserves a subdomain route.
 	Subdomain string
+
+	// Hostname is set when this entry reserves a custom-hostname route (H3).
+	Hostname string
+
+	// PathPrefix is set when this entry reserves a path-prefix route (H3).
+	PathPrefix string
 
 	// NodeID is the cluster node that owns this client connection.
 	NodeID string
@@ -28,6 +48,15 @@ type RouteEntry struct {
 
 	// RegisteredAt is when the route was registered.
 	RegisteredAt time.Time
+}
+
+// Key returns the storage key for this entry: RouteID if set, otherwise
+// ClientID (the historical default for the one-entry-per-client case).
+func (e RouteEntry) Key() string {
+	if e.RouteID != "" {
+		return e.RouteID
+	}
+	return e.ClientID
 }
 
 // NodeInfo describes a member of the cluster.
@@ -49,20 +78,39 @@ type NodeInfo struct {
 // Single-node deployments use MemoryStateStore (no external dependency).
 // Multi-node deployments use RedisStateStore.
 type StateStore interface {
-	// RegisterRoute stores a client's route entry on this node.
-	// Implementations must atomically reserve entry.Subdomain: if it is
-	// already held by a different, still-live client, RegisterRoute must
-	// return ErrSubdomainConflict (wrapped or not) instead of silently
-	// overwriting the existing owner (S3/H6). Re-registering the same
-	// (ClientID, Subdomain) pair — e.g. a TTL refresh — must succeed.
+	// RegisterRoute atomically reserves the routing key set on entry
+	// (exactly one of Subdomain/Hostname/PathPrefix). Implementations must
+	// return ErrSubdomainConflict (wrapped or not) when the key is already
+	// held by a different, still-live route entry (S3/H6), instead of
+	// silently overwriting the existing owner. Re-registering the same
+	// entry.Key() (e.g. a TTL refresh, see H1) must succeed idempotently,
+	// as must reclaiming a key whose previous owner has gone stale (its
+	// entry already expired/removed).
 	RegisterRoute(entry RouteEntry) error
 
-	// UnregisterRoute removes all routes for a given client.
+	// UnregisterRoute removes all route entries owned by the given client
+	// (across all of its RouteIDs — connect-time subdomain plus any
+	// per-tunnel hostname/path entries), used on full client disconnect.
 	UnregisterRoute(clientID string) error
+
+	// UnregisterRouteEntry removes a single route reservation by its
+	// RouteID (or ClientID, if RouteID was left empty when registering),
+	// used when an individual tunnel is closed but the client connection
+	// (and its other routes) remain active.
+	UnregisterRouteEntry(routeID string) error
 
 	// LookupBySubdomain returns the route entry for the given subdomain.
 	// Returns (nil, nil) when no entry is found (not an error condition).
 	LookupBySubdomain(subdomain string) (*RouteEntry, error)
+
+	// LookupByHostname returns the route entry for the given custom
+	// hostname (H3). Returns (nil, nil) when not found.
+	LookupByHostname(hostname string) (*RouteEntry, error)
+
+	// LookupByPathPrefix returns the route entry whose PathPrefix is the
+	// longest prefix match of path (H3), mirroring Router.matchPath's
+	// local semantics. Returns (nil, nil) when no path route matches.
+	LookupByPathPrefix(path string) (*RouteEntry, error)
 
 	// ListRoutes returns all active route entries across the cluster.
 	ListRoutes() ([]RouteEntry, error)

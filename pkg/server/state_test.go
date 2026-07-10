@@ -173,3 +173,119 @@ func TestMemoryStateStore_EvictDeadNodes(t *testing.T) {
 		t.Error("route owned by dead node was not evicted")
 	}
 }
+
+// TestMemoryStateStore_MultipleRoutesPerClient verifies H3: a single
+// client can own more than one route entry (its connect-time subdomain
+// plus a per-tunnel hostname and path prefix), distinguished by RouteID,
+// and all three are independently lookupable.
+func TestMemoryStateStore_MultipleRoutesPerClient(t *testing.T) {
+	s := NewMemoryStateStore()
+
+	if err := s.RegisterRoute(RouteEntry{ClientID: "c1", Subdomain: "sub1", NodeID: "n1"}); err != nil {
+		t.Fatalf("register subdomain: %v", err)
+	}
+	if err := s.RegisterRoute(RouteEntry{RouteID: "t1:host", ClientID: "c1", Hostname: "custom.example.com", NodeID: "n1"}); err != nil {
+		t.Fatalf("register hostname: %v", err)
+	}
+	if err := s.RegisterRoute(RouteEntry{RouteID: "t1:path", ClientID: "c1", PathPrefix: "/api", NodeID: "n1"}); err != nil {
+		t.Fatalf("register path: %v", err)
+	}
+
+	if got, _ := s.LookupBySubdomain("sub1"); got == nil || got.ClientID != "c1" {
+		t.Fatalf("LookupBySubdomain: got %+v", got)
+	}
+	if got, _ := s.LookupByHostname("custom.example.com"); got == nil || got.ClientID != "c1" {
+		t.Fatalf("LookupByHostname: got %+v", got)
+	}
+	if got, _ := s.LookupByPathPrefix("/api/v1/foo"); got == nil || got.ClientID != "c1" {
+		t.Fatalf("LookupByPathPrefix: got %+v", got)
+	}
+
+	routes, err := s.ListRoutes()
+	if err != nil {
+		t.Fatalf("ListRoutes: %v", err)
+	}
+	if len(routes) != 3 {
+		t.Fatalf("got %d routes; want 3", len(routes))
+	}
+
+	// UnregisterRoute(clientID) must remove ALL of the client's routes.
+	if err := s.UnregisterRoute("c1"); err != nil {
+		t.Fatalf("UnregisterRoute: %v", err)
+	}
+	if got, _ := s.LookupBySubdomain("sub1"); got != nil {
+		t.Error("subdomain route should be gone")
+	}
+	if got, _ := s.LookupByHostname("custom.example.com"); got != nil {
+		t.Error("hostname route should be gone")
+	}
+	if got, _ := s.LookupByPathPrefix("/api/v1/foo"); got != nil {
+		t.Error("path route should be gone")
+	}
+}
+
+// TestMemoryStateStore_UnregisterRouteEntry verifies that removing a
+// single route by RouteID leaves the client's other routes intact —
+// mirroring closing one tunnel without disconnecting the whole client.
+func TestMemoryStateStore_UnregisterRouteEntry(t *testing.T) {
+	s := NewMemoryStateStore()
+
+	_ = s.RegisterRoute(RouteEntry{ClientID: "c1", Subdomain: "sub1", NodeID: "n1"})
+	_ = s.RegisterRoute(RouteEntry{RouteID: "t1:host", ClientID: "c1", Hostname: "custom.example.com", NodeID: "n1"})
+
+	if err := s.UnregisterRouteEntry("t1:host"); err != nil {
+		t.Fatalf("UnregisterRouteEntry: %v", err)
+	}
+
+	if got, _ := s.LookupByHostname("custom.example.com"); got != nil {
+		t.Error("hostname route should be gone")
+	}
+	if got, _ := s.LookupBySubdomain("sub1"); got == nil {
+		t.Error("subdomain route should still be present")
+	}
+}
+
+// TestMemoryStateStore_HostnameAndPathConflict verifies S3/H6's conflict
+// rejection also applies to the new hostname/path routing keys (H3), not
+// just subdomains.
+func TestMemoryStateStore_HostnameAndPathConflict(t *testing.T) {
+	s := NewMemoryStateStore()
+
+	_ = s.RegisterRoute(RouteEntry{RouteID: "t1:host", ClientID: "c1", Hostname: "shared.example.com", NodeID: "n1"})
+	err := s.RegisterRoute(RouteEntry{RouteID: "t2:host", ClientID: "c2", Hostname: "shared.example.com", NodeID: "n2"})
+	if !errors.Is(err, ErrSubdomainConflict) {
+		t.Fatalf("expected ErrSubdomainConflict for hostname conflict, got %v", err)
+	}
+
+	_ = s.RegisterRoute(RouteEntry{RouteID: "t1:path", ClientID: "c1", PathPrefix: "/api", NodeID: "n1"})
+	err = s.RegisterRoute(RouteEntry{RouteID: "t2:path", ClientID: "c2", PathPrefix: "/api", NodeID: "n2"})
+	if !errors.Is(err, ErrSubdomainConflict) {
+		t.Fatalf("expected ErrSubdomainConflict for path conflict, got %v", err)
+	}
+}
+
+// TestMemoryStateStore_LookupByPathPrefix_LongestMatch verifies that
+// LookupByPathPrefix picks the longest matching prefix, mirroring
+// Router.matchPath's local semantics.
+func TestMemoryStateStore_LookupByPathPrefix_LongestMatch(t *testing.T) {
+	s := NewMemoryStateStore()
+
+	_ = s.RegisterRoute(RouteEntry{RouteID: "short", ClientID: "c1", PathPrefix: "/api", NodeID: "n1"})
+	_ = s.RegisterRoute(RouteEntry{RouteID: "long", ClientID: "c2", PathPrefix: "/api/v2", NodeID: "n1"})
+
+	got, err := s.LookupByPathPrefix("/api/v2/widgets")
+	if err != nil {
+		t.Fatalf("LookupByPathPrefix: %v", err)
+	}
+	if got == nil || got.ClientID != "c2" {
+		t.Fatalf("expected longest-prefix match to win (c2), got %+v", got)
+	}
+
+	got, err = s.LookupByPathPrefix("/api/v1/widgets")
+	if err != nil {
+		t.Fatalf("LookupByPathPrefix: %v", err)
+	}
+	if got == nil || got.ClientID != "c1" {
+		t.Fatalf("expected fallback to shorter prefix match (c1), got %+v", got)
+	}
+}

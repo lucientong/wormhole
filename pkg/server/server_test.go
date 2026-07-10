@@ -14,10 +14,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/lucientong/wormhole/pkg/auth"
 	"github.com/lucientong/wormhole/pkg/proto"
 	"github.com/lucientong/wormhole/pkg/tunnel"
@@ -147,6 +149,67 @@ func TestNewServer_OIDCWiredToAuthenticator(t *testing.T) {
 	claims, err := s.authenticator.ValidateToken(jwt)
 	require.NoError(t, err, "OIDC-issued JWT must validate — this fails if OIDC was never wired to the authenticator")
 	assert.Equal(t, "user@example.com", claims.TeamName)
+}
+
+// TestApplyClusterNodeIDDefault verifies H4: ClusterNodeID falls back to
+// the machine hostname when clustering is enabled but no ID was set, and
+// is left untouched otherwise (explicit value, or clustering disabled).
+func TestApplyClusterNodeIDDefault(t *testing.T) {
+	hostname, err := os.Hostname()
+	require.NoError(t, err)
+
+	cfg := Config{ClusterStateBackend: ClusterBackendMemory}
+	applyClusterNodeIDDefault(&cfg)
+	assert.Equal(t, hostname, cfg.ClusterNodeID, "should default to hostname when clustering is enabled")
+
+	cfg = Config{ClusterStateBackend: ClusterBackendMemory, ClusterNodeID: "explicit-id"}
+	applyClusterNodeIDDefault(&cfg)
+	assert.Equal(t, "explicit-id", cfg.ClusterNodeID, "explicit ID must not be overwritten")
+
+	cfg = Config{}
+	applyClusterNodeIDDefault(&cfg)
+	assert.Empty(t, cfg.ClusterNodeID, "single-node (no cluster backend) must not get a hostname leaked in")
+}
+
+func TestInitStateStore(t *testing.T) {
+	assert.Nil(t, initStateStore(Config{}), "no backend configured -> single-node, nil store")
+
+	memStore := initStateStore(Config{ClusterStateBackend: ClusterBackendMemory})
+	require.NotNil(t, memStore)
+	_, ok := memStore.(*MemoryStateStore)
+	assert.True(t, ok)
+	_ = memStore.Close()
+}
+
+func TestInitAuthStore(t *testing.T) {
+	memStore := initAuthStore(Config{})
+	_, ok := memStore.(*auth.MemoryStore)
+	assert.True(t, ok, "default persistence should be in-memory")
+
+	tmpDir := t.TempDir()
+	sqliteStore := initAuthStore(Config{Persistence: PersistenceSQLite, PersistencePath: tmpDir + "/auth.db"})
+	_, ok = sqliteStore.(*auth.SQLiteStore)
+	assert.True(t, ok)
+	_ = sqliteStore.Close()
+}
+
+// TestInitAuthStore_Redis verifies H5's config wiring: --persistence redis
+// uses AuthRedisAddr when set, and otherwise falls back to
+// ClusterRedisAddr so a single --cluster-redis-addr is enough to share one
+// Redis instance for both cluster routing state and auth/revocation state.
+func TestInitAuthStore_Redis(t *testing.T) {
+	mr := miniredis.RunT(t)
+
+	store := initAuthStore(Config{Persistence: PersistenceRedis, AuthRedisAddr: mr.Addr()})
+	_, ok := store.(*auth.RedisStore)
+	assert.True(t, ok)
+	_ = store.Close()
+
+	// Falls back to ClusterRedisAddr when AuthRedisAddr is unset.
+	store = initAuthStore(Config{Persistence: PersistenceRedis, ClusterRedisAddr: mr.Addr()})
+	_, ok = store.(*auth.RedisStore)
+	assert.True(t, ok)
+	_ = store.Close()
 }
 
 func TestServer_IsP2PCompatible(t *testing.T) {

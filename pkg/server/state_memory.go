@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -11,7 +12,7 @@ import (
 // This is the default backend for single-node deployments.
 type MemoryStateStore struct {
 	mu     sync.RWMutex
-	routes map[string]RouteEntry // clientID → route
+	routes map[string]RouteEntry // routeID (see RouteEntry.Key()) → route
 	nodes  map[string]NodeInfo   // nodeID  → node
 }
 
@@ -23,26 +24,73 @@ func NewMemoryStateStore() *MemoryStateStore {
 	}
 }
 
+// conflictsWith reports whether existing (a different route entry) claims
+// the same routing key as entry (H3: any of Subdomain/Hostname/PathPrefix,
+// compared case-insensitively / prefix-normalized to match Router's
+// semantics).
+func conflictsWith(entry, existing RouteEntry) bool {
+	switch {
+	case entry.Subdomain != "":
+		return strings.EqualFold(existing.Subdomain, entry.Subdomain)
+	case entry.Hostname != "":
+		return strings.EqualFold(existing.Hostname, entry.Hostname)
+	case entry.PathPrefix != "":
+		return normalizePath(existing.PathPrefix) == normalizePath(entry.PathPrefix)
+	default:
+		return false
+	}
+}
+
 func (m *MemoryStateStore) RegisterRoute(entry RouteEntry) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// S3/H6: reject when the subdomain is already owned by a different
-	// client instead of silently overwriting it (last-writer-wins).
-	for clientID, existing := range m.routes {
-		if existing.Subdomain == entry.Subdomain && clientID != entry.ClientID {
-			return fmt.Errorf("%w: subdomain %q", ErrSubdomainConflict, entry.Subdomain)
+	key := entry.Key()
+
+	// S3/H6/H3: reject when the routing key is already owned by a
+	// different route entry instead of silently overwriting it
+	// (last-writer-wins).
+	for routeID, existing := range m.routes {
+		if routeID != key && conflictsWith(entry, existing) {
+			return fmt.Errorf("%w: %s", ErrSubdomainConflict, routeDescription(entry))
 		}
 	}
 
-	m.routes[entry.ClientID] = entry
+	entry.RegisteredAt = time.Now()
+	m.routes[key] = entry
 	return nil
+}
+
+// routeDescription returns a human-readable description of which routing
+// key an entry claims, for error messages.
+func routeDescription(entry RouteEntry) string {
+	switch {
+	case entry.Subdomain != "":
+		return fmt.Sprintf("subdomain %q", entry.Subdomain)
+	case entry.Hostname != "":
+		return fmt.Sprintf("hostname %q", entry.Hostname)
+	case entry.PathPrefix != "":
+		return fmt.Sprintf("path prefix %q", entry.PathPrefix)
+	default:
+		return "route"
+	}
 }
 
 func (m *MemoryStateStore) UnregisterRoute(clientID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.routes, clientID)
+	for routeID, entry := range m.routes {
+		if entry.ClientID == clientID {
+			delete(m.routes, routeID)
+		}
+	}
+	return nil
+}
+
+func (m *MemoryStateStore) UnregisterRouteEntry(routeID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.routes, routeID)
 	return nil
 }
 
@@ -50,12 +98,45 @@ func (m *MemoryStateStore) LookupBySubdomain(subdomain string) (*RouteEntry, err
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, entry := range m.routes {
-		if entry.Subdomain == subdomain {
+		if entry.Subdomain != "" && strings.EqualFold(entry.Subdomain, subdomain) {
 			e := entry
 			return &e, nil
 		}
 	}
 	return nil, nil //nolint:nilnil // nil means "not found", which is not an error
+}
+
+func (m *MemoryStateStore) LookupByHostname(hostname string) (*RouteEntry, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, entry := range m.routes {
+		if entry.Hostname != "" && strings.EqualFold(entry.Hostname, hostname) {
+			e := entry
+			return &e, nil
+		}
+	}
+	return nil, nil //nolint:nilnil // nil means "not found", which is not an error
+}
+
+func (m *MemoryStateStore) LookupByPathPrefix(path string) (*RouteEntry, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	reqPath := normalizePath(path)
+	var best *RouteEntry
+	bestLen := 0
+	for _, entry := range m.routes {
+		if entry.PathPrefix == "" {
+			continue
+		}
+		prefix := normalizePath(entry.PathPrefix)
+		if strings.HasPrefix(reqPath, prefix) && len(prefix) > bestLen {
+			e := entry
+			best = &e
+			bestLen = len(prefix)
+		}
+	}
+	return best, nil
 }
 
 func (m *MemoryStateStore) ListRoutes() ([]RouteEntry, error) {
@@ -101,10 +182,13 @@ func (m *MemoryStateStore) EvictDeadNodes(olderThan time.Duration) error {
 
 	for _, id := range deadNodes {
 		delete(m.nodes, id)
-		// Remove routes owned by the dead node.
-		for clientID, route := range m.routes {
+		// Remove routes owned by the dead node (H8: unify with Redis,
+		// which relies on route TTL rather than an explicit sweep, but a
+		// dead node's routes should disappear from ListRoutes/lookups
+		// immediately rather than lingering until some unrelated TTL).
+		for routeID, route := range m.routes {
 			if route.NodeID == id {
-				delete(m.routes, clientID)
+				delete(m.routes, routeID)
 			}
 		}
 	}

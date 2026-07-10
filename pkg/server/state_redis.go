@@ -5,31 +5,46 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
 const (
-	redisRoutePrefix  = "wormhole:route:" // wormhole:route:<clientID>
-	redisNodePrefix   = "wormhole:node:"  // wormhole:node:<nodeID>
-	redisSubdomainIdx = "wormhole:sub:"   // wormhole:sub:<subdomain> → clientID
+	redisRoutePrefix     = "wormhole:route:"        // wormhole:route:<routeID> → JSON RouteEntry
+	redisNodePrefix      = "wormhole:node:"         // wormhole:node:<nodeID> → JSON NodeInfo
+	redisSubdomainIdx    = "wormhole:sub:"          // wormhole:sub:<subdomain> → routeID
+	redisHostnameIdx     = "wormhole:host:"         // wormhole:host:<hostname> → routeID (H3)
+	redisPathIdx         = "wormhole:path:"         // wormhole:path:<normalized path> → routeID (H3)
+	redisClientRoutesIdx = "wormhole:clientroutes:" // wormhole:clientroutes:<clientID> → SET of routeIDs
 
-	// defaultRouteTTL is how long a route persists after its last heartbeat.
-	// Clients periodically refresh their route TTL via NodeHeartbeat.
+	// defaultRouteTTL is how long a route persists after its last refresh.
+	// The owning node re-registers (refreshes) every live route on each
+	// heartbeat tick (see Server.refreshClusterRoutes, H1), which runs far
+	// more often than this TTL, so a route only actually expires when its
+	// owning node has stopped heartbeating entirely.
 	defaultRouteTTL = 5 * time.Minute
 
 	// defaultNodeTTL is how long a node heartbeat is kept.
 	defaultNodeTTL = 90 * time.Second
+
+	// redisScanCount is the COUNT hint passed to SCAN, balancing round-trip
+	// count against per-call latency. It's a hint only; Redis may return
+	// more or fewer keys per call.
+	redisScanCount = 200
 )
 
 // RedisStateStore implements StateStore using Redis for multi-node coordination.
 //
 // Key layout:
 //
-//	wormhole:route:<clientID>  — JSON RouteEntry, TTL = defaultRouteTTL
-//	wormhole:sub:<subdomain>   — clientID string, TTL = defaultRouteTTL
-//	wormhole:node:<nodeID>     — JSON NodeInfo, TTL = defaultNodeTTL
+//	wormhole:route:<routeID>        — JSON RouteEntry, TTL = defaultRouteTTL
+//	wormhole:sub:<subdomain>        — routeID string, TTL = defaultRouteTTL
+//	wormhole:host:<hostname>        — routeID string, TTL = defaultRouteTTL (H3)
+//	wormhole:path:<norm path>       — routeID string, TTL = defaultRouteTTL (H3)
+//	wormhole:clientroutes:<clientID> — SET of routeIDs owned by clientID, TTL = defaultRouteTTL
+//	wormhole:node:<nodeID>          — JSON NodeInfo, TTL = defaultNodeTTL
 type RedisStateStore struct {
 	client *redis.Client
 }
@@ -75,31 +90,51 @@ func newRedisStateStoreWithClient(client *redis.Client) *RedisStateStore {
 	return &RedisStateStore{client: client}
 }
 
-// RegisterRoute atomically reserves entry.Subdomain via SETNX (S3/H6)
+// indexKey returns the Redis index key (and, for error messages, a
+// human-readable description) for whichever of Subdomain/Hostname/PathPrefix
+// is set on entry. Returns ("", "") if none are set.
+func indexKey(entry RouteEntry) (key, desc string) {
+	switch {
+	case entry.Subdomain != "":
+		return redisSubdomainIdx + strings.ToLower(entry.Subdomain), fmt.Sprintf("subdomain %q", entry.Subdomain)
+	case entry.Hostname != "":
+		return redisHostnameIdx + strings.ToLower(entry.Hostname), fmt.Sprintf("hostname %q", entry.Hostname)
+	case entry.PathPrefix != "":
+		return redisPathIdx + normalizePath(entry.PathPrefix), fmt.Sprintf("path prefix %q", entry.PathPrefix)
+	default:
+		return "", ""
+	}
+}
+
+// RegisterRoute atomically reserves entry's routing key (whichever of
+// Subdomain/Hostname/PathPrefix is set) via SetArgs{Mode:"NX"} (S3/H6/H3)
 // instead of a plain SET, which previously let two nodes racing to
-// register the same subdomain silently overwrite each other
-// (last-writer-wins). Semantics:
+// register the same key silently overwrite each other (last-writer-wins).
+// Semantics:
 //
-//   - Subdomain free                       → reserve it for entry.ClientID.
-//   - Subdomain already owned by entry.ClientID → idempotent TTL refresh.
-//   - Subdomain owned by another client whose route entry has expired
+//   - Key free                              → reserve it for entry.Key().
+//   - Key already owned by entry.Key()       → idempotent TTL refresh (H1).
+//   - Key owned by another route entry whose storage record has expired
 //     (crashed without calling UnregisterRoute) → reclaim it.
-//   - Subdomain owned by another *live* client  → ErrSubdomainConflict.
+//   - Key owned by another *live* route entry  → ErrSubdomainConflict.
 func (r *RedisStateStore) RegisterRoute(entry RouteEntry) error {
 	ctx := context.Background()
 
+	idxKey, desc := indexKey(entry)
+	if idxKey == "" {
+		return errors.New("route entry has no Subdomain, Hostname, or PathPrefix set")
+	}
+
+	entry.RegisteredAt = time.Now()
+	routeID := entry.Key()
 	data, err := json.Marshal(entry)
 	if err != nil {
 		return fmt.Errorf("marshal route entry: %w", err)
 	}
 
-	subKey := redisSubdomainIdx + entry.Subdomain
-	routeKey := redisRoutePrefix + entry.ClientID
+	routeKey := redisRoutePrefix + routeID
 
-	// SetNX is deprecated in favor of Set/SetArgs with an NX condition; a
-	// plain "SET key value NX" reports "not set" as a nil reply rather than
-	// a Go error, which SetArgs surfaces as the redis.Nil sentinel.
-	_, err = r.client.SetArgs(ctx, subKey, entry.ClientID, redis.SetArgs{
+	_, err = r.client.SetArgs(ctx, idxKey, routeID, redis.SetArgs{
 		Mode: "NX",
 		TTL:  defaultRouteTTL,
 	}).Result()
@@ -107,103 +142,207 @@ func (r *RedisStateStore) RegisterRoute(entry RouteEntry) error {
 	case err == nil:
 		// Reserved successfully.
 	case errors.Is(err, redis.Nil):
-		if resolveErr := r.resolveSubdomainConflict(ctx, subKey, entry); resolveErr != nil {
+		if resolveErr := r.resolveConflict(ctx, idxKey, routeID, desc); resolveErr != nil {
 			return resolveErr
 		}
 	default:
-		return fmt.Errorf("reserve subdomain %q: %w", entry.Subdomain, err)
+		return fmt.Errorf("reserve %s: %w", desc, err)
 	}
 
-	if err := r.client.Set(ctx, routeKey, data, defaultRouteTTL).Err(); err != nil {
+	pipe := r.client.Pipeline()
+	pipe.Set(ctx, routeKey, data, defaultRouteTTL)
+	if entry.ClientID != "" {
+		clientRoutesKey := redisClientRoutesIdx + entry.ClientID
+		pipe.SAdd(ctx, clientRoutesKey, routeID)
+		pipe.Expire(ctx, clientRoutesKey, defaultRouteTTL)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("store route entry: %w", err)
 	}
 	return nil
 }
 
-// resolveSubdomainConflict is called when SetNX on the subdomain index key
-// found it already occupied. It distinguishes an idempotent refresh by the
-// current owner, a stale reservation left by a crashed node, and a genuine
-// conflict with another live owner.
-func (r *RedisStateStore) resolveSubdomainConflict(ctx context.Context, subKey string, entry RouteEntry) error {
-	existingOwner, err := r.client.Get(ctx, subKey).Result()
+// resolveConflict is called when SetNX on an index key found it already
+// occupied. It distinguishes an idempotent refresh by the current owner, a
+// stale reservation left by a crashed node, and a genuine conflict with
+// another live owner.
+func (r *RedisStateStore) resolveConflict(ctx context.Context, idxKey, routeID, desc string) error {
+	existingRouteID, err := r.client.Get(ctx, idxKey).Result()
 	if err != nil && !errors.Is(err, redis.Nil) {
-		return fmt.Errorf("check subdomain owner %q: %w", entry.Subdomain, err)
+		return fmt.Errorf("check owner of %s: %w", desc, err)
 	}
 
-	if existingOwner == entry.ClientID {
-		// Same client re-registering (e.g. retry) — just refresh the TTL.
-		if err := r.client.Expire(ctx, subKey, defaultRouteTTL).Err(); err != nil {
-			return fmt.Errorf("refresh subdomain ttl %q: %w", entry.Subdomain, err)
+	if existingRouteID == routeID {
+		// Same route re-registering (e.g. a refresh or a retry) — just
+		// refresh the TTL.
+		if err := r.client.Expire(ctx, idxKey, defaultRouteTTL).Err(); err != nil {
+			return fmt.Errorf("refresh ttl for %s: %w", desc, err)
 		}
 		return nil
 	}
 
-	if existingOwner != "" {
-		ownerAlive, err := r.client.Exists(ctx, redisRoutePrefix+existingOwner).Result()
+	if existingRouteID != "" {
+		ownerAlive, err := r.client.Exists(ctx, redisRoutePrefix+existingRouteID).Result()
 		if err != nil {
-			return fmt.Errorf("check owner liveness %q: %w", entry.Subdomain, err)
+			return fmt.Errorf("check owner liveness for %s: %w", desc, err)
 		}
 		if ownerAlive > 0 {
-			return fmt.Errorf("%w: subdomain %q is held by client %q", ErrSubdomainConflict, entry.Subdomain, existingOwner)
+			return fmt.Errorf("%w: %s is held by another client", ErrSubdomainConflict, desc)
 		}
 	}
 
 	// Stale reservation (owner's route entry already expired/removed, or
-	// the key vanished between SetNX and Get) — reclaim it for entry.ClientID.
-	if err := r.client.Set(ctx, subKey, entry.ClientID, defaultRouteTTL).Err(); err != nil {
-		return fmt.Errorf("reclaim stale subdomain %q: %w", entry.Subdomain, err)
+	// the key vanished between SetNX and Get) — reclaim it for routeID.
+	if err := r.client.Set(ctx, idxKey, routeID, defaultRouteTTL).Err(); err != nil {
+		return fmt.Errorf("reclaim stale %s: %w", desc, err)
 	}
 	return nil
 }
 
+// UnregisterRoute removes all route entries owned by clientID, using the
+// wormhole:clientroutes:<clientID> set to find them without scanning the
+// entire keyspace.
 func (r *RedisStateStore) UnregisterRoute(clientID string) error {
 	ctx := context.Background()
+	clientRoutesKey := redisClientRoutesIdx + clientID
 
-	// Look up the subdomain before deleting.
-	routeKey := redisRoutePrefix + clientID
-	data, err := r.client.Get(ctx, routeKey).Bytes()
-	if err != nil && !errors.Is(err, redis.Nil) {
-		return fmt.Errorf("lookup route for deletion: %w", err)
+	routeIDs, err := r.client.SMembers(ctx, clientRoutesKey).Result()
+	if err != nil {
+		return fmt.Errorf("list routes for client %q: %w", clientID, err)
 	}
 
-	var entry RouteEntry
-	if len(data) > 0 {
-		_ = json.Unmarshal(data, &entry)
+	for _, routeID := range routeIDs {
+		if err := r.deleteRouteByID(ctx, routeID); err != nil {
+			return err
+		}
+	}
+	return r.client.Del(ctx, clientRoutesKey).Err()
+}
+
+// UnregisterRouteEntry removes a single route reservation by its RouteID
+// (or ClientID, when RouteID was left empty at registration time).
+func (r *RedisStateStore) UnregisterRouteEntry(routeID string) error {
+	ctx := context.Background()
+
+	entry, err := r.getRouteEntry(ctx, routeID)
+	if err != nil {
+		return err
+	}
+	if entry != nil && entry.ClientID != "" {
+		if err := r.client.SRem(ctx, redisClientRoutesIdx+entry.ClientID, routeID).Err(); err != nil {
+			return fmt.Errorf("remove route %q from client index: %w", routeID, err)
+		}
+	}
+	return r.deleteRouteByID(ctx, routeID)
+}
+
+// deleteRouteByID deletes the route's storage key and its index key
+// (whichever of subdomain/hostname/path it held). It's a no-op (not an
+// error) if the route entry no longer exists.
+func (r *RedisStateStore) deleteRouteByID(ctx context.Context, routeID string) error {
+	entry, err := r.getRouteEntry(ctx, routeID)
+	if err != nil {
+		return err
+	}
+	if entry == nil {
+		return nil
 	}
 
 	pipe := r.client.Pipeline()
-	pipe.Del(ctx, routeKey)
-	if entry.Subdomain != "" {
-		pipe.Del(ctx, redisSubdomainIdx+entry.Subdomain)
+	pipe.Del(ctx, redisRoutePrefix+routeID)
+	if idxKey, _ := indexKey(*entry); idxKey != "" {
+		pipe.Del(ctx, idxKey)
 	}
 	_, err = pipe.Exec(ctx)
-	return err
+	if err != nil {
+		return fmt.Errorf("delete route %q: %w", routeID, err)
+	}
+	return nil
+}
+
+// getRouteEntry fetches and unmarshals the route entry stored at routeID,
+// or (nil, nil) if it doesn't exist.
+func (r *RedisStateStore) getRouteEntry(ctx context.Context, routeID string) (*RouteEntry, error) {
+	data, err := r.client.Get(ctx, redisRoutePrefix+routeID).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return nil, nil //nolint:nilnil // not found is not an error
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get route %q: %w", routeID, err)
+	}
+	var entry RouteEntry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		return nil, fmt.Errorf("unmarshal route %q: %w", routeID, err)
+	}
+	return &entry, nil
+}
+
+// lookupByIndex resolves an index key to its route entry, or (nil, nil) if
+// either the index or the underlying route record is missing (a missing
+// route record means a stale index entry that hasn't expired yet — treated
+// the same as "not found", not an error).
+func (r *RedisStateStore) lookupByIndex(idxKey string) (*RouteEntry, error) {
+	ctx := context.Background()
+
+	routeID, err := r.client.Get(ctx, idxKey).Result()
+	if errors.Is(err, redis.Nil) {
+		return nil, nil //nolint:nilnil // not found is not an error
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lookup index %q: %w", idxKey, err)
+	}
+	return r.getRouteEntry(ctx, routeID)
 }
 
 func (r *RedisStateStore) LookupBySubdomain(subdomain string) (*RouteEntry, error) {
+	return r.lookupByIndex(redisSubdomainIdx + strings.ToLower(subdomain))
+}
+
+// LookupByHostname implements H3: custom-hostname routes are now indexed
+// in Redis the same way subdomains are, so cross-node fallback can find a
+// client's custom-hostname tunnel regardless of which node it's connected to.
+func (r *RedisStateStore) LookupByHostname(hostname string) (*RouteEntry, error) {
+	return r.lookupByIndex(redisHostnameIdx + strings.ToLower(hostname))
+}
+
+// LookupByPathPrefix implements H3's path-routing half. Path routes need a
+// longest-prefix match rather than an exact key lookup, so this scans the
+// (typically small) set of registered path keys instead of doing a single
+// GET, mirroring Router.matchPath's local semantics.
+func (r *RedisStateStore) LookupByPathPrefix(path string) (*RouteEntry, error) {
 	ctx := context.Background()
+	reqPath := normalizePath(path)
 
-	clientID, err := r.client.Get(ctx, redisSubdomainIdx+subdomain).Result()
-	if errors.Is(err, redis.Nil) {
-		return nil, nil //nolint:nilnil // nil means "not found", which is not an error
-	}
+	keys, err := r.scanKeys(ctx, redisPathIdx+"*")
 	if err != nil {
-		return nil, fmt.Errorf("lookup subdomain index: %w", err)
+		return nil, fmt.Errorf("scan path routes: %w", err)
+	}
+	if len(keys) == 0 {
+		return nil, nil //nolint:nilnil // not found is not an error
 	}
 
-	data, err := r.client.Get(ctx, redisRoutePrefix+clientID).Bytes()
-	if errors.Is(err, redis.Nil) {
-		return nil, nil //nolint:nilnil // stale subdomain index; not an error
-	}
+	values, err := r.client.MGet(ctx, keys...).Result()
 	if err != nil {
-		return nil, fmt.Errorf("lookup route entry: %w", err)
+		return nil, fmt.Errorf("mget path routes: %w", err)
 	}
 
-	var entry RouteEntry
-	if err := json.Unmarshal(data, &entry); err != nil {
-		return nil, fmt.Errorf("unmarshal route entry: %w", err)
+	var bestRouteID string
+	bestLen := 0
+	for i, key := range keys {
+		v, ok := values[i].(string)
+		if !ok || v == "" {
+			continue
+		}
+		prefix := strings.TrimPrefix(key, redisPathIdx)
+		if strings.HasPrefix(reqPath, prefix) && len(prefix) > bestLen {
+			bestRouteID = v
+			bestLen = len(prefix)
+		}
 	}
-	return &entry, nil
+	if bestRouteID == "" {
+		return nil, nil //nolint:nilnil // not found is not an error
+	}
+	return r.getRouteEntry(ctx, bestRouteID)
 }
 
 func (r *RedisStateStore) ListRoutes() ([]RouteEntry, error) {
@@ -248,10 +387,33 @@ func (r *RedisStateStore) GetNodes() ([]NodeInfo, error) {
 	return out, nil
 }
 
+// scanKeys returns all keys matching keyPattern using SCAN rather than KEYS
+// (H7): KEYS blocks the single-threaded Redis event loop for its entire
+// O(N) traversal of the whole keyspace, which is a real availability risk
+// once the keyspace holds more than a trivial number of entries. SCAN
+// iterates in bounded-size cursor batches instead.
+func (r *RedisStateStore) scanKeys(ctx context.Context, keyPattern string) ([]string, error) {
+	var keys []string
+	var cursor uint64
+	for {
+		batch, next, err := r.client.Scan(ctx, cursor, keyPattern, redisScanCount).Result()
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, batch...)
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return keys, nil
+}
+
 // scanJSON fetches all values matching keyPattern from Redis and returns them as
-// a slice of raw JSON byte slices.  It uses a pipeline to minimize round-trips.
+// a slice of raw JSON byte slices, using SCAN (H7) + a single MGET per batch of
+// keys to minimize round-trips without blocking on KEYS.
 func (r *RedisStateStore) scanJSON(ctx context.Context, keyPattern string) ([][]byte, error) {
-	keys, err := r.client.Keys(ctx, keyPattern).Result()
+	keys, err := r.scanKeys(ctx, keyPattern)
 	if err != nil {
 		return nil, fmt.Errorf("scan keys %q: %w", keyPattern, err)
 	}
@@ -266,16 +428,20 @@ func (r *RedisStateStore) scanJSON(ctx context.Context, keyPattern string) ([][]
 
 	out := make([][]byte, 0, len(values))
 	for _, v := range values {
-		if v == nil {
+		s, ok := v.(string)
+		if !ok {
 			continue
 		}
-		out = append(out, []byte(v.(string)))
+		out = append(out, []byte(s))
 	}
 	return out, nil
 }
 
-// EvictDeadNodes is a no-op for Redis because Redis TTL handles expiry automatically.
-// The Redis TTL on node keys (defaultNodeTTL) ensures stale entries are cleaned up.
+// EvictDeadNodes is a no-op for Redis because Redis TTL handles expiry
+// automatically: a dead node stops refreshing its own routes (see
+// Server.refreshClusterRoutes, H1) and its wormhole:node:<id> heartbeat key
+// and abandoned route/index keys all expire via their own TTLs (H8) without
+// needing an explicit sweep.
 func (r *RedisStateStore) EvictDeadNodes(_ time.Duration) error {
 	return nil
 }

@@ -36,14 +36,20 @@ func NewHTTPHandler(router *Router, server *Server) *HTTPHandler {
 func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
+	// S1: reject requests forged with an invalid cluster-peer secret
+	// before doing anything else with them.
+	if !h.server.verifyClusterSecret(w, r) {
+		return
+	}
+
 	// Route request to client.
 	client := h.router.Route(r.Host, r.URL.Path)
 	if client == nil {
 		// Try cluster-wide lookup: maybe the client is on another node.
-		if route := h.server.lookupRemoteClient(extractSubdomain(r.Host, h.server.config.Domain)); route != nil {
+		// H3: checks hostname/subdomain/path routes, not just subdomain.
+		if route := h.server.lookupRemoteRoute(r.Host, r.URL.Path); route != nil {
 			if !h.server.isLocalNode(route.NodeID) && route.NodeAddr != "" {
 				log.Debug().
-					Str("subdomain", route.Subdomain).
 					Str("node", route.NodeAddr).
 					Msg("Cluster: proxying HTTP request to remote node")
 				h.server.proxyToNode(route.NodeAddr, w, r)

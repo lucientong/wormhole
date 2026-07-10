@@ -3,6 +3,7 @@ package cmd
 import (
 	"testing"
 
+	"github.com/lucientong/wormhole/pkg/server"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 )
@@ -109,4 +110,35 @@ func TestBuildServerConfig_TunnelTLSDefault_ManualCertsNoDomainNeeded(t *testing
 
 	assert.True(t, config.TunnelTLSEnabled)
 	assert.False(t, config.AutoTLS, "manual certs provided, no need for auto-TLS")
+}
+
+// TestBuildServerConfig_ClusterFlags verifies P3-5's new cluster/auth-Redis
+// CLI flags (--cluster-secret, --auth-redis-*, --persistence redis) are
+// correctly wired into server.Config.
+func TestBuildServerConfig_ClusterFlags(t *testing.T) {
+	withServerGlobals(t, false, false, "", "", "")
+	cmd := newTLSTestCmd()
+
+	origSecret := serverClusterSecret
+	origAddr, origPass, origDB := serverAuthRedisAddr, serverAuthRedisPassword, serverAuthRedisDB
+	origPersistence := serverPersistence
+	t.Cleanup(func() {
+		serverClusterSecret = origSecret
+		serverAuthRedisAddr, serverAuthRedisPassword, serverAuthRedisDB = origAddr, origPass, origDB
+		serverPersistence = origPersistence
+	})
+
+	serverClusterSecret = "shared-secret"
+	serverAuthRedisAddr = "redis.internal:6379"
+	serverAuthRedisPassword = "hunter2"
+	serverAuthRedisDB = 3
+	serverPersistence = "redis"
+
+	config := buildServerConfig(cmd)
+
+	assert.Equal(t, "shared-secret", config.ClusterSecret)
+	assert.Equal(t, "redis.internal:6379", config.AuthRedisAddr)
+	assert.Equal(t, "hunter2", config.AuthRedisPassword)
+	assert.Equal(t, 3, config.AuthRedisDB)
+	assert.Equal(t, server.PersistenceRedis, config.Persistence)
 }

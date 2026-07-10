@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -63,6 +64,10 @@ type Server struct {
 	// Cluster state store (nil for single-node mode).
 	stateStore StateStore
 
+	// stateStoreHealthy tracks whether the most recent heartbeat/route
+	// refresh against stateStore succeeded, surfaced via /health (H9).
+	stateStoreHealthy atomic.Bool
+
 	// Shutdown.
 	closed  uint32
 	closeCh chan struct{}
@@ -90,6 +95,13 @@ type ClientSession struct {
 	P2PLocalAddr  string
 	P2PPublicKey  string // ECDH public key (base64-encoded) for E2E encryption.
 	P2PTunnelID   string // Tunnel ID from the latest P2P offer.
+
+	// clusterRoutes records every cluster StateStore route entry this
+	// client currently owns (connect-time subdomain plus any per-tunnel
+	// hostname/path entries), so the heartbeat loop can periodically
+	// re-register them to refresh their TTL (H1) without needing to
+	// recompute what should still be registered from scratch.
+	clusterRoutes []RouteEntry
 
 	mu sync.Mutex
 }
@@ -137,6 +149,8 @@ type Stats struct {
 
 // NewServer creates a new server instance.
 func NewServer(config Config) *Server {
+	applyClusterNodeIDDefault(&config)
+
 	s := &Server{
 		config:  config,
 		clients: make(map[string]*ClientSession),
@@ -173,28 +187,18 @@ func NewServer(config Config) *Server {
 
 	// Initialize cluster state store.
 	s.stateStore = initStateStore(config)
+	if s.stateStore != nil {
+		// Optimistic default: assume healthy until the first heartbeat
+		// (sent moments after Start()) proves otherwise, so /health
+		// doesn't report "degraded" for the brief startup window before
+		// the cluster heartbeat goroutine gets its first tick in (H9).
+		s.stateStoreHealthy.Store(true)
+	}
 
 	// Initialize authentication.
 	if config.RequireAuth {
 		// Initialize storage backend.
-		var store auth.Store
-		switch config.Persistence {
-		case PersistenceSQLite:
-			sqliteStore, err := auth.NewSQLiteStore(auth.SQLiteStoreConfig{
-				Path:      config.PersistencePath,
-				CreateDir: true,
-			})
-			if err != nil {
-				log.Fatal().Err(err).Msg("Failed to initialize SQLite store")
-			}
-			store = sqliteStore
-			log.Info().
-				Str("path", config.PersistencePath).
-				Msg("Using SQLite persistence for auth data")
-		default:
-			store = auth.NewMemoryStore()
-			log.Info().Msg("Using in-memory storage for auth data (no persistence)")
-		}
+		store := initAuthStore(config)
 
 		switch {
 		case config.AuthSecret != "":
@@ -258,6 +262,29 @@ func NewServer(config Config) *Server {
 	}
 
 	return s
+}
+
+// applyClusterNodeIDDefault implements H4: ClusterNodeID "defaults to
+// hostname" was documented but never implemented — an operator who enables
+// clustering without explicitly setting --cluster-node-id got an empty
+// NodeID, which breaks isLocalNode() (every route looks "remote") and
+// produces ambiguous wormhole:node: entries in the state store if more
+// than one such node exists. Falls back to os.Hostname() only when
+// clustering is actually enabled, to avoid a surprising hostname leak for
+// single-node setups.
+func applyClusterNodeIDDefault(config *Config) {
+	if config.ClusterStateBackend == "" || config.ClusterNodeID != "" {
+		return
+	}
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		log.Warn().Err(err).Msg("Cluster: ClusterNodeID not set and hostname lookup failed; " +
+			"node identity will be empty, which breaks cross-node route ownership checks")
+		return
+	}
+	config.ClusterNodeID = hostname
+	log.Info().Str("cluster_node_id", hostname).
+		Msg("Cluster: ClusterNodeID not set, defaulting to hostname")
 }
 
 // Start starts the server.
@@ -572,6 +599,20 @@ func (s *Server) handleClient(conn net.Conn) {
 func (s *Server) registerClientRoute(client *ClientSession, clientIP string) bool {
 	subdomain, sessionID := client.Subdomain, client.ID
 
+	// H10: Router.RegisterSubdomain (below) already reclaims a
+	// subdomain locally when its current owner's mux has died but
+	// hasn't been cleaned up yet — e.g. a client reconnecting faster
+	// than the old session's death was detected. Proactively evict that
+	// stale owner's cluster-side entry too, so the reclaim isn't
+	// immediately undone by RegisterRoute finding the old (still
+	// TTL-live) entry and reporting a conflict against the new
+	// connection's own former self.
+	if existing := s.router.LookupSubdomain(subdomain); existing != nil && isStaleOwner(existing, client) && s.stateStore != nil {
+		if err := s.stateStore.UnregisterRoute(existing.ID); err != nil {
+			log.Warn().Err(err).Str("client", existing.ID).Msg("Cluster: failed to evict stale route before reclaim")
+		}
+	}
+
 	if err := s.router.RegisterSubdomain(subdomain, client); err != nil {
 		log.Error().Err(err).Str("subdomain", subdomain).Str("session_id", sessionID).
 			Msg("Subdomain registration conflict — rejecting connection")
@@ -584,24 +625,12 @@ func (s *Server) registerClientRoute(client *ClientSession, clientIP string) boo
 	// H6/S3: RegisterRoute atomically reserves the subdomain cluster-wide
 	// (Redis SETNX) instead of last-writer-wins; a genuine conflict with a
 	// live owner on another node must reject the connection too, for the
-	// same reason as the local check above.
-	if s.stateStore == nil {
+	// same reason as the local check above. RouteID defaults to
+	// sessionID/ClientID, matching this connection's primary route.
+	ok, err := s.registerClusterRoute(client, RouteEntry{ClientID: sessionID, Subdomain: subdomain})
+	if ok {
 		return true
 	}
-	err := s.stateStore.RegisterRoute(RouteEntry{
-		ClientID:  sessionID,
-		Subdomain: subdomain,
-		NodeID:    s.config.ClusterNodeID,
-		NodeAddr:  s.config.ClusterNodeAddr,
-	})
-	if err == nil {
-		return true
-	}
-	if !errors.Is(err, ErrSubdomainConflict) {
-		log.Warn().Err(err).Str("subdomain", subdomain).Msg("Cluster: failed to register route in state store")
-		return true
-	}
-
 	log.Error().Err(err).Str("subdomain", subdomain).Str("session_id", sessionID).
 		Msg("Cluster: subdomain already claimed by another node — rejecting connection")
 	s.router.UnregisterSubdomain(subdomain)
@@ -609,6 +638,127 @@ func (s *Server) registerClientRoute(client *ClientSession, clientIP string) boo
 		s.auditLogger.LogAuthFailure(clientIP, fmt.Sprintf("subdomain %q already claimed cluster-wide", subdomain))
 	}
 	return false
+}
+
+// registerClusterRoute reserves entry in the shared state store (a no-op,
+// always-true success when running single-node) and, on success, appends
+// it to client.clusterRoutes so the heartbeat loop keeps refreshing its TTL
+// (H1). NodeID/NodeAddr are filled in from the server's own config. Returns
+// (false, ErrSubdomainConflict-wrapping err) only for a genuine live
+// conflict; a state-store error unrelated to conflict resolution is logged
+// and treated as non-fatal (matches the previous behavior — losing cluster
+// visibility temporarily is preferable to rejecting every connection
+// whenever Redis hiccups).
+func (s *Server) registerClusterRoute(client *ClientSession, entry RouteEntry) (bool, error) {
+	if s.stateStore == nil {
+		return true, nil
+	}
+
+	entry.NodeID = s.config.ClusterNodeID
+	entry.NodeAddr = s.config.ClusterNodeAddr
+
+	err := s.stateStore.RegisterRoute(entry)
+	if err == nil {
+		client.mu.Lock()
+		client.clusterRoutes = append(client.clusterRoutes, entry)
+		client.mu.Unlock()
+		return true, nil
+	}
+	if !errors.Is(err, ErrSubdomainConflict) {
+		log.Warn().Err(err).Str("route", entry.Key()).Msg("Cluster: failed to register route in state store")
+		return true, nil
+	}
+	return false, err
+}
+
+// unregisterClusterRoute removes entry from the state store and from
+// client.clusterRoutes, undoing registerClusterRoute. Used when an
+// individual tunnel (rather than the whole connection) is closed.
+func (s *Server) unregisterClusterRoute(client *ClientSession, routeID string) {
+	if s.stateStore == nil {
+		return
+	}
+	if err := s.stateStore.UnregisterRouteEntry(routeID); err != nil {
+		log.Warn().Err(err).Str("route", routeID).Msg("Cluster: failed to unregister route from state store")
+	}
+	client.mu.Lock()
+	for i, e := range client.clusterRoutes {
+		if e.Key() == routeID {
+			client.clusterRoutes = append(client.clusterRoutes[:i], client.clusterRoutes[i+1:]...)
+			break
+		}
+	}
+	client.mu.Unlock()
+}
+
+// registerTunnelRoutes registers a tunnel's extra routing keys (any of
+// subdomain/hostname/pathPrefix that's non-empty) in both the local Router
+// and, if clustered, the shared state store (H3). Cluster route IDs are
+// scoped to tunnelID (":sub"/":host"/":path" suffixes) so multiple tunnels
+// on the same client don't collide with each other or with the client's
+// primary connect-time subdomain entry (which uses ClientID as its
+// RouteID). On any conflict — local or cluster-wide — everything already
+// registered by this call is rolled back and a human-readable rejection
+// reason is returned; "" means every requested key was registered.
+func (s *Server) registerTunnelRoutes(client *ClientSession, tunnelID, subdomain, hostname, pathPrefix string) string {
+	if subdomain != "" {
+		if err := s.router.RegisterSubdomain(subdomain, client); err != nil {
+			return fmt.Sprintf("subdomain %q already in use", subdomain)
+		}
+		routeID := tunnelID + ":sub"
+		if ok, _ := s.registerClusterRoute(client, RouteEntry{RouteID: routeID, ClientID: client.ID, Subdomain: subdomain}); !ok {
+			s.router.UnregisterSubdomain(subdomain)
+			return fmt.Sprintf("subdomain %q already claimed cluster-wide", subdomain)
+		}
+	}
+
+	if hostname != "" {
+		if err := s.router.RegisterHostname(hostname, client); err != nil {
+			s.unregisterTunnelRoutes(client, tunnelID, subdomain, "", "")
+			return fmt.Sprintf("hostname %q already in use", hostname)
+		}
+		routeID := tunnelID + ":host"
+		if ok, _ := s.registerClusterRoute(client, RouteEntry{RouteID: routeID, ClientID: client.ID, Hostname: hostname}); !ok {
+			s.router.UnregisterHostname(hostname)
+			s.unregisterTunnelRoutes(client, tunnelID, subdomain, "", "")
+			return fmt.Sprintf("hostname %q already claimed cluster-wide", hostname)
+		}
+	}
+
+	if pathPrefix != "" {
+		if err := s.router.RegisterPath(pathPrefix, client); err != nil {
+			s.unregisterTunnelRoutes(client, tunnelID, subdomain, hostname, "")
+			return fmt.Sprintf("path prefix %q already in use", pathPrefix)
+		}
+		routeID := tunnelID + ":path"
+		if ok, _ := s.registerClusterRoute(client, RouteEntry{RouteID: routeID, ClientID: client.ID, PathPrefix: pathPrefix}); !ok {
+			s.router.UnregisterPath(pathPrefix)
+			s.unregisterTunnelRoutes(client, tunnelID, subdomain, hostname, "")
+			return fmt.Sprintf("path prefix %q already claimed cluster-wide", pathPrefix)
+		}
+	}
+
+	return ""
+}
+
+// unregisterTunnelRoutes removes the local Router entries and cluster
+// state-store entries (if any) for a tunnel's extra subdomain/hostname/path
+// routes, undoing registerTunnelRoutes. Used both when TCP port allocation
+// fails right after registration and when the tunnel is later closed
+// individually (see releaseTunnelResources).
+func (s *Server) unregisterTunnelRoutes(client *ClientSession, tunnelID, subdomain, hostname, pathPrefix string) {
+	if subdomain != "" {
+		s.router.UnregisterSubdomain(subdomain)
+		s.unregisterClusterRoute(client, tunnelID+":sub")
+	}
+	if hostname != "" {
+		s.router.UnregisterHostname(hostname)
+		s.unregisterClusterRoute(client, tunnelID+":host")
+	}
+	if pathPrefix != "" {
+		s.router.UnregisterPath(pathPrefix)
+		s.unregisterClusterRoute(client, tunnelID+":path")
+	}
 }
 
 // handleClientAuth performs the authentication handshake for a new client.
@@ -899,21 +1049,24 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 		publicURL = fmt.Sprintf("%s://%s", scheme, req.Hostname)
 	}
 
-	// Register this tunnel's subdomain route if it differs from the
-	// connection's default (which is already routed at auth time). This
-	// allows a single client connection to serve multiple subdomains, one
-	// per registered tunnel.
+	// Register this tunnel's routing keys — subdomain (if it differs from
+	// the connection's default, which is already routed at auth time),
+	// custom hostname, and path prefix — in both the local Router and, if
+	// clustered, the shared state store (H3: hostname/path routes were
+	// previously local-only, so cluster peers had no way to find them and
+	// silently 404'd cross-node hostname/path requests). A conflict on any
+	// of them, local or cluster-wide, rejects the whole registration.
+	extraSubdomain := ""
 	if subdomain != "" && subdomain != client.Subdomain {
-		if regErr := s.router.RegisterSubdomain(subdomain, client); regErr != nil {
-			log.Warn().Err(regErr).Str("subdomain", subdomain).Msg("Tunnel registration rejected: subdomain already in use")
-			resp := proto.NewRegisterResponse(false, fmt.Sprintf("subdomain %q already in use", subdomain), "", "", 0)
-			data, encErr := resp.Encode()
-			if encErr != nil {
-				return
-			}
+		extraSubdomain = subdomain
+	}
+	if failMsg := s.registerTunnelRoutes(client, tunnelID, extraSubdomain, req.Hostname, req.PathPrefix); failMsg != "" {
+		log.Warn().Str("client", client.ID).Str("tunnel_id", tunnelID).Msg("Tunnel registration rejected: " + failMsg)
+		resp := proto.NewRegisterResponse(false, failMsg, "", "", 0)
+		if data, encErr := resp.Encode(); encErr == nil {
 			_, _ = stream.Write(data)
-			return
 		}
+		return
 	}
 
 	// Allocate TCP port for TCP tunnels. Unlike HTTP tunnels (which can
@@ -927,9 +1080,7 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 		port, ln, allocErr := s.portAllocator.Allocate(context.Background())
 		if allocErr != nil {
 			log.Error().Err(allocErr).Msg("Failed to allocate TCP port")
-			if subdomain != "" && subdomain != client.Subdomain {
-				s.router.UnregisterSubdomain(subdomain)
-			}
+			s.unregisterTunnelRoutes(client, tunnelID, extraSubdomain, req.Hostname, req.PathPrefix)
 			resp := proto.NewRegisterResponse(false, fmt.Sprintf("failed to allocate TCP port: %v", allocErr), "", "", 0)
 			data, encErr := resp.Encode()
 			if encErr != nil {
@@ -962,18 +1113,6 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 	atomic.AddUint64(&s.stats.ActiveTunnels, 1)
 	if s.metrics != nil {
 		s.metrics.ActiveTunnels.Inc()
-	}
-
-	// Also register custom hostname/path if requested.
-	if req.Hostname != "" {
-		if regErr := s.router.RegisterHostname(req.Hostname, client); regErr != nil {
-			log.Warn().Err(regErr).Str("hostname", req.Hostname).Msg("Failed to register custom hostname")
-		}
-	}
-	if req.PathPrefix != "" {
-		if regErr := s.router.RegisterPath(req.PathPrefix, client); regErr != nil {
-			log.Warn().Err(regErr).Str("path_prefix", req.PathPrefix).Msg("Failed to register path prefix")
-		}
 	}
 
 	// Send response.
@@ -1139,15 +1278,11 @@ func (s *Server) releaseTunnelResources(client *ClientSession, removed *TunnelIn
 		s.portAllocator.Release(int(removed.TCPPort))
 	}
 
-	if removed.Hostname != "" {
-		s.router.UnregisterHostname(removed.Hostname)
-	}
-	if removed.PathPrefix != "" {
-		s.router.UnregisterPath(removed.PathPrefix)
-	}
+	extraSubdomain := ""
 	if removed.Subdomain != "" && removed.Subdomain != client.Subdomain {
-		s.router.UnregisterSubdomain(removed.Subdomain)
+		extraSubdomain = removed.Subdomain
 	}
+	s.unregisterTunnelRoutes(client, removed.ID, extraSubdomain, removed.Hostname, removed.PathPrefix)
 
 	atomic.AddUint64(&s.stats.ActiveTunnels, ^uint64(0))
 	if s.metrics != nil {
@@ -1730,7 +1865,7 @@ func extractIP(remoteAddr string) string {
 // Returns nil (single-node) when no cluster backend is configured.
 func initStateStore(config Config) StateStore {
 	switch config.ClusterStateBackend {
-	case "redis":
+	case ClusterBackendRedis:
 		if config.ClusterRedisAddr == "" {
 			log.Fatal().Msg("Cluster: ClusterRedisAddr must be set when using redis state backend")
 		}
@@ -1744,12 +1879,51 @@ func initStateStore(config Config) StateStore {
 		}
 		log.Info().Str("addr", config.ClusterRedisAddr).Msg("Cluster: using Redis state store")
 		return store
-	case "memory":
+	case ClusterBackendMemory:
 		log.Info().Msg("Cluster: using in-memory state store (single-node)")
 		return NewMemoryStateStore()
 	default:
 		// No clustering — operate as a single-node server.
 		return nil
+	}
+}
+
+// initAuthStore creates the appropriate auth.Store based on config.Persistence.
+func initAuthStore(config Config) auth.Store {
+	switch config.Persistence {
+	case PersistenceSQLite:
+		sqliteStore, err := auth.NewSQLiteStore(auth.SQLiteStoreConfig{
+			Path:      config.PersistencePath,
+			CreateDir: true,
+		})
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to initialize SQLite store")
+		}
+		log.Info().
+			Str("path", config.PersistencePath).
+			Msg("Using SQLite persistence for auth data")
+		return sqliteStore
+	case PersistenceRedis:
+		// H5: default to the cluster Redis connection when a dedicated
+		// one isn't configured, so enabling clustering with a Redis
+		// backend and shared revocation only requires one Redis address
+		// in the common case of using a single instance for both.
+		addr, password, db := config.AuthRedisAddr, config.AuthRedisPassword, config.AuthRedisDB
+		if addr == "" {
+			addr, password, db = config.ClusterRedisAddr, config.ClusterRedisPassword, config.ClusterRedisDB
+		}
+		if addr == "" {
+			log.Fatal().Msg("Auth: --persistence redis requires --auth-redis-addr or --cluster-redis-addr")
+		}
+		redisStore, err := auth.NewRedisStore(auth.RedisStoreConfig{Addr: addr, Password: password, DB: db})
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to initialize Redis auth store")
+		}
+		log.Info().Str("addr", addr).Msg("Using Redis persistence for auth data (shared token revocation, H5)")
+		return redisStore
+	default:
+		log.Info().Msg("Using in-memory storage for auth data (no persistence)")
+		return auth.NewMemoryStore()
 	}
 }
 

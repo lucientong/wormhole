@@ -99,9 +99,21 @@ func (a *AdminAPI) maxBodySize(next http.Handler, maxBytes int64) http.Handler {
 
 // HealthResponse is the response for the health endpoint.
 type HealthResponse struct {
-	Status  string `json:"status"`
-	Version string `json:"version,omitempty"`
-	Uptime  string `json:"uptime"`
+	Status  string         `json:"status"`
+	Version string         `json:"version,omitempty"`
+	Uptime  string         `json:"uptime"`
+	Cluster *ClusterHealth `json:"cluster,omitempty"`
+}
+
+// ClusterHealth reports cluster state-store connectivity (H9). Without it,
+// a Redis outage only ever showed up as scattered WARN log lines — there
+// was no queryable signal an operator or monitoring system could poll to
+// tell "this node can't currently reach the shared state store" apart from
+// a genuine full outage. Omitted entirely on single-node deployments (no
+// state store configured at all).
+type ClusterHealth struct {
+	NodeID            string `json:"node_id"`
+	StateStoreHealthy bool   `json:"state_store_healthy"`
 }
 
 // StatsResponse is the response for the stats endpoint.
@@ -151,6 +163,18 @@ func (a *AdminAPI) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	resp := HealthResponse{
 		Status: "healthy",
 		Uptime: time.Since(a.server.stats.StartTime).Round(time.Second).String(),
+	}
+
+	// H9: surface cluster state-store connectivity instead of leaving
+	// operators to infer a Redis outage purely from log lines.
+	if configured, healthy := a.server.stateStoreHealth(); configured {
+		resp.Cluster = &ClusterHealth{
+			NodeID:            a.server.config.ClusterNodeID,
+			StateStoreHealthy: healthy,
+		}
+		if !healthy {
+			resp.Status = "degraded"
+		}
 	}
 
 	writeJSON(w, http.StatusOK, resp)

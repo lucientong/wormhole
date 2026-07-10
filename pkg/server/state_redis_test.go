@@ -147,3 +147,125 @@ func TestRedisStateStore_EvictDeadNodes_NoOp(t *testing.T) {
 	store, _ := newTestRedisStateStore(t)
 	assert.NoError(t, store.EvictDeadNodes(time.Minute))
 }
+
+// TestRedisStateStore_HostnameRoute verifies H3: custom-hostname routes are
+// now indexed in Redis (previously only subdomains were), so a cluster
+// peer can find a client's hostname-based tunnel via LookupByHostname.
+func TestRedisStateStore_HostnameRoute(t *testing.T) {
+	store, _ := newTestRedisStateStore(t)
+
+	err := store.RegisterRoute(RouteEntry{
+		RouteID: "tunnel-1:host", ClientID: "client-a", Hostname: "custom.example.com", NodeID: "node-1",
+	})
+	require.NoError(t, err)
+
+	entry, err := store.LookupByHostname("CUSTOM.example.com") // case-insensitive
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Equal(t, "client-a", entry.ClientID)
+
+	// Not found.
+	entry, err = store.LookupByHostname("nope.example.com")
+	require.NoError(t, err)
+	assert.Nil(t, entry)
+}
+
+// TestRedisStateStore_PathPrefixRoute_LongestMatch verifies H3's
+// longest-prefix-match semantics for path routes, mirroring Router.matchPath.
+func TestRedisStateStore_PathPrefixRoute_LongestMatch(t *testing.T) {
+	store, _ := newTestRedisStateStore(t)
+
+	require.NoError(t, store.RegisterRoute(RouteEntry{RouteID: "short", ClientID: "c1", PathPrefix: "/api", NodeID: "n1"}))
+	require.NoError(t, store.RegisterRoute(RouteEntry{RouteID: "long", ClientID: "c2", PathPrefix: "/api/v2", NodeID: "n1"}))
+
+	entry, err := store.LookupByPathPrefix("/api/v2/widgets")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Equal(t, "c2", entry.ClientID, "longest matching prefix should win")
+
+	entry, err = store.LookupByPathPrefix("/api/v1/widgets")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Equal(t, "c1", entry.ClientID)
+
+	entry, err = store.LookupByPathPrefix("/unrelated")
+	require.NoError(t, err)
+	assert.Nil(t, entry)
+}
+
+// TestRedisStateStore_MultipleRoutesPerClient verifies H3: a single client
+// can register a subdomain, a hostname, and a path-prefix route
+// simultaneously (distinguished by RouteID), and UnregisterRoute cleans up
+// all of them via the wormhole:clientroutes:<clientID> index — without a
+// separate call per RouteID and without scanning the whole keyspace.
+func TestRedisStateStore_MultipleRoutesPerClient(t *testing.T) {
+	store, _ := newTestRedisStateStore(t)
+
+	require.NoError(t, store.RegisterRoute(RouteEntry{ClientID: "c1", Subdomain: "sub1", NodeID: "n1"}))
+	require.NoError(t, store.RegisterRoute(RouteEntry{RouteID: "t1:host", ClientID: "c1", Hostname: "host1.example.com", NodeID: "n1"}))
+	require.NoError(t, store.RegisterRoute(RouteEntry{RouteID: "t1:path", ClientID: "c1", PathPrefix: "/api", NodeID: "n1"}))
+
+	routes, err := store.ListRoutes()
+	require.NoError(t, err)
+	assert.Len(t, routes, 3)
+
+	require.NoError(t, store.UnregisterRoute("c1"))
+
+	entry, _ := store.LookupBySubdomain("sub1")
+	assert.Nil(t, entry, "subdomain route should be gone")
+	entry, _ = store.LookupByHostname("host1.example.com")
+	assert.Nil(t, entry, "hostname route should be gone")
+	entry, _ = store.LookupByPathPrefix("/api/x")
+	assert.Nil(t, entry, "path route should be gone")
+
+	routes, err = store.ListRoutes()
+	require.NoError(t, err)
+	assert.Empty(t, routes)
+}
+
+// TestRedisStateStore_UnregisterRouteEntry verifies that removing a single
+// route by RouteID (e.g. closing one tunnel) leaves the client's other
+// routes — including its primary connect-time subdomain — intact.
+func TestRedisStateStore_UnregisterRouteEntry(t *testing.T) {
+	store, _ := newTestRedisStateStore(t)
+
+	require.NoError(t, store.RegisterRoute(RouteEntry{ClientID: "c1", Subdomain: "sub1", NodeID: "n1"}))
+	require.NoError(t, store.RegisterRoute(RouteEntry{RouteID: "t1:host", ClientID: "c1", Hostname: "host1.example.com", NodeID: "n1"}))
+
+	require.NoError(t, store.UnregisterRouteEntry("t1:host"))
+
+	entry, _ := store.LookupByHostname("host1.example.com")
+	assert.Nil(t, entry, "closed tunnel's hostname route should be gone")
+	entry, _ = store.LookupBySubdomain("sub1")
+	require.NotNil(t, entry, "the connection's primary subdomain route must survive")
+	assert.Equal(t, "c1", entry.ClientID)
+}
+
+// TestRedisStateStore_HostnameConflict verifies S3/H6's conflict rejection
+// also applies to hostname routes (H3), not just subdomains.
+func TestRedisStateStore_HostnameConflict(t *testing.T) {
+	store, _ := newTestRedisStateStore(t)
+
+	require.NoError(t, store.RegisterRoute(RouteEntry{RouteID: "t1:host", ClientID: "c1", Hostname: "shared.example.com", NodeID: "n1"}))
+
+	err := store.RegisterRoute(RouteEntry{RouteID: "t2:host", ClientID: "c2", Hostname: "shared.example.com", NodeID: "n2"})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrSubdomainConflict)
+}
+
+// TestRedisStateStore_RegisterRoute_NoRoutingKeySet verifies that an entry
+// with none of Subdomain/Hostname/PathPrefix set is rejected outright
+// rather than silently succeeding with an unusable/unindexed reservation.
+func TestRedisStateStore_RegisterRoute_NoRoutingKeySet(t *testing.T) {
+	store, _ := newTestRedisStateStore(t)
+	err := store.RegisterRoute(RouteEntry{ClientID: "c1", NodeID: "n1"})
+	assert.Error(t, err)
+}
+
+// TestRedisStateStore_UnregisterRouteEntry_Missing verifies that
+// unregistering a RouteID that doesn't exist is a harmless no-op, matching
+// UnregisterRoute's existing idempotent-cleanup behavior.
+func TestRedisStateStore_UnregisterRouteEntry_Missing(t *testing.T) {
+	store, _ := newTestRedisStateStore(t)
+	assert.NoError(t, store.UnregisterRouteEntry("does-not-exist"))
+}

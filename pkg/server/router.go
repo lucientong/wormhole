@@ -34,13 +34,28 @@ func NewRouter(domain string) *Router {
 	}
 }
 
-// RegisterSubdomain registers a subdomain route for a client session.
+// isStaleOwner reports whether an existing route owner is safe to reclaim:
+// a different *ClientSession* pointer whose underlying mux has already
+// gone away. A nil Mux (as in some unit tests that construct a
+// *ClientSession by hand) is never treated as stale, to avoid accidentally
+// reclaiming routes in tests that don't wire up a real Mux.
+func isStaleOwner(existing, incoming *ClientSession) bool {
+	return existing != incoming && existing.Mux != nil && existing.Mux.IsClosed()
+}
+
+// RegisterSubdomain registers a subdomain route for a client session. If
+// the subdomain is currently held by a session whose connection has already
+// died (Mux.IsClosed()) but hasn't been cleaned up yet server-side, the
+// stale entry is reclaimed instead of rejecting the new registration (H10:
+// otherwise a client reconnecting faster than the old session's death is
+// detected — e.g. a network blip with no clean FIN — would be wrongly
+// told its own subdomain is "already registered").
 func (r *Router) RegisterSubdomain(subdomain string, client *ClientSession) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	subdomain = strings.ToLower(subdomain)
-	if _, exists := r.subdomains[subdomain]; exists {
+	if existing, exists := r.subdomains[subdomain]; exists && !isStaleOwner(existing, client) {
 		return fmt.Errorf("subdomain %q already registered", subdomain)
 	}
 
@@ -49,12 +64,13 @@ func (r *Router) RegisterSubdomain(subdomain string, client *ClientSession) erro
 }
 
 // RegisterHostname registers a custom hostname route for a client session.
+// See RegisterSubdomain's doc comment for the stale-owner reclaim rule (H10).
 func (r *Router) RegisterHostname(hostname string, client *ClientSession) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	hostname = strings.ToLower(hostname)
-	if _, exists := r.hostnames[hostname]; exists {
+	if existing, exists := r.hostnames[hostname]; exists && !isStaleOwner(existing, client) {
 		return fmt.Errorf("hostname %q already registered", hostname)
 	}
 
@@ -63,12 +79,13 @@ func (r *Router) RegisterHostname(hostname string, client *ClientSession) error 
 }
 
 // RegisterPath registers a path-based route for a client session.
+// See RegisterSubdomain's doc comment for the stale-owner reclaim rule (H10).
 func (r *Router) RegisterPath(pathPrefix string, client *ClientSession) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	pathPrefix = normalizePath(pathPrefix)
-	if _, exists := r.paths[pathPrefix]; exists {
+	if existing, exists := r.paths[pathPrefix]; exists && !isStaleOwner(existing, client) {
 		return fmt.Errorf("path %q already registered", pathPrefix)
 	}
 
