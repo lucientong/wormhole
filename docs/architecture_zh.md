@@ -22,6 +22,7 @@
 - [HA / 多节点控制面](#ha--多节点控制面)
 - [健壮性与协议加固 (P3-6 批次 A)](#健壮性与协议加固-p3-6-批次-a)
 - [热路径分配池化 (P3-6 批次 B)](#热路径分配池化-p3-6-批次-b)
+- [context 贯通 (P3-6 批次 C)](#context-贯通-p3-6-批次-c)
 - [数据流总结](#数据流总结)
 
 ---
@@ -1310,6 +1311,44 @@ P3-6 第二个子批次针对 `review-v0.6.md` 中标出的、影响面最大的
 这不是性能改动，而是在审查同一批转发代码时顺带发现的问题：`forwardHTTPWithInspect` 的注释声称请求/响应正文"受 MaxBodySize 限制"，但实际的读取（`io.ReadAll(httpReq.Body)`、`io.ReadAll(resp.Body)`）根本没有任何限制——只要开启 `--inspector` 并收到一次足够大的上传/下载，就会无视配置的上限把它整个缓冲进内存。现在两处读取都包了一层 `io.LimitReader(body, MaxBodySize+1)`（这个 `+1` 让下游的截断检测逻辑能区分"刚好等于上限"和"超过上限"，与 `Inspector.Wrap` 已经在用的约定一致）。`Inspector` 新增了 `MaxBodySize()` 访问器，方便 `inspector` 包外的调用方按 `Capture` 实际会存储的口径来限定自己的读取。
 
 这也意味着超过 `MaxBodySize` 的正文会在转发给本地服务**之前**就被截断，而不只是在记录之前——这和 `Inspector.Wrap` 早就在做的取舍一样，而且只影响开启了检查器的这条代码路径：不带检查的中继/P2P 转发（`forwardRawTCP`、`dialAndProxy`，见上面的 DP-11）未受影响，仍然完全不设上限，因为 Inspector 本身的定位是调试辅助工具，而不是给生产环境大流量场景开启的东西。
+
+---
+
+## context 贯通 (P3-6 批次 C)
+
+P3-6 第三个子批次收尾了 `review-v0.6.md` 中的 DP-05/DP-06：服务端调用树深处的若干操作直接使用 `context.Background()`，导致进行中的 `Shutdown()` 完全无法打断它们——每一个都只会在自身的固定超时（例如 `AuthTimeout`）耗尽之后才返回，不管那需要多久。上帝对象拆分（批次 D）仍是独立的、更靠后的子批次。
+
+### 服务端根 context (DP-05)
+
+`Server.Start(ctx)` 现在把 `s.rootCtx, s.rootCancel = context.WithCancel(ctx)` 作为第一步执行。`Shutdown()` 在 `close(s.closeCh)` 之后立刻调用 `s.rootCancel()`——发生在优雅关闭 HTTP/管理监听、关闭其他附属资源**之前**——这样任何仍在监听这个 context 的 goroutine 都能尽早看到取消信号。
+
+新增的 `serverCtx()` 访问器：已设置 `s.rootCtx` 时返回它，否则返回 `context.Background()`。这个兜底在实践中很重要：`pkg/server` 的大量单测都是直接调用 handler 方法（`authenticateClient`、`handleRegister`、`handleTCPConnection` 等），从未经过 `Start`，`serverCtx()` 能让这些测试原样继续工作，而不需要每个测试都先伪造一个根 context。
+
+此前硬编码 `context.Background()` 的 4 处调用点现在改用 `s.serverCtx()`：
+
+| 调用点 | 控制的操作 |
+|--------|-----------|
+| `authenticateClient` | 认证握手初始流的 `AcceptStreamContext` 超时 |
+| `handleRegister` | 为 TCP 隧道分配监听端口时的 `portAllocator.Allocate` |
+| `notifyPeerOfP2P` | 打开通知 P2P 对端的流时的 `OpenStreamContext` |
+| `handleTCPConnection` | 打开到 client 的每连接流时的 `OpenStreamContext` |
+
+这些改动在正常运行期间不改变任何行为——`s.serverCtx()` 在 `Shutdown` 取消它之前，行为与 `context.Background()` 完全一致。影响只体现在关闭路径上：一个卡在握手中途的 client，或一个正等待端口分配的 TCP 隧道连接，不再需要拖着优雅关闭等到自身超时耗尽。
+
+### 感知 ctx 取消的流 I/O (DP-06)
+
+`OpenStreamContext(ctx)` 本身只在发送握手帧之前检查过一次 `ctx`——它从不阻塞等待回复，这部分本来就没问题。DP-06 指出的缺口在下游：调用方一旦拿到返回的 `*Stream`，普通的 `Read`/`Write` 方法就完全无法感知任何 context 了。它们只能通过 `SetDeadline`/`SetReadDeadline`/`SetWriteDeadline`，或者流/mux 直接关闭来打断——如果调用方是用一个可取消的 `ctx` 打开流的，这个取消能力在 `OpenStreamContext` 返回的那一刻就丢失了。
+
+`pkg/tunnel/stream.go` 现在暴露 `ReadContext(ctx, p)` 和 `WriteContext(ctx, p)`；`Read`/`Write` 变成薄封装，把 `context.Background()` 传给它们。这里的关键设计约束是：数据面热路径（`io.CopyBuffer` 之类，永远调用不带 ctx 的 `Read`/`Write`）不能因此多付出任何代价。这正是为什么 ctx 感知能力是按调用逐次选择加入的，而不是直接砌进阻塞等待本身：
+
+- 如果 `ctx.Done()` 为 `nil`（`context.Background()` 就是这样），不会启动任何 watcher goroutine，方法行为与改动前完全一致——热路径零额外开销。
+- 如果 `ctx` 是可取消的，一个短生命周期的 goroutine 会在这次调用期间监听 `ctx.Done()`，一旦触发就对相应的 `sync.Cond`（`readCond`/`sendCond`）调用 `Broadcast()`，提前唤醒被阻塞的等待者；读/写循环在每次被唤醒时都会检查 `ctx.Err()`（在既有的超时/关闭/窗口检查之外），一旦设置就立刻返回。
+
+`waitForSendWindow` 是从 `WriteContext` 中拆出来的，纯粹是为了让其圈复杂度落在项目 `golangci-lint`（`gocyclo`）的阈值以内——不包含任何新行为，只是既有的发送窗口等待循环。
+
+`authenticateClient` 读取传入的 `AuthRequest` 时现在调用 `stream.ReadContext(ctx, buf)`，用的正是前面 DP-05 派生自 `s.serverCtx()` 的同一个 `ctx`，把 DP-05 和 DP-06 串联到了审查报告特别指出的这一个调用点上：`TestServer_AuthenticateClient_ServerCtxCancelUnblocks` 把 `AuthTimeout` 设为 30 秒，在握手阻塞等待 client 的 `AuthRequest` 期间取消服务端根 context，断言该调用在几十毫秒内以 `context.Canceled` 返回，而不是等满 30 秒。
+
+`ReadContext`/`WriteContext` 出现之后，`golangci-lint` 的 `contextcheck` 分析器在 `pkg/client/client.go` 里发现了 14 处同样的模式——每一个控制面 RPC（`authenticate`、`registerTunnel`、`registerOneTunnel`、`sendPing`、`sendP2POffer`、`sendP2PResult`、`RequestStats`、`CloseTunnel`）都已经接收了 `ctx` 参数，却仍然调用不带 ctx 的 `Read`/`Write`。这些正是 DP-06 同一个缺口在客户端侧的镜像——一个被取消的 `ctx`（比如来自 `Client.Close()` 或调用方指定的 deadline）此前一样无法打断进行中的控制面 RPC，跟服务端的情况一样。这 14 处全部改为对应的 `*Context` 变体，用的就是各自函数体里已经有的那个 `ctx`。
 
 ---
 

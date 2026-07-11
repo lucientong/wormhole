@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"sync"
 	"testing"
@@ -428,6 +429,127 @@ func TestStream_ReadTimeout(t *testing.T) {
 	assert.ErrorIs(t, err, ErrTimeout)
 	assert.True(t, elapsed >= 40*time.Millisecond, "Should have waited for timeout")
 	assert.True(t, elapsed < 200*time.Millisecond, "Should not wait too long")
+}
+
+// TestStream_ReadContext_CancelUnblocks verifies that ReadContext (DP-06)
+// returns ctx.Err() promptly when ctx is canceled while blocked waiting
+// for data, instead of only being interruptible via SetReadDeadline or
+// closing the stream/mux.
+func TestStream_ReadContext_CancelUnblocks(t *testing.T) {
+	mux := &Mux{
+		streams:    make(map[uint32]*Stream),
+		closeCh:    make(chan struct{}),
+		sendCh:     make(chan *Frame, 64),
+		config:     DefaultMuxConfig(),
+		codec:      NewFrameCodec(),
+		streamLock: sync.RWMutex{},
+	}
+
+	s := newStream(1, DefaultStreamConfig(), mux)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	buf := make([]byte, 10)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := s.ReadContext(ctx, buf)
+		errCh <- err
+	}()
+
+	// Give the goroutine a moment to block in Cond.Wait before canceling.
+	time.Sleep(20 * time.Millisecond)
+	start := time.Now()
+	cancel()
+
+	select {
+	case err := <-errCh:
+		assert.ErrorIs(t, err, context.Canceled)
+		assert.Less(t, time.Since(start), 500*time.Millisecond, "ReadContext should unblock promptly on cancel")
+	case <-time.After(1 * time.Second):
+		t.Fatal("ReadContext did not unblock after ctx cancellation")
+	}
+}
+
+// TestStream_ReadContext_AlreadyCanceled verifies that ReadContext returns
+// immediately without blocking when ctx is canceled up front.
+func TestStream_ReadContext_AlreadyCanceled(t *testing.T) {
+	mux := &Mux{
+		streams:    make(map[uint32]*Stream),
+		closeCh:    make(chan struct{}),
+		sendCh:     make(chan *Frame, 64),
+		config:     DefaultMuxConfig(),
+		codec:      NewFrameCodec(),
+		streamLock: sync.RWMutex{},
+	}
+
+	s := newStream(1, DefaultStreamConfig(), mux)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	buf := make([]byte, 10)
+	n, err := s.ReadContext(ctx, buf)
+	assert.Equal(t, 0, n)
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+// TestStream_ReadContext_BackgroundStillWorks verifies Read (which
+// delegates to ReadContext with context.Background()) is unaffected by
+// the DP-06 change: no watcher goroutine is spawned (Done() is nil) and
+// data already in the buffer is returned normally.
+func TestStream_ReadContext_BackgroundStillWorks(t *testing.T) {
+	mux := &Mux{
+		streams:    make(map[uint32]*Stream),
+		closeCh:    make(chan struct{}),
+		sendCh:     make(chan *Frame, 64),
+		config:     DefaultMuxConfig(),
+		codec:      NewFrameCodec(),
+		streamLock: sync.RWMutex{},
+	}
+
+	s := newStream(1, DefaultStreamConfig(), mux)
+	require.NoError(t, s.receiveData([]byte("hello")))
+
+	buf := make([]byte, 10)
+	n, err := s.Read(buf)
+	require.NoError(t, err)
+	assert.Equal(t, "hello", string(buf[:n]))
+}
+
+// TestStream_WriteContext_CancelUnblocks verifies that WriteContext
+// (DP-06) returns ctx.Err() promptly when ctx is canceled while blocked
+// waiting for send-window space to free up.
+func TestStream_WriteContext_CancelUnblocks(t *testing.T) {
+	mux := &Mux{
+		streams:    make(map[uint32]*Stream),
+		closeCh:    make(chan struct{}),
+		sendCh:     make(chan *Frame, 64),
+		config:     DefaultMuxConfig(),
+		codec:      NewFrameCodec(),
+		streamLock: sync.RWMutex{},
+	}
+
+	// Zero-size window: Write blocks immediately waiting for space, and
+	// nothing here ever grants any, so mux.sendData is never invoked.
+	cfg := StreamConfig{WindowSize: 0, MaxWindowSize: 0, ReadBufferSize: 1024}
+	s := newStream(1, cfg, mux)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := s.WriteContext(ctx, []byte("hello"))
+		errCh <- err
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	start := time.Now()
+	cancel()
+
+	select {
+	case err := <-errCh:
+		assert.ErrorIs(t, err, context.Canceled)
+		assert.Less(t, time.Since(start), 500*time.Millisecond, "WriteContext should unblock promptly on cancel")
+	case <-time.After(1 * time.Second):
+		t.Fatal("WriteContext did not unblock after ctx cancellation")
+	}
 }
 
 // TestStream_WriteTimeout verifies that Write returns ErrTimeout when

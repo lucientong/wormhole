@@ -22,6 +22,7 @@
 - [HA / Multi-Node Control Plane](#ha--multi-node-control-plane)
 - [Robustness & Protocol Hardening (P3-6 Batch A)](#robustness--protocol-hardening-p3-6-batch-a)
 - [Hot-Path Allocation Pooling (P3-6 Batch B)](#hot-path-allocation-pooling-p3-6-batch-b)
+- [Context Propagation (P3-6 Batch C)](#context-propagation-p3-6-batch-c)
 - [Data Flow Summary](#data-flow-summary)
 
 ---
@@ -1331,6 +1332,44 @@ Measured with a benchmark pair (`BenchmarkIOCopy_Baseline` vs `BenchmarkCopyWith
 Not a performance change, but found while auditing the same forwarding code: `forwardHTTPWithInspect`'s comment claimed request/response bodies were "limited by MaxBodySize," but the actual reads (`io.ReadAll(httpReq.Body)`, `io.ReadAll(resp.Body)`) had no such limit — enabling `--inspector` and receiving one sufficiently large upload/download would buffer it entirely in memory regardless of the configured cap. Both reads are now wrapped in `io.LimitReader(body, MaxBodySize+1)` (the `+1` lets the truncation-detection logic downstream distinguish "exactly at the limit" from "over it," same convention `Inspector.Wrap` already uses). `Inspector` gained a `MaxBodySize()` accessor so callers outside the `inspector` package can size their own reads consistently with what `Capture` will store.
 
 This does mean a body larger than `MaxBodySize` is truncated *before* being forwarded to the local service, not just before being recorded — the same trade-off `Inspector.Wrap` already makes, and one specific to the inspector code path: relay/P2P forwarding without inspection (`forwardRawTCP`, `dialAndProxy`, DP-11 above) is untouched and remains fully unbounded, since the inspector is documented as a debugging aid, not something you'd enable for large-payload production traffic.
+
+---
+
+## Context Propagation (P3-6 Batch C)
+
+The third P3-6 sub-batch closed DP-05/DP-06 from `review-v0.6.md`: several operations deep in the server's handler tree used `context.Background()` directly, so a `Shutdown()` in progress had no way to interrupt them — each one would only return once its own fixed timeout (e.g. `AuthTimeout`) elapsed, however long that took. Batch D (god-object decomposition) remains a separate, later sub-batch.
+
+### Server Root Context (DP-05)
+
+`Server.Start(ctx)` now derives `s.rootCtx, s.rootCancel = context.WithCancel(ctx)` as its very first step. `Shutdown()` calls `s.rootCancel()` immediately after `close(s.closeCh)` — before draining the HTTP/admin servers or closing ancillary resources — so every goroutine still selecting on that context sees the cancellation as early as possible.
+
+A new `serverCtx()` accessor returns `s.rootCtx` if set, or `context.Background()` otherwise. The fallback matters in practice: most of `pkg/server`'s test suite calls handler methods (`authenticateClient`, `handleRegister`, `handleTCPConnection`, ...) directly against a `Server` value that never went through `Start`, and `serverCtx()` keeps those working unchanged instead of requiring every test to first fake a root context.
+
+Four call sites that previously hardcoded `context.Background()` now call `s.serverCtx()`:
+
+| Call site | What it gates |
+|-----------|----------------|
+| `authenticateClient` | `AcceptStreamContext` timeout for the initial auth handshake stream |
+| `handleRegister` | `portAllocator.Allocate` when provisioning a TCP tunnel's listener port |
+| `notifyPeerOfP2P` | `OpenStreamContext` when opening the notification stream to a P2P peer |
+| `handleTCPConnection` | `OpenStreamContext` when opening the per-connection stream to the client |
+
+None of these change behavior during normal operation — `s.serverCtx()` behaves exactly like `context.Background()` until `Shutdown` cancels it. The effect is purely on the shutdown path: a client mid-handshake, or a TCP tunnel connection waiting on port allocation, no longer holds up graceful shutdown for the length of its own timeout.
+
+### Context-Aware Stream I/O (DP-06)
+
+`OpenStreamContext(ctx)` itself only ever checked `ctx` once, before sending the stream's handshake frame — it never blocked waiting for a reply, so that part was already correct. The gap DP-06 identified was downstream: once a caller had the resulting `*Stream`, the plain `Read`/`Write` methods had no way to observe a context at all. They could only be interrupted via `SetDeadline`/`SetReadDeadline`/`SetWriteDeadline` or by the stream/mux closing outright — a caller that opened the stream with a cancelable `ctx` lost that cancellation the moment `OpenStreamContext` returned.
+
+`pkg/tunnel/stream.go` now exposes `ReadContext(ctx, p)` and `WriteContext(ctx, p)`; `Read`/`Write` are thin wrappers that delegate to them with `context.Background()`. The key design constraint: the data-plane hot path (`io.CopyBuffer` and friends, which always call the ctx-less `Read`/`Write`) must not pay anything extra for this. That's why the ctx-awareness is opt-in per call rather than baked into the blocking wait itself:
+
+- If `ctx.Done()` is `nil` (true for `context.Background()`), no watcher goroutine is spawned and the method behaves exactly as before — zero added cost on the hot path.
+- If `ctx` is cancelable, a short-lived goroutine watches `ctx.Done()` for the duration of the call and calls `Broadcast()` on the relevant `sync.Cond` (`readCond`/`sendCond`) to wake up a blocked waiter early; the read/write loop then checks `ctx.Err()` on each wakeup (in addition to the existing deadline/close/window checks) and returns it immediately if set.
+
+`waitForSendWindow` was split out of `WriteContext` purely to keep its cyclomatic complexity within the project's `golangci-lint` (`gocyclo`) threshold — it holds no new behavior, just the existing send-window wait loop.
+
+`authenticateClient`'s read of the incoming `AuthRequest` now calls `stream.ReadContext(ctx, buf)` using the same `ctx` derived from `s.serverCtx()` above, chaining DP-05 and DP-06 together for the one call site the review specifically called out: `TestServer_AuthenticateClient_ServerCtxCancelUnblocks` sets `AuthTimeout` to 30s, cancels the server's root context while the handshake is blocked waiting for the client's `AuthRequest`, and asserts the call returns `context.Canceled` within milliseconds rather than the full 30 seconds.
+
+Once `ReadContext`/`WriteContext` existed, `golangci-lint`'s `contextcheck` analyzer flagged the same pattern in 14 places across `pkg/client/client.go` — every control-plane RPC (`authenticate`, `registerTunnel`, `registerOneTunnel`, `sendPing`, `sendP2POffer`, `sendP2PResult`, `RequestStats`, `CloseTunnel`) already received a `ctx` parameter but still called the plain `Read`/`Write`. These are the client-side mirror of the same DP-06 gap — a canceled `ctx` (e.g. from `Client.Close()` or a caller-supplied deadline) couldn't interrupt an in-flight control RPC any more than it could on the server. All 14 were switched to the `*Context` variants using the `ctx` already in scope.
 
 ---
 

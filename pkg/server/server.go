@@ -98,6 +98,30 @@ type Server struct {
 	closed  uint32
 	closeCh chan struct{}
 	closeWg sync.WaitGroup
+
+	// rootCtx/rootCancel back the lifecycle context handed to hot-path
+	// operations deep in the call tree (auth handshake, port allocation,
+	// P2P notification, TCP tunnel stream open — DP-05) so Shutdown can
+	// interrupt them immediately instead of leaving them to block out
+	// their own fixed timeouts. Set by Start; nil until then, so
+	// serverCtx() falls back to context.Background() for callers (mostly
+	// unit tests) that invoke handlers directly without Start.
+	rootCtx    context.Context
+	rootCancel context.CancelFunc
+}
+
+// serverCtx returns the server's root lifecycle context (DP-05):
+// derived from the ctx passed to Start and canceled as the first step of
+// Shutdown, so long-running or blocking operations initiated deep in the
+// handler call tree (auth handshake waits, TCP port allocation, P2P
+// notification stream opens) observe cancellation immediately instead of
+// only via their own fixed timeouts. Returns context.Background() if
+// called before Start (e.g. tests invoking handlers directly).
+func (s *Server) serverCtx() context.Context {
+	if s.rootCtx != nil {
+		return s.rootCtx
+	}
+	return context.Background()
 }
 
 // ClientSession represents a connected client.
@@ -321,6 +345,12 @@ func applyClusterNodeIDDefault(config *Config) {
 
 // Start starts the server.
 func (s *Server) Start(ctx context.Context) error {
+	// DP-05: derive the root lifecycle context up front so every
+	// goroutine spawned below (and the handlers they call, several
+	// layers deep) can observe cancellation the instant Shutdown runs,
+	// rather than only via their own AuthTimeout/etc. deadlines.
+	s.rootCtx, s.rootCancel = context.WithCancel(ctx)
+
 	log.Info().
 		Str("tunnel_addr", s.config.ListenAddr).
 		Str("http_addr", s.config.HTTPAddr).
@@ -452,6 +482,13 @@ func (s *Server) Shutdown() error {
 
 	log.Info().Msg("Shutting down server...")
 	close(s.closeCh)
+	// DP-05: cancel the root context first so anything blocked on it deep
+	// in the handler tree (auth stream accept, TCP port allocation, P2P
+	// notify stream open) unblocks immediately instead of running out
+	// its own fixed timeout while the rest of Shutdown proceeds below.
+	if s.rootCancel != nil {
+		s.rootCancel()
+	}
 
 	// Close the tunnel listener directly: it's a raw net.Listener (the
 	// tunnel protocol is our own framing, not net/http), so there's no
@@ -466,6 +503,27 @@ func (s *Server) Shutdown() error {
 	// finish (up to ShutdownTimeout) before returning, so a request that's
 	// mid-flight when an operator sends SIGTERM completes normally instead
 	// of getting its connection yanked out from under it.
+	s.drainHTTPServers()
+
+	s.closeAncillaryResources()
+
+	// Close all clients.
+	s.clientLock.Lock()
+	for _, client := range s.clients {
+		_ = client.Mux.Close()
+	}
+	s.clientLock.Unlock()
+
+	s.closeWg.Wait()
+	log.Info().Msg("Server shutdown complete")
+	return nil
+}
+
+// drainHTTPServers gracefully shuts down the HTTP and admin API servers
+// within Config.ShutdownTimeout (or defaultShutdownTimeout), falling back
+// to a hard Close for whichever one doesn't drain in time. Split out of
+// Shutdown to keep its cyclomatic complexity in check.
+func (s *Server) drainHTTPServers() {
 	shutdownTimeout := s.config.ShutdownTimeout
 	if shutdownTimeout <= 0 {
 		shutdownTimeout = defaultShutdownTimeout
@@ -491,44 +549,34 @@ func (s *Server) Shutdown() error {
 		})
 	}
 	httpShutdownWg.Wait()
+}
 
-	// Close port allocator.
+// closeAncillaryResources closes the server's supporting subsystems
+// (port allocator, rate limiter, authenticator, audit store, cluster
+// state store) as part of Shutdown. Split out to keep Shutdown's
+// cyclomatic complexity in check.
+func (s *Server) closeAncillaryResources() {
 	if s.portAllocator != nil {
 		s.portAllocator.CloseAll()
 	}
 
-	// Close rate limiter.
 	if s.rateLimiter != nil {
 		s.rateLimiter.Close()
 	}
 
-	// Close authenticator (and its store).
 	if s.authenticator != nil {
 		_ = s.authenticator.Close()
 	}
 
-	// Close audit store.
 	if s.auditLogger != nil {
 		if store := s.auditLogger.Store(); store != nil {
 			_ = store.Close()
 		}
 	}
 
-	// Close cluster state store.
 	if s.stateStore != nil {
 		_ = s.stateStore.Close()
 	}
-
-	// Close all clients.
-	s.clientLock.Lock()
-	for _, client := range s.clients {
-		_ = client.Mux.Close()
-	}
-	s.clientLock.Unlock()
-
-	s.closeWg.Wait()
-	log.Info().Msg("Server shutdown complete")
-	return nil
 }
 
 // acceptTunnelLoop accepts new client connections.
@@ -904,8 +952,11 @@ func (s *Server) handleClientAuth(mux *tunnel.Mux, sessionID, clientIP, remoteAd
 // It waits for an AuthRequest on the first stream and responds with AuthResponse.
 // The sessionID parameter is the pre-generated ID to include in the response.
 func (s *Server) authenticateClient(mux *tunnel.Mux, sessionID string) (*auth.Claims, string, error) {
-	// Accept the auth stream with a timeout.
-	ctx, cancel := context.WithTimeout(context.Background(), s.config.AuthTimeout)
+	// Accept the auth stream with a timeout, bounded on the short side by
+	// AuthTimeout and on the long side by server shutdown (DP-05): a
+	// client mid-handshake when the server shuts down no longer holds up
+	// the accept for the full AuthTimeout.
+	ctx, cancel := context.WithTimeout(s.serverCtx(), s.config.AuthTimeout)
 	defer cancel()
 
 	stream, err := mux.AcceptStreamContext(ctx)
@@ -919,9 +970,11 @@ func (s *Server) authenticateClient(mux *tunnel.Mux, sessionID string) (*auth.Cl
 		return nil, "", fmt.Errorf("set auth deadline: %w", deadlineErr)
 	}
 
-	// Read auth request.
+	// Read auth request. ReadContext (DP-06) additionally wakes up on ctx
+	// cancellation, so a shutdown mid-handshake unblocks this immediately
+	// rather than waiting out the AuthTimeout deadline set above.
 	buf := make([]byte, 4096)
-	n, err := stream.Read(buf)
+	n, err := stream.ReadContext(ctx, buf)
 	if err != nil {
 		return nil, "", fmt.Errorf("read auth request: %w", err)
 	}
@@ -1206,7 +1259,7 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 	// so the client can surface the failure and retry.
 	var tcpPort uint32
 	if req.Protocol == proto.ProtocolTCP {
-		port, ln, allocErr := s.portAllocator.Allocate(context.Background())
+		port, ln, allocErr := s.portAllocator.Allocate(s.serverCtx())
 		if allocErr != nil {
 			log.Error().Err(allocErr).Msg("Failed to allocate TCP port")
 			s.unregisterTunnelRoutes(client, tunnelID, extraSubdomain, req.Hostname, req.PathPrefix)
@@ -1603,7 +1656,7 @@ func (s *Server) notifyPeerOfP2P(peer *ClientSession, initiator *ClientSession) 
 	peer.mu.Unlock()
 
 	// Open a stream to the peer to notify them.
-	stream, err := peer.Mux.OpenStreamContext(context.Background())
+	stream, err := peer.Mux.OpenStreamContext(s.serverCtx())
 	if err != nil {
 		log.Error().Err(err).Str("peer", peer.ID).Msg("Failed to open stream to notify peer of P2P")
 		return
@@ -1922,7 +1975,7 @@ func (s *Server) handleTCPConnection(conn net.Conn, client *ClientSession, tunne
 	defer release()
 
 	// Open stream to client.
-	stream, err := client.Mux.OpenStreamContext(context.Background())
+	stream, err := client.Mux.OpenStreamContext(s.serverCtx())
 	if err != nil {
 		log.Error().Err(err).Msg("Open stream for TCP tunnel failed")
 		return

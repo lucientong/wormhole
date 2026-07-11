@@ -232,7 +232,7 @@ func (h *HTTPHandler) handleWebSocket(client *ClientSession, w http.ResponseWrit
 	if buf.Reader.Buffered() > 0 {
 		buffered := make([]byte, buf.Reader.Buffered())
 		if _, readErr := buf.Read(buffered); readErr == nil {
-			_, _ = stream.Write(buffered)
+			_, _ = stream.WriteContext(r.Context(), buffered)
 		}
 	}
 

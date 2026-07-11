@@ -582,6 +582,53 @@ func TestServer_AuthenticateClient_Success(t *testing.T) {
 	require.NoError(t, <-errCh)
 }
 
+// TestServer_AuthenticateClient_ServerCtxCancelUnblocks verifies DP-05/
+// DP-06 together: authenticateClient derives its timeout from
+// s.serverCtx(), and the auth-request Read uses ReadContext, so canceling
+// the server's root context (as Shutdown does) unblocks an in-flight
+// handshake immediately instead of only after the full AuthTimeout.
+func TestServer_AuthenticateClient_ServerCtxCancelUnblocks(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.RequireAuth = true
+	cfg.AuthTokens = []string{"valid-token"}
+	cfg.AuthTimeout = 30 * time.Second // deliberately long; cancellation should still be fast.
+	s := NewServer(cfg)
+
+	// Simulate what Start does, without going through the full listener
+	// setup, so authenticateClient's s.serverCtx() picks this up.
+	s.rootCtx, s.rootCancel = context.WithCancel(context.Background())
+
+	clientMux, serverMux := newMuxPair(t)
+
+	// Client opens the auth stream but never writes an AuthRequest, so
+	// the server blocks in stream.ReadContext waiting for data.
+	clientStream, openErr := clientMux.OpenStream()
+	require.NoError(t, openErr)
+	defer clientStream.Close()
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, _, authErr := s.authenticateClient(serverMux, "test-session-id")
+		resultCh <- authErr
+	}()
+
+	// Give authenticateClient time to reach the blocking Read.
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	s.rootCancel()
+
+	select {
+	case authErr := <-resultCh:
+		assert.Error(t, authErr)
+		assert.ErrorIs(t, authErr, context.Canceled)
+		assert.Less(t, time.Since(start), 2*time.Second,
+			"authenticateClient should unblock on server ctx cancellation, not wait out AuthTimeout")
+	case <-time.After(5 * time.Second):
+		t.Fatal("authenticateClient did not unblock after server ctx cancellation")
+	}
+}
+
 // TestServer_AuthenticateClient_ReturnsRealCapabilities verifies DP-33:
 // a successful AuthResponse carries the server's actual feature set
 // rather than an empty/placeholder Capabilities list.
@@ -1396,6 +1443,51 @@ func TestServer_RemoveClient(t *testing.T) {
 	assert.True(t, serverMux.IsClosed())
 
 	_ = clientConn.Close()
+}
+
+// TestServer_ServerCtx_FallsBackBeforeStart verifies serverCtx() (DP-05)
+// returns a usable, non-nil context.Background() before Start has run —
+// e.g. for unit tests that invoke handlers directly, as most of this
+// file's tests do.
+func TestServer_ServerCtx_FallsBackBeforeStart(t *testing.T) {
+	s := NewServer(DefaultConfig())
+	ctx := s.serverCtx()
+	require.NotNil(t, ctx)
+	assert.NoError(t, ctx.Err())
+	assert.Nil(t, ctx.Done())
+}
+
+// TestServer_ServerCtx_CanceledByShutdown verifies that Start populates
+// s.rootCtx and Shutdown cancels it (DP-05), so any operation still
+// blocked on serverCtx() deep in the handler tree unblocks as soon as
+// Shutdown begins rather than waiting on its own fixed timeout.
+func TestServer_ServerCtx_CanceledByShutdown(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.HTTPAddr = "127.0.0.1:0"
+	cfg.AdminAddr = "127.0.0.1:0"
+	cfg.MuxConfig.KeepAliveInterval = 0
+
+	s := NewServer(cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.Start(ctx)
+	}()
+
+	<-s.listenersReady
+	serverCtx := s.serverCtx()
+	require.NotNil(t, serverCtx)
+	assert.NoError(t, serverCtx.Err())
+
+	cancel()
+	require.NoError(t, <-errCh)
+
+	assert.ErrorIs(t, serverCtx.Err(), context.Canceled,
+		"serverCtx should be canceled once Shutdown (triggered by Start's ctx.Done) completes")
 }
 
 func TestServer_StartAndShutdown(t *testing.T) {

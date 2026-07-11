@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"context"
 	"errors"
 	"io"
 	"sync"
@@ -97,14 +98,42 @@ func (s *Stream) ID() uint32 {
 // Read reads data from the stream.
 // It blocks until data is available, the stream is closed, or the deadline expires.
 func (s *Stream) Read(p []byte) (int, error) {
+	return s.ReadContext(context.Background(), p)
+}
+
+// ReadContext reads data from the stream like Read, but additionally
+// unblocks with ctx.Err() as soon as ctx is canceled (DP-06). Without this,
+// a caller that opened the stream with a cancelable context (e.g.
+// OpenStreamContext) had no way to interrupt a subsequent blocking Read —
+// only SetReadDeadline or closing the stream/mux could do so. Read delegates
+// here with context.Background(), which has a nil Done channel, so the
+// hot data-copy path (io.Copy et al., which always calls plain Read) pays
+// no extra cost: no watcher goroutine is spawned when ctx can never fire.
+func (s *Stream) ReadContext(ctx context.Context, p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
+	}
+
+	if cancelDone := ctx.Done(); cancelDone != nil {
+		stop := make(chan struct{})
+		defer close(stop)
+		go func() {
+			select {
+			case <-cancelDone:
+				s.readCond.Broadcast()
+			case <-stop:
+			}
+		}()
 	}
 
 	s.readLock.Lock()
 	defer s.readLock.Unlock()
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+
 		// Check if stream is closed
 		state := atomic.LoadUint32(&s.state)
 		if state == streamStateClosed || state == streamStateRemoteClose {
@@ -149,8 +178,60 @@ func (s *Stream) Read(p []byte) (int, error) {
 // Write writes data to the stream.
 // It blocks until all data is written, the stream is closed, or the deadline expires.
 func (s *Stream) Write(p []byte) (int, error) {
+	return s.WriteContext(context.Background(), p)
+}
+
+// waitForSendWindow blocks until the send window has space, the stream
+// closes, ctx is canceled, or the write deadline expires. Callers must
+// hold s.writeLock. Split out of WriteContext to keep its cyclomatic
+// complexity in check.
+func (s *Stream) waitForSendWindow(ctx context.Context) error {
+	for atomic.LoadInt64(&s.sendWindow) <= 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		state := atomic.LoadUint32(&s.state)
+		if state == streamStateClosed || state == streamStateLocalClose {
+			return ErrStreamClosed
+		}
+
+		if s.writeTimeout.IsZero() {
+			s.sendCond.Wait()
+			continue
+		}
+		if time.Now().After(s.writeTimeout) {
+			return ErrTimeout
+		}
+		timeout := time.Until(s.writeTimeout)
+		timer := time.AfterFunc(timeout, func() {
+			s.sendCond.Broadcast()
+		})
+		s.sendCond.Wait()
+		timer.Stop()
+	}
+	return nil
+}
+
+// WriteContext writes data to the stream like Write, but additionally
+// unblocks with ctx.Err() as soon as ctx is canceled (DP-06), while
+// waiting for send-window space. See ReadContext for why this costs
+// nothing on the hot data-copy path, which always calls plain Write.
+func (s *Stream) WriteContext(ctx context.Context, p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
+	}
+
+	if cancelDone := ctx.Done(); cancelDone != nil {
+		stop := make(chan struct{})
+		defer close(stop)
+		go func() {
+			select {
+			case <-cancelDone:
+				s.sendCond.Broadcast()
+			case <-stop:
+			}
+		}()
 	}
 
 	s.writeLock.Lock()
@@ -164,27 +245,12 @@ func (s *Stream) Write(p []byte) (int, error) {
 
 	written := 0
 	for written < len(p) {
-		// Wait for send window
-		for atomic.LoadInt64(&s.sendWindow) <= 0 {
-			state := atomic.LoadUint32(&s.state)
-			if state == streamStateClosed || state == streamStateLocalClose {
-				return written, ErrStreamClosed
-			}
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
 
-			// Check timeout
-			if !s.writeTimeout.IsZero() {
-				if time.Now().After(s.writeTimeout) {
-					return written, ErrTimeout
-				}
-				timeout := time.Until(s.writeTimeout)
-				timer := time.AfterFunc(timeout, func() {
-					s.sendCond.Broadcast()
-				})
-				s.sendCond.Wait()
-				timer.Stop()
-			} else {
-				s.sendCond.Wait()
-			}
+		if err := s.waitForSendWindow(ctx); err != nil {
+			return written, err
 		}
 
 		// Calculate how much we can send

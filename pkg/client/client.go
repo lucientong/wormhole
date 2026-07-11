@@ -434,13 +434,13 @@ func (c *Client) authenticate(ctx context.Context) error {
 		return fmt.Errorf("encode auth request: %w", err)
 	}
 
-	if _, writeErr := stream.Write(data); writeErr != nil {
+	if _, writeErr := stream.WriteContext(ctx, data); writeErr != nil {
 		return fmt.Errorf("write auth request: %w", writeErr)
 	}
 
 	// Read auth response.
 	buf := make([]byte, 4096)
-	n, err := stream.Read(buf)
+	n, err := stream.ReadContext(ctx, buf)
 	if err != nil {
 		return fmt.Errorf("read auth response: %w", err)
 	}
@@ -519,13 +519,13 @@ func (c *Client) registerTunnel(ctx context.Context) error {
 		return fmt.Errorf("encode request: %w", err)
 	}
 
-	if _, writeErr := stream.Write(data); writeErr != nil {
+	if _, writeErr := stream.WriteContext(ctx, data); writeErr != nil {
 		return fmt.Errorf("write request: %w", writeErr)
 	}
 
 	// Read response
 	buf := make([]byte, 4096)
-	n, err := stream.Read(buf)
+	n, err := stream.ReadContext(ctx, buf)
 	if err != nil {
 		return fmt.Errorf("read response: %w", err)
 	}
@@ -642,12 +642,12 @@ func (c *Client) registerOneTunnel(ctx context.Context, def TunnelDef) (*ActiveT
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
-	if _, writeErr := stream.Write(data); writeErr != nil {
+	if _, writeErr := stream.WriteContext(ctx, data); writeErr != nil {
 		return nil, fmt.Errorf("write request: %w", writeErr)
 	}
 
 	buf := make([]byte, 4096)
-	n, err := stream.Read(buf)
+	n, err := stream.ReadContext(ctx, buf)
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
@@ -1267,13 +1267,13 @@ func (c *Client) sendPing(ctx context.Context, pingID uint64) error {
 		return fmt.Errorf("set deadline: %w", err)
 	}
 
-	if _, err := stream.Write(data); err != nil {
+	if _, err := stream.WriteContext(ctx, data); err != nil {
 		return fmt.Errorf("write ping: %w", err)
 	}
 
 	// Read pong
 	buf := make([]byte, 256)
-	if _, err := stream.Read(buf); err != nil {
+	if _, err := stream.ReadContext(ctx, buf); err != nil {
 		return fmt.Errorf("read pong: %w", err)
 	}
 
@@ -1334,7 +1334,7 @@ func (c *Client) sendP2POffer(ctx context.Context) {
 		return
 	}
 
-	if _, err := stream.Write(data); err != nil {
+	if _, err := stream.WriteContext(ctx, data); err != nil {
 		log.Debug().Err(err).Msg("Failed to send P2P offer")
 		return
 	}
@@ -1722,7 +1722,7 @@ func (c *Client) sendP2PResult(ctx context.Context, success bool, peerAddr, errM
 		return
 	}
 
-	if _, err := stream.Write(data); err != nil {
+	if _, err := stream.WriteContext(ctx, data); err != nil {
 		log.Debug().Err(err).Msg("Failed to send P2P result")
 		return
 	}
@@ -1953,13 +1953,13 @@ func (c *Client) RequestStats(ctx context.Context) (*proto.StatsResponse, error)
 		return nil, fmt.Errorf("encode stats request: %w", err)
 	}
 
-	if _, writeErr := stream.Write(data); writeErr != nil {
+	if _, writeErr := stream.WriteContext(ctx, data); writeErr != nil {
 		return nil, fmt.Errorf("write stats request: %w", writeErr)
 	}
 
 	// Read response.
 	buf := make([]byte, 4096)
-	n, err := stream.Read(buf)
+	n, err := stream.ReadContext(ctx, buf)
 	if err != nil {
 		return nil, fmt.Errorf("read stats response: %w", err)
 	}
@@ -2005,13 +2005,13 @@ func (c *Client) CloseTunnel(ctx context.Context, tunnelID, reason string) error
 		return fmt.Errorf("encode close request: %w", err)
 	}
 
-	if _, writeErr := stream.Write(data); writeErr != nil {
+	if _, writeErr := stream.WriteContext(ctx, data); writeErr != nil {
 		return fmt.Errorf("write close request: %w", writeErr)
 	}
 
 	// Read response.
 	buf := make([]byte, 4096)
-	n, err := stream.Read(buf)
+	n, err := stream.ReadContext(ctx, buf)
 	if err != nil {
 		return fmt.Errorf("read close response: %w", err)
 	}
