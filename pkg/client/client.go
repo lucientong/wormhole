@@ -4,16 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"encoding/base64"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -23,8 +18,6 @@ import (
 	"github.com/lucientong/wormhole/pkg/inspector"
 	"github.com/lucientong/wormhole/pkg/p2p"
 	"github.com/lucientong/wormhole/pkg/proto"
-	"github.com/lucientong/wormhole/pkg/tunnel"
-	"github.com/lucientong/wormhole/pkg/version"
 	"github.com/lucientong/wormhole/pkg/web"
 	"github.com/rs/zerolog/log"
 )
@@ -76,7 +69,6 @@ func copyWithPooledBuffer(dst io.Writer, src io.Reader) (int64, error) {
 	return io.CopyBuffer(dst, src, *bufPtr)
 }
 
-// Client is the wormhole client.
 // ActiveTunnel holds runtime state for a registered tunnel.
 type ActiveTunnel struct {
 	Def       TunnelDef
@@ -85,28 +77,26 @@ type ActiveTunnel struct {
 	TCPPort   uint32
 }
 
+// Client is the wormhole client.
+//
+// It is a composition root (P3-6 batch D): the actual control-plane
+// connection lifecycle (dial/auth/register/heartbeat/reconnect) lives in
+// RelayClient, and the `wormhole connect` P2P hole-punching lifecycle
+// lives in P2PSession. Client wires the two together — relay's inbound
+// P2P notifications are routed to the session, and the session's offers
+// are sent over relay's control connection (see RelayChannel) — and owns
+// the cross-cutting concerns that don't belong to either: aggregate
+// Stats, the inspector, and the optional local control/inspector HTTP
+// servers.
 type Client struct {
 	config Config
 
-	// Connection state
-	mux       *tunnel.Mux
-	conn      net.Conn
-	connected uint32
-	publicURL string
-	tunnelID  string
-	sessionID string // Server-assigned session ID (for reconnect awareness).
+	relay *relayClient
+	p2p   *p2pSession
 
-	// serverCapabilities is the feature set the server advertised in its
-	// AuthResponse (DP-33). nil/empty means either not-yet-authenticated
-	// or an older server that doesn't send this field — both treated as
-	// "unknown" by serverSupports, not "supports nothing".
-	serverCapabilities []string
-
-	// Multi-tunnel state (populated after registration).
-	// Single-tunnel mode uses publicURL/tunnelID directly;
-	// multi-tunnel mode populates this map.
-	activeTunnels   map[string]*ActiveTunnel // name → active tunnel
-	activeTunnelsMu sync.RWMutex
+	// Statistics, aggregated across both the relay and P2P data paths.
+	stats   Stats
+	statsMu sync.Mutex
 
 	// Control server (optional; exposes /tunnels for `wormhole tunnels list`).
 	ctrlServer *http.Server
@@ -115,19 +105,6 @@ type Client struct {
 	inspector        *inspector.Inspector
 	inspectorHandler *inspector.Handler
 	inspectorServer  *http.Server
-
-	// P2P
-	p2pManager *p2p.Manager
-	p2pConn    net.PacketConn     // UDP connection for P2P
-	p2pPeer    *net.UDPAddr       // Peer's confirmed UDP address
-	p2pMux     *p2p.UDPMux        // Multiplexed P2P transport (replaces Transport)
-	p2pMode    uint32             // 1 if using P2P, 0 for relay
-	p2pCloseCh chan struct{}      // Signal to stop P2P accept loop
-	p2pKeyPair *p2p.KeyPair       // ECDH key pair for this session
-	p2pCipher  *p2p.SessionCipher // Derived session cipher for E2E encryption
-
-	// Statistics
-	stats Stats
 
 	// Shutdown
 	closed  uint32
@@ -148,15 +125,26 @@ type Stats struct {
 // NewClient creates a new client instance.
 func NewClient(config Config) *Client {
 	insp := inspector.New(inspector.DefaultConfig())
-	p2pConfig := config.P2PConfig
-	p2pConfig.Enabled = config.P2PEnabled
-	return &Client{
-		config:        config,
-		inspector:     insp,
-		p2pManager:    p2p.NewManager(p2pConfig),
-		closeCh:       make(chan struct{}),
-		activeTunnels: make(map[string]*ActiveTunnel),
+	c := &Client{
+		config:    config,
+		inspector: insp,
+		closeCh:   make(chan struct{}),
 	}
+
+	p2pSess := newP2PSession(config, c, c, c.closeCh)
+	relay := newRelayClient(config, c, c, p2pSess.manager, c.closeCh, &c.closeWg)
+	// Wire the two components together without either depending on the
+	// other's concrete type (see RelayClient/P2PSession doc comments).
+	relay.setAfterConnect(func(ctx context.Context) {
+		p2pSess.MaybeSendOffer(ctx, relay)
+	})
+	relay.setNotificationHandler(func(ctx context.Context, rc RelayChannel, resp *proto.P2POfferResponse, candidates []string) {
+		p2pSess.HandleNotification(ctx, rc, resp, candidates)
+	})
+
+	c.relay = relay
+	c.p2p = p2pSess
+	return c
 }
 
 // Start starts the client.
@@ -170,784 +158,26 @@ func (c *Client) Start(ctx context.Context) error {
 
 	// Initialize P2P (non-blocking — failure is acceptable).
 	if c.config.P2PEnabled {
-		if err := c.p2pManager.Init(ctx); err != nil {
+		if err := c.p2p.Init(ctx); err != nil {
 			log.Warn().Err(err).Msg("P2P initialization failed, will use relay mode")
 		}
 	}
 
-	// Connect with reconnection
-	return c.connectWithRetry(ctx)
+	// Connect with reconnection.
+	return c.relay.Run(ctx)
 }
 
-// connectWithRetry connects to the server with automatic reconnection.
-func (c *Client) connectWithRetry(ctx context.Context) error {
-	interval := c.config.ReconnectInterval
-	attempts := 0
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-c.closeCh:
-			return nil
-		default:
-		}
-
-		if err := c.connect(ctx); err != nil {
-			log.Error().Err(err).Msg("Connection failed")
-
-			attempts++
-			if c.config.MaxReconnectAttempts > 0 && attempts >= c.config.MaxReconnectAttempts {
-				return fmt.Errorf("max reconnection attempts reached")
-			}
-
-			atomic.AddUint64(&c.stats.Reconnects, 1)
-
-			// Exponential backoff
-			select {
-			case <-time.After(interval):
-				interval = time.Duration(float64(interval) * c.config.ReconnectBackoff)
-				if interval > c.config.MaxReconnectInterval {
-					interval = c.config.MaxReconnectInterval
-				}
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-c.closeCh:
-				return nil
-			}
-			continue
-		}
-
-		// Connected successfully
-		attempts = 0
-		interval = c.config.ReconnectInterval
-
-		// Handle connection
-		c.handleConnection(ctx)
-
-		// Connection lost, will reconnect
-		log.Warn().
-			Str("tunnel_id", c.tunnelID).
-			Msg("Connection lost, reconnecting (tunnel will be re-registered)...")
-	}
+// localForwarder is the interface RelayClient and P2PSession use to hand
+// off an accepted stream carrying a StreamRequest to be proxied to the
+// local service. It's implemented by *Client and injected at
+// construction time so neither component needs to know about the
+// inspector, multi-tunnel routing, or aggregate Stats — all of which are
+// identical regardless of whether the stream arrived over the relay or a
+// direct P2P connection.
+type localForwarder interface {
+	forwardToLocal(ctx context.Context, conn streamConn, req *proto.StreamRequest)
 }
 
-// connect establishes a connection to the server.
-func (c *Client) connect(ctx context.Context) error {
-	// Dial server (plain TCP or TLS).
-	dialer := &net.Dialer{
-		Timeout: 10 * time.Second,
-	}
-
-	var conn net.Conn
-	var err error
-
-	if c.config.TLSEnabled {
-		tlsConfig, tlsErr := c.buildTLSConfig()
-		if tlsErr != nil {
-			return fmt.Errorf("build TLS config: %w", tlsErr)
-		}
-		tlsDialer := &tls.Dialer{
-			NetDialer: dialer,
-			Config:    tlsConfig,
-		}
-		conn, err = tlsDialer.DialContext(ctx, protocolTCP, c.config.ServerAddr)
-	} else {
-		conn, err = dialer.DialContext(ctx, protocolTCP, c.config.ServerAddr)
-	}
-	if err != nil {
-		return fmt.Errorf("dial server: %w", err)
-	}
-
-	// Create multiplexer
-	mux, err := tunnel.Client(conn, c.config.MuxConfig)
-	if err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("create mux: %w", err)
-	}
-
-	c.mu.Lock()
-	c.conn = conn
-	c.mux = mux
-	c.stats.ConnectionTime = time.Now()
-	c.mu.Unlock()
-
-	atomic.StoreUint32(&c.connected, 1)
-
-	log.Info().Str("server", c.config.ServerAddr).Msg("Connected to server")
-
-	// Phase 5: Authenticate if token is provided.
-	if c.config.Token != "" {
-		if err := c.authenticateWithRefresh(ctx); err != nil {
-			_ = mux.Close()
-			_ = conn.Close()
-			return fmt.Errorf("authenticate: %w", err)
-		}
-	}
-
-	// "Connect" mode (`wormhole connect <target>`) doesn't expose a tunnel
-	// of its own — it only needs the control connection to exchange P2P
-	// signaling with the server, so tunnel registration is skipped entirely.
-	if c.config.ConnectTarget != "" {
-		return nil
-	}
-
-	// Register tunnel(s).
-	if len(c.config.Tunnels) > 0 {
-		if err := c.registerAllTunnels(ctx); err != nil {
-			_ = mux.Close()
-			_ = conn.Close()
-			return fmt.Errorf("register tunnels: %w", err)
-		}
-	} else {
-		if err := c.registerTunnel(ctx); err != nil {
-			_ = mux.Close()
-			_ = conn.Close()
-			return fmt.Errorf("register tunnel: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// buildTLSConfig builds a *tls.Config from the client configuration.
-func (c *Client) buildTLSConfig() (*tls.Config, error) {
-	tlsConfig := &tls.Config{
-		MinVersion: tls.VersionTLS12,
-	}
-
-	if c.config.TLSInsecure {
-		tlsConfig.InsecureSkipVerify = true // #nosec G402 -- user explicitly opted in via --tls-insecure
-	}
-
-	// Load custom CA certificate if specified.
-	if c.config.TLSCACert != "" {
-		caCert, err := os.ReadFile(c.config.TLSCACert) // #nosec G304 -- path from CLI flag, not untrusted input
-		if err != nil {
-			return nil, fmt.Errorf("read CA certificate: %w", err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(caCert) {
-			return nil, fmt.Errorf("failed to parse CA certificate from %s", c.config.TLSCACert)
-		}
-		tlsConfig.RootCAs = pool
-	}
-
-	// Extract hostname from server address for SNI.
-	host, _, err := net.SplitHostPort(c.config.ServerAddr)
-	if err != nil {
-		// If no port in address, use as-is.
-		host = c.config.ServerAddr
-	}
-	tlsConfig.ServerName = host
-
-	return tlsConfig, nil
-}
-
-// capabilities returns the set of optional protocol features this client
-// build actually supports/wants, advertised to the server via
-// AuthRequest.Capabilities (DP-33). "multi-tunnel" is unconditional;
-// "p2p" reflects whether P2P is enabled in this client's config.
-func (c *Client) capabilities() []string {
-	caps := []string{"multi-tunnel"}
-	if c.config.P2PEnabled {
-		caps = append(caps, "p2p")
-	}
-	return caps
-}
-
-// serverSupports reports whether the server advertised the given
-// capability in its AuthResponse. An empty/nil capabilities list (no
-// AuthResponse.Capabilities received yet, or an older server that
-// predates this field) is treated as "unknown" and returns true, so
-// behavior against older servers is unaffected — this only actively
-// gates behavior once a server has explicitly told us its feature set.
-func (c *Client) serverSupports(name string) bool {
-	c.mu.Lock()
-	caps := c.serverCapabilities
-	c.mu.Unlock()
-
-	if len(caps) == 0 {
-		return true
-	}
-	for _, capability := range caps {
-		if capability == name {
-			return true
-		}
-	}
-	return false
-}
-
-// authenticateWithRefresh calls authenticate() and, if the server rejects the
-// current token and Config.OnAuthFailure is set (e.g. wired to an OAuth2
-// refresh_token grant by the CLI layer), attempts to obtain a fresh token
-// and retries authentication exactly once. This lets a long-lived client
-// survive an OIDC access token expiring mid-session or across a reconnect
-// without requiring the user to run `wormhole login` again.
-func (c *Client) authenticateWithRefresh(ctx context.Context) error {
-	err := c.authenticate(ctx)
-	if err == nil || c.config.OnAuthFailure == nil {
-		return err
-	}
-
-	newToken, ok := c.config.OnAuthFailure(ctx)
-	if !ok || newToken == "" {
-		return err
-	}
-
-	log.Info().Msg("Auth token refreshed after rejection, retrying authentication")
-	c.mu.Lock()
-	c.config.Token = newToken
-	c.mu.Unlock()
-
-	return c.authenticate(ctx)
-}
-
-// authenticate sends an AuthRequest to the server and validates the response.
-func (c *Client) authenticate(ctx context.Context) error {
-	c.mu.Lock()
-	mux := c.mux
-	c.mu.Unlock()
-
-	if mux == nil {
-		return fmt.Errorf("not connected")
-	}
-
-	// Open auth stream.
-	stream, err := mux.OpenStreamContext(ctx)
-	if err != nil {
-		return fmt.Errorf("open auth stream: %w", err)
-	}
-	defer stream.Close()
-
-	// Set timeout for auth handshake.
-	if deadlineErr := stream.SetDeadline(time.Now().Add(10 * time.Second)); deadlineErr != nil {
-		return fmt.Errorf("set auth deadline: %w", deadlineErr)
-	}
-
-	// Send auth request, advertising this client's real feature set
-	// (DP-33) rather than leaving Capabilities empty.
-	req := proto.NewAuthRequest(c.config.Token, version.Short(), c.config.Subdomain)
-	req.AuthRequest.Capabilities = c.capabilities()
-	data, err := req.Encode()
-	if err != nil {
-		return fmt.Errorf("encode auth request: %w", err)
-	}
-
-	if _, writeErr := stream.WriteContext(ctx, data); writeErr != nil {
-		return fmt.Errorf("write auth request: %w", writeErr)
-	}
-
-	// Read auth response.
-	buf := make([]byte, 4096)
-	n, err := stream.ReadContext(ctx, buf)
-	if err != nil {
-		return fmt.Errorf("read auth response: %w", err)
-	}
-
-	msg, err := proto.DecodeControlMessage(buf[:n])
-	if err != nil {
-		return fmt.Errorf("decode auth response: %w", err)
-	}
-
-	if msg.AuthResponse == nil {
-		return fmt.Errorf("unexpected response type (expected auth response)")
-	}
-
-	resp := msg.AuthResponse
-	if !resp.Success {
-		return fmt.Errorf("server rejected authentication: %s", resp.Error)
-	}
-
-	// Use subdomain from auth response if provided.
-	if resp.Subdomain != "" {
-		c.mu.Lock()
-		c.config.Subdomain = resp.Subdomain
-		c.mu.Unlock()
-	}
-
-	// Save session ID for reconnect awareness.
-	if resp.SessionID != "" {
-		c.mu.Lock()
-		c.sessionID = resp.SessionID
-		c.mu.Unlock()
-	}
-
-	// Remember what the server actually supports (DP-33) so optional
-	// behavior, like attempting a P2P offer, can be gated on it instead
-	// of assumed. An empty list means an older server that predates this
-	// field — treated as "unknown", not "supports nothing" (see
-	// serverSupports).
-	c.mu.Lock()
-	c.serverCapabilities = resp.Capabilities
-	c.mu.Unlock()
-
-	log.Info().
-		Str("session_id", resp.SessionID).
-		Str("subdomain", resp.Subdomain).
-		Strs("server_capabilities", resp.Capabilities).
-		Msg("Authenticated with server")
-
-	return nil
-}
-
-// registerTunnel registers a tunnel with the server.
-func (c *Client) registerTunnel(ctx context.Context) error {
-	c.mu.Lock()
-	mux := c.mux
-	c.mu.Unlock()
-
-	if mux == nil {
-		return fmt.Errorf("not connected")
-	}
-
-	// Open control stream
-	stream, err := mux.OpenStreamContext(ctx)
-	if err != nil {
-		return fmt.Errorf("open stream: %w", err)
-	}
-	defer stream.Close()
-
-	// Send register request
-	if c.config.LocalPort < 0 || c.config.LocalPort > 65535 {
-		return fmt.Errorf("invalid local port: %d", c.config.LocalPort)
-	}
-	p := parseProtocol(c.config.Protocol)
-	req := proto.NewRegisterRequest(uint32(c.config.LocalPort), p, c.config.Subdomain, c.config.Hostname, c.config.PathPrefix) // #nosec G115
-	data, err := req.Encode()
-	if err != nil {
-		return fmt.Errorf("encode request: %w", err)
-	}
-
-	if _, writeErr := stream.WriteContext(ctx, data); writeErr != nil {
-		return fmt.Errorf("write request: %w", writeErr)
-	}
-
-	// Read response
-	buf := make([]byte, 4096)
-	n, err := stream.ReadContext(ctx, buf)
-	if err != nil {
-		return fmt.Errorf("read response: %w", err)
-	}
-
-	msg, err := proto.DecodeControlMessage(buf[:n])
-	if err != nil {
-		return fmt.Errorf("decode response: %w", err)
-	}
-
-	if msg.RegisterResponse == nil {
-		return fmt.Errorf("unexpected response type")
-	}
-
-	resp := msg.RegisterResponse
-	if !resp.Success {
-		return fmt.Errorf("registration failed: %s", resp.Error)
-	}
-
-	c.mu.Lock()
-	c.tunnelID = resp.TunnelID
-	c.publicURL = resp.PublicURL
-	c.mu.Unlock()
-
-	log.Info().
-		Str("tunnel_id", resp.TunnelID).
-		Str("public_url", resp.PublicURL).
-		Msg("Tunnel registered")
-
-	fmt.Printf("\n")
-	fmt.Printf("  🕳️  Wormhole is ready!\n")
-	fmt.Printf("\n")
-	fmt.Printf("  Forwarding:   %s -> http://%s:%d\n", resp.PublicURL, c.config.LocalHost, c.config.LocalPort)
-	fmt.Printf("  Version:      %s\n", version.Short())
-	switch {
-	case c.p2pManager != nil && c.p2pManager.NATInfo() != nil:
-		info := c.p2pManager.NATInfo()
-		traversable := info.Type.IsTraversable()
-		fmt.Printf("  NAT Type:     %s\n", info.Type)
-		fmt.Printf("  Public Addr:  %s\n", info.PublicAddr)
-		if traversable {
-			fmt.Printf("  Traversable:  ✅ Yes (P2P direct connections possible)\n")
-		} else {
-			fmt.Printf("  Traversable:  ⚠️  Limited (P2P only with non-Symmetric peers)\n")
-		}
-		fmt.Printf("  P2P Mode:     %s\n", c.p2pManager.Mode())
-	case c.config.P2PEnabled:
-		fmt.Printf("  P2P:          ⚠️  NAT discovery failed, using relay mode\n")
-	default:
-		fmt.Printf("  P2P:          Disabled\n")
-	}
-	fmt.Printf("\n")
-	fmt.Printf("  Tip: Run 'wormhole nat-check' for detailed NAT diagnostics\n")
-	fmt.Printf("\n")
-	fmt.Printf("  Press Ctrl+C to stop\n")
-	fmt.Printf("\n")
-
-	return nil
-}
-
-// registerAllTunnels registers all tunnels from Config.Tunnels.
-// It is used in multi-tunnel (config file) mode.
-func (c *Client) registerAllTunnels(ctx context.Context) error {
-	c.activeTunnelsMu.Lock()
-	// Reset active tunnels map for this connection cycle.
-	c.activeTunnels = make(map[string]*ActiveTunnel, len(c.config.Tunnels))
-	c.activeTunnelsMu.Unlock()
-
-	for _, def := range c.config.Tunnels {
-		at, err := c.registerOneTunnel(ctx, def)
-		if err != nil {
-			log.Error().Err(err).Str("tunnel", def.Name).Msg("Failed to register tunnel")
-			continue // Best effort: skip failed tunnels.
-		}
-		c.activeTunnelsMu.Lock()
-		c.activeTunnels[def.Name] = at
-		c.activeTunnelsMu.Unlock()
-	}
-
-	c.activeTunnelsMu.RLock()
-	count := len(c.activeTunnels)
-	c.activeTunnelsMu.RUnlock()
-
-	if count == 0 {
-		return fmt.Errorf("all tunnel registrations failed")
-	}
-
-	c.printMultiTunnelBanner()
-	return nil
-}
-
-// registerOneTunnel registers a single tunnel definition and returns its state.
-func (c *Client) registerOneTunnel(ctx context.Context, def TunnelDef) (*ActiveTunnel, error) {
-	c.mu.Lock()
-	mux := c.mux
-	c.mu.Unlock()
-
-	if mux == nil {
-		return nil, fmt.Errorf("not connected")
-	}
-
-	stream, err := mux.OpenStreamContext(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("open stream: %w", err)
-	}
-	defer stream.Close()
-
-	if def.LocalPort < 0 || def.LocalPort > 65535 {
-		return nil, fmt.Errorf("invalid local port: %d", def.LocalPort)
-	}
-
-	p := parseProtocol(def.Protocol)
-	req := proto.NewRegisterRequest(uint32(def.LocalPort), p, def.Subdomain, def.Hostname, def.PathPrefix) // #nosec G115
-	data, err := req.Encode()
-	if err != nil {
-		return nil, fmt.Errorf("encode request: %w", err)
-	}
-	if _, writeErr := stream.WriteContext(ctx, data); writeErr != nil {
-		return nil, fmt.Errorf("write request: %w", writeErr)
-	}
-
-	buf := make([]byte, 4096)
-	n, err := stream.ReadContext(ctx, buf)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	msg, err := proto.DecodeControlMessage(buf[:n])
-	if err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
-	}
-	if msg.RegisterResponse == nil {
-		return nil, fmt.Errorf("unexpected response type")
-	}
-
-	resp := msg.RegisterResponse
-	if !resp.Success {
-		return nil, fmt.Errorf("registration failed: %s", resp.Error)
-	}
-
-	log.Info().
-		Str("name", def.Name).
-		Str("tunnel_id", resp.TunnelID).
-		Str("public_url", resp.PublicURL).
-		Int("local_port", def.LocalPort).
-		Msg("Tunnel registered")
-
-	return &ActiveTunnel{
-		Def:       def,
-		TunnelID:  resp.TunnelID,
-		PublicURL: resp.PublicURL,
-		TCPPort:   resp.TCPPort,
-	}, nil
-}
-
-// printMultiTunnelBanner prints a startup banner listing all active tunnels.
-func (c *Client) printMultiTunnelBanner() {
-	c.activeTunnelsMu.RLock()
-	defer c.activeTunnelsMu.RUnlock()
-
-	fmt.Printf("\n")
-	fmt.Printf("  🕳️  Wormhole is ready! (%d tunnel(s) active)\n", len(c.activeTunnels))
-	fmt.Printf("\n")
-	for name, at := range c.activeTunnels {
-		fmt.Printf("  %-12s %s  →  %s:%d\n", name+":", at.PublicURL, at.Def.LocalHost, at.Def.LocalPort)
-	}
-	fmt.Printf("\n  Press Ctrl+C to stop\n\n")
-}
-
-// ListActiveTunnels returns a copy of the currently active tunnels.
-func (c *Client) ListActiveTunnels() []ActiveTunnel {
-	c.activeTunnelsMu.RLock()
-	defer c.activeTunnelsMu.RUnlock()
-
-	out := make([]ActiveTunnel, 0, len(c.activeTunnels))
-	for _, at := range c.activeTunnels {
-		out = append(out, *at)
-	}
-	// In single-tunnel mode also expose the main tunnel.
-	if len(out) == 0 && c.tunnelID != "" {
-		out = append(out, ActiveTunnel{
-			Def: TunnelDef{
-				Name:      "default",
-				LocalPort: c.config.LocalPort,
-				LocalHost: c.config.LocalHost,
-				Protocol:  c.config.Protocol,
-			},
-			TunnelID:  c.tunnelID,
-			PublicURL: c.publicURL,
-		})
-	}
-	return out
-}
-
-// ReloadTunnels updates the active tunnel set based on a new list of definitions.
-// New tunnels are registered; removed tunnels are closed via CloseRequest.
-// This is designed to be called when a SIGHUP reloads the config file.
-func (c *Client) ReloadTunnels(ctx context.Context, newDefs []TunnelDef) {
-	c.mu.Lock()
-	mux := c.mux
-	c.mu.Unlock()
-	if mux == nil || mux.IsClosed() {
-		log.Warn().Msg("ReloadTunnels: not connected, skipping")
-		return
-	}
-
-	c.activeTunnelsMu.RLock()
-	current := make(map[string]*ActiveTunnel, len(c.activeTunnels))
-	for k, v := range c.activeTunnels {
-		current[k] = v
-	}
-	c.activeTunnelsMu.RUnlock()
-
-	newSet := make(map[string]TunnelDef, len(newDefs))
-	for _, d := range newDefs {
-		newSet[d.Name] = d
-	}
-
-	// Close tunnels that are no longer in the new config.
-	for name, at := range current {
-		if _, exists := newSet[name]; !exists {
-			log.Info().Str("tunnel", name).Msg("Closing removed tunnel")
-			if err := c.CloseTunnel(ctx, at.TunnelID, "config reload"); err != nil {
-				log.Warn().Err(err).Str("tunnel", name).Msg("Failed to close removed tunnel")
-			}
-			c.activeTunnelsMu.Lock()
-			delete(c.activeTunnels, name)
-			c.activeTunnelsMu.Unlock()
-		}
-	}
-
-	// Register tunnels that are new.
-	for name, def := range newSet {
-		if _, exists := current[name]; !exists {
-			log.Info().Str("tunnel", name).Msg("Registering new tunnel from config reload")
-			at, err := c.registerOneTunnel(ctx, def)
-			if err != nil {
-				log.Error().Err(err).Str("tunnel", name).Msg("Failed to register new tunnel")
-				continue
-			}
-			c.activeTunnelsMu.Lock()
-			c.activeTunnels[name] = at
-			c.activeTunnelsMu.Unlock()
-		}
-	}
-}
-
-// CreateTunnel registers a single new tunnel on an already-connected
-// client and adds it to the active tunnel set (U1), for imperative
-// tunnel management via the control API (`wormhole tunnels create`) as a
-// complement to the declarative config-file + SIGHUP reload path
-// (ReloadTunnels). Returns an error if a tunnel with the same name is
-// already active or if registration fails.
-func (c *Client) CreateTunnel(ctx context.Context, def TunnelDef) (*ActiveTunnel, error) {
-	c.activeTunnelsMu.RLock()
-	_, exists := c.activeTunnels[def.Name]
-	c.activeTunnelsMu.RUnlock()
-	if exists {
-		return nil, fmt.Errorf("tunnel %q already exists", def.Name)
-	}
-
-	at, err := c.registerOneTunnel(ctx, def)
-	if err != nil {
-		return nil, err
-	}
-
-	c.activeTunnelsMu.Lock()
-	if c.activeTunnels == nil {
-		c.activeTunnels = make(map[string]*ActiveTunnel, 1)
-	}
-	c.activeTunnels[def.Name] = at
-	c.activeTunnelsMu.Unlock()
-
-	return at, nil
-}
-
-// DeleteTunnel closes and removes a single active tunnel by name (U1),
-// the imperative counterpart to CreateTunnel. Returns an error if no
-// tunnel with that name is currently active.
-func (c *Client) DeleteTunnel(ctx context.Context, name string) error {
-	c.activeTunnelsMu.RLock()
-	at, exists := c.activeTunnels[name]
-	c.activeTunnelsMu.RUnlock()
-	if !exists {
-		return fmt.Errorf("tunnel %q not found", name)
-	}
-
-	if err := c.CloseTunnel(ctx, at.TunnelID, "removed via tunnels delete"); err != nil {
-		return err
-	}
-
-	c.activeTunnelsMu.Lock()
-	delete(c.activeTunnels, name)
-	c.activeTunnelsMu.Unlock()
-
-	return nil
-}
-
-// handleConnection handles an active connection. It blocks until the
-// connection is lost (mux closed, e.g. due to network failure) or the
-// application shuts down (ctx.Done() / c.closeCh), whichever happens
-// first. This is what allows connectWithRetry's reconnection loop to
-// actually run after a connection drop — previously this only unblocked
-// on application shutdown, so a dead mux never triggered a reconnect.
-func (c *Client) handleConnection(ctx context.Context) {
-	c.closeWg.Add(2)
-	go c.acceptStreams(ctx)
-	go c.heartbeatLoop(ctx)
-
-	// Attempt P2P offer (non-blocking). Skipped if the server explicitly
-	// told us (DP-33) it doesn't support P2P relay — an older server that
-	// sent no Capabilities is treated as "unknown" and still attempted.
-	if c.config.P2PEnabled && c.p2pManager.IsEnabled() && c.serverSupports("p2p") {
-		c.closeWg.Go(func() {
-			c.sendP2POffer(ctx)
-		})
-	}
-
-	c.mu.Lock()
-	mux := c.mux
-	c.mu.Unlock()
-
-	// Wait for whichever comes first: connection loss, app shutdown, or
-	// explicit Close(). mux may be nil only in tests that skip connect().
-	if mux != nil {
-		select {
-		case <-mux.CloseNotify():
-		case <-ctx.Done():
-		case <-c.closeCh:
-		}
-	} else {
-		select {
-		case <-ctx.Done():
-		case <-c.closeCh:
-		}
-	}
-
-	c.mu.Lock()
-	if c.mux != nil {
-		_ = c.mux.Close()
-	}
-	c.mu.Unlock()
-
-	atomic.StoreUint32(&c.connected, 0)
-	c.closeWg.Wait()
-}
-
-// acceptStreams accepts incoming streams from the server.
-func (c *Client) acceptStreams(ctx context.Context) {
-	defer c.closeWg.Done()
-
-	for {
-		c.mu.Lock()
-		mux := c.mux
-		c.mu.Unlock()
-
-		if mux == nil || mux.IsClosed() {
-			return
-		}
-
-		stream, err := mux.AcceptStreamContext(ctx)
-		if err != nil {
-			if ctx.Err() != nil || mux.IsClosed() {
-				return
-			}
-			log.Error().Err(err).Msg("Accept stream failed")
-			continue
-		}
-
-		go c.handleStream(ctx, stream)
-	}
-}
-
-// handleStream handles an incoming stream from the server.
-//
-// A P2P peer-notification stream (opened by the server's notifyPeerOfP2P)
-// may carry a P2PCandidates message — Symmetric+Symmetric NAT port
-// prediction — ahead of the terminal P2POfferResponse, both length-prefixed
-// via proto.WriteControlMessage. We therefore loop-read until we hit a
-// message that concludes the exchange (StreamRequest or P2POfferResponse),
-// rather than assuming a single read yields the whole exchange (DP-24).
-func (c *Client) handleStream(ctx context.Context, stream *tunnel.Stream) {
-	defer stream.Close()
-
-	var p2pCandidates []string
-
-	for {
-		msg, err := proto.ReadControlMessage(stream)
-		if err != nil {
-			if len(p2pCandidates) == 0 {
-				log.Error().Err(err).Msg("Read stream request failed")
-			}
-			return
-		}
-
-		switch {
-		case msg.StreamRequest != nil:
-			req := msg.StreamRequest
-			atomic.AddUint64(&c.stats.Requests, 1)
-			// Forward to local service.
-			c.forwardToLocal(ctx, stream, req)
-			return
-
-		case msg.P2PCandidates != nil:
-			// Not yet consumed by the hole-punching algorithm (tracked in
-			// P3-3); retained here purely so the exchange doesn't stall or
-			// get misclassified while waiting for the offer response.
-			p2pCandidates = append(p2pCandidates, msg.P2PCandidates.Candidates...)
-			continue
-
-		case msg.P2POfferResponse != nil:
-			// Server is notifying us about a peer that wants to connect.
-			c.handleP2PNotification(ctx, msg.P2POfferResponse, p2pCandidates)
-			return
-
-		default:
-			log.Warn().Int("type", int(msg.Type)).Msg("Unexpected message type in stream")
-			return
-		}
-	}
-}
-
-// forwardToLocal forwards a stream to the local service.
 // streamConn is implemented by both *tunnel.Stream and *p2p.UDPStream,
 // allowing forwardToLocal to handle both relay and P2P data paths.
 type streamConn = io.ReadWriteCloser
@@ -961,37 +191,6 @@ func (c *Client) forwardToLocal(ctx context.Context, conn streamConn, req *proto
 
 	// Fallback: raw TCP bidirectional proxy.
 	c.forwardRawTCP(ctx, conn, req)
-}
-
-// resolveLocalAddr returns the local host/port that a given stream request
-// should be forwarded to. In multi-tunnel mode, the server tags each
-// StreamRequest with the TunnelID of the tunnel it matched (see
-// HTTPHandler.resolveTunnelID server-side); we look that ID up in
-// activeTunnels to find the corresponding ActiveTunnel.Def. When the
-// TunnelID is empty or unknown (single-tunnel/legacy mode, or a transient
-// mismatch during reconnection), fall back to the top-level config's
-// LocalHost/LocalPort so existing single-tunnel behavior is preserved.
-func (c *Client) resolveLocalAddr(tunnelID string) (host string, port int) {
-	if tunnelID != "" {
-		c.activeTunnelsMu.RLock()
-		for _, at := range c.activeTunnels {
-			if at.TunnelID == tunnelID {
-				host, port = at.Def.LocalHost, at.Def.LocalPort
-				c.activeTunnelsMu.RUnlock()
-				if host == "" {
-					host = defaultLocalHost
-				}
-				return host, port
-			}
-		}
-		c.activeTunnelsMu.RUnlock()
-	}
-
-	host = c.config.LocalHost
-	if host == "" {
-		host = defaultLocalHost
-	}
-	return host, c.config.LocalPort
 }
 
 // forwardRawTCP forwards a stream to the local service using raw TCP proxy.
@@ -1008,7 +207,7 @@ func (c *Client) forwardRawTCPWithReader(ctx context.Context, reader io.Reader, 
 // dialAndProxy connects to the local service and proxies data bidirectionally
 // between the given reader/writer pair and the local connection.
 func (c *Client) dialAndProxy(ctx context.Context, inReader io.Reader, outWriter io.Writer, sreq *proto.StreamRequest) {
-	localHost, localPort := c.resolveLocalAddr(sreq.TunnelID)
+	localHost, localPort := c.relay.ResolveLocalAddr(sreq.TunnelID)
 	localAddr := net.JoinHostPort(localHost, fmt.Sprintf("%d", localPort))
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	localConn, err := dialer.DialContext(ctx, protocolTCP, localAddr)
@@ -1035,7 +234,7 @@ func (c *Client) dialAndProxy(ctx context.Context, inReader io.Reader, outWriter
 		defer wg.Done()
 		n, copyErr := copyWithPooledBuffer(localConn, inReader)
 		if n > 0 {
-			atomic.AddUint64(&c.stats.BytesIn, uint64(n))
+			c.addBytesIn(uint64(n))
 		}
 		if copyErr != nil {
 			log.Debug().Err(copyErr).Msg("Copy tunnel->local failed")
@@ -1056,7 +255,7 @@ func (c *Client) dialAndProxy(ctx context.Context, inReader io.Reader, outWriter
 		defer wg.Done()
 		n, copyErr := copyWithPooledBuffer(outWriter, localConn)
 		if n > 0 {
-			atomic.AddUint64(&c.stats.BytesOut, uint64(n)) // #nosec G115
+			c.addBytesOut(uint64(n)) // #nosec G115
 		}
 		if copyErr != nil {
 			log.Debug().Err(copyErr).Msg("Copy local->tunnel failed")
@@ -1072,7 +271,7 @@ func (c *Client) dialAndProxy(ctx context.Context, inReader io.Reader, outWriter
 // forwards it to the local service via http.Transport, captures the
 // request/response pair in the inspector, and writes the response back.
 func (c *Client) forwardHTTPWithInspect(ctx context.Context, stream streamConn, sreq *proto.StreamRequest) {
-	localHost, localPort := c.resolveLocalAddr(sreq.TunnelID)
+	localHost, localPort := c.relay.ResolveLocalAddr(sreq.TunnelID)
 	localAddr := net.JoinHostPort(localHost, fmt.Sprintf("%d", localPort))
 
 	start := time.Now()
@@ -1111,7 +310,7 @@ func (c *Client) forwardHTTPWithInspect(ctx context.Context, stream streamConn, 
 	}
 
 	// Track bytes in.
-	atomic.AddUint64(&c.stats.BytesIn, uint64(len(reqBody)))
+	c.addBytesIn(uint64(len(reqBody)))
 
 	// 3. Prepare the request for forwarding to local service.
 	httpReq.URL.Scheme = protocolHTTP
@@ -1166,7 +365,7 @@ func (c *Client) forwardHTTPWithInspect(ctx context.Context, stream streamConn, 
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 
 	// Track bytes out.
-	atomic.AddUint64(&c.stats.BytesOut, uint64(len(respBody)))
+	c.addBytesOut(uint64(len(respBody)))
 
 	// 6. Write response back to stream.
 	// Reconstruct the response with the body we've read.
@@ -1180,716 +379,112 @@ func (c *Client) forwardHTTPWithInspect(ctx context.Context, stream streamConn, 
 	c.inspector.Capture(httpReq, reqBody, resp, respBody, duration, nil)
 }
 
-// maxConsecutiveHeartbeatFailures is the number of consecutive failed
-// pings after which the mux is force-closed to trigger reconnection.
-// A single failed ping can be a transient hiccup, but repeated failures
-// indicate a half-dead connection that will otherwise linger forever
-// (acceptStreams/heartbeatLoop keep running against a connection that
-// never delivers data).
-const maxConsecutiveHeartbeatFailures = 3
-
-// heartbeatLoop sends periodic heartbeats. After several consecutive
-// failures it force-closes the mux so handleConnection's CloseNotify
-// wait unblocks and connectWithRetry can re-dial. It also watches the
-// mux's own CloseNotify channel directly so it exits promptly if the mux
-// dies for any other reason (e.g. the peer closing the connection),
-// rather than waiting for the next heartbeat tick — this matters because
-// handleConnection blocks on closeWg.Wait(), which includes this loop.
-func (c *Client) heartbeatLoop(ctx context.Context) {
-	defer c.closeWg.Done()
-
-	c.mu.Lock()
-	mux := c.mux
-	c.mu.Unlock()
-	if mux == nil {
-		return
-	}
-
-	ticker := time.NewTicker(c.config.HeartbeatInterval)
-	defer ticker.Stop()
-
-	var pingID uint64
-	var consecutiveFailures int
-
-	for {
-		select {
-		case <-ticker.C:
-			if mux.IsClosed() {
-				return
-			}
-
-			pingID++
-			if err := c.sendPing(ctx, pingID); err != nil {
-				consecutiveFailures++
-				log.Error().Err(err).Int("consecutive_failures", consecutiveFailures).Msg("Heartbeat failed")
-				if consecutiveFailures >= maxConsecutiveHeartbeatFailures {
-					log.Warn().Msg("Too many consecutive heartbeat failures, closing connection to trigger reconnect")
-					_ = mux.Close()
-					return
-				}
-				continue
-			}
-			consecutiveFailures = 0
-
-		case <-mux.CloseNotify():
-			return
-		case <-ctx.Done():
-			return
-		case <-c.closeCh:
-			return
-		}
-	}
-}
-
-// sendPing sends a ping to the server.
-func (c *Client) sendPing(ctx context.Context, pingID uint64) error {
-	c.mu.Lock()
-	mux := c.mux
-	c.mu.Unlock()
-
-	if mux == nil {
-		return fmt.Errorf("not connected")
-	}
-
-	stream, err := mux.OpenStreamContext(ctx)
-	if err != nil {
-		return fmt.Errorf("open stream: %w", err)
-	}
-	defer stream.Close()
-
-	req := proto.NewPingRequest(pingID)
-	data, err := req.Encode()
-	if err != nil {
-		return fmt.Errorf("encode ping: %w", err)
-	}
-
-	if err := stream.SetDeadline(time.Now().Add(c.config.HeartbeatTimeout)); err != nil {
-		return fmt.Errorf("set deadline: %w", err)
-	}
-
-	if _, err := stream.WriteContext(ctx, data); err != nil {
-		return fmt.Errorf("write ping: %w", err)
-	}
-
-	// Read pong
-	buf := make([]byte, 256)
-	if _, err := stream.ReadContext(ctx, buf); err != nil {
-		return fmt.Errorf("read pong: %w", err)
-	}
-
-	return nil
-}
-
-// sendP2POffer sends a P2P offer to the server with this client's NAT info.
-// It also generates an ECDH key pair and includes the public key for E2E encryption.
-func (c *Client) sendP2POffer(ctx context.Context) {
-	natInfo := c.p2pManager.NATInfo()
-	if natInfo == nil {
-		return
-	}
-
-	// Generate ECDH key pair for this P2P session.
-	keyPair, keyErr := p2p.GenerateKeyPair()
-	if keyErr != nil {
-		log.Error().Err(keyErr).Msg("Failed to generate ECDH key pair for P2P")
-		return
-	}
-
-	c.mu.Lock()
-	c.p2pKeyPair = keyPair
-	mux := c.mux
-	tunnelID := c.tunnelID
-	c.mu.Unlock()
-
-	if mux == nil {
-		return
-	}
-
-	stream, err := mux.OpenStreamContext(ctx)
-	if err != nil {
-		log.Debug().Err(err).Msg("Failed to open stream for P2P offer")
-		return
-	}
-	defer stream.Close()
-
-	// Encode public key as base64 for transmission in JSON.
-	pubKeyB64 := base64.StdEncoding.EncodeToString(keyPair.Public)
-
-	req := proto.NewP2POfferRequest(
-		tunnelID,
-		natInfo.Type.String(),
-		natInfo.PublicAddr.String(),
-		natInfo.LocalAddr.String(),
-		pubKeyB64,
-		c.config.ConnectTarget,
-	)
-	data, err := req.Encode()
-	if err != nil {
-		log.Debug().Err(err).Msg("Failed to encode P2P offer")
-		return
-	}
-
-	if err := stream.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		log.Debug().Err(err).Msg("Failed to set P2P offer deadline")
-		return
-	}
-
-	if _, err := stream.WriteContext(ctx, data); err != nil {
-		log.Debug().Err(err).Msg("Failed to send P2P offer")
-		return
-	}
-
-	// Read response. The server may first send zero or more P2PCandidates
-	// messages (Symmetric+Symmetric NAT port prediction, see
-	// handleP2POffer server-side) before the terminal P2POfferResponse.
-	// Both are length-prefixed via proto.WriteControlMessage, so we
-	// loop-read framed messages rather than relying on a single raw
-	// stream.Read() to capture the whole exchange (DP-24).
-	resp, candidates, readErr := readP2POfferResponse(stream)
-	if readErr != nil {
-		log.Debug().Err(readErr).Msg("Failed to read P2P offer response")
-		return
-	}
-
-	c.handleP2POfferResponse(ctx, resp, candidates)
-}
-
-// readP2POfferResponse loop-reads framed control messages from stream until
-// the terminal P2POfferResponse arrives, collecting any P2PCandidates sent
-// beforehand (DP-24).
-func readP2POfferResponse(stream io.Reader) (*proto.P2POfferResponse, []string, error) {
-	var candidates []string
-	for {
-		msg, readErr := proto.ReadControlMessage(stream)
-		if readErr != nil {
-			return nil, nil, readErr
-		}
-		switch {
-		case msg.P2PCandidates != nil:
-			candidates = append(candidates, msg.P2PCandidates.Candidates...)
-		case msg.P2POfferResponse != nil:
-			return msg.P2POfferResponse, candidates, nil
-		default:
-			return nil, nil, fmt.Errorf("unexpected message type %d in P2P offer response", msg.Type)
-		}
-	}
-}
-
-// handleP2POfferResponse derives the E2E session cipher (if a peer key was
-// returned) and kicks off hole punching, or logs the relay-mode fallback.
-func (c *Client) handleP2POfferResponse(ctx context.Context, resp *proto.P2POfferResponse, candidates []string) {
-	if !resp.Success || resp.PeerAddr == "" {
-		// errP2PNoTarget is the expected, silent outcome for an "expose"
-		// mode client (ConnectTarget == ""): it only registered its P2P
-		// reachability info and never asked to reach a peer, so this isn't
-		// a failure worth surfacing.
-		if c.config.ConnectTarget == "" {
-			log.Debug().Str("reason", resp.Error).Msg("P2P offer: no peer available, staying in relay mode")
-			return
-		}
-		fmt.Printf("  ❌ wormhole connect: %s (target %q)\n", resp.Error, c.config.ConnectTarget)
-		log.Error().Str("target", c.config.ConnectTarget).Str("reason", resp.Error).
-			Msg("wormhole connect: failed to match target peer")
-		return
-	}
-
-	if resp.PeerPublicKey != "" {
-		if derivErr := c.deriveP2PCipher(resp.PeerPublicKey); derivErr != nil {
-			log.Error().Err(derivErr).Msg("Failed to derive P2P session cipher")
-			return
-		}
-	}
-
-	log.Info().
-		Str("peer_addr", resp.PeerAddr).
-		Str("peer_nat", resp.PeerNATType).
-		Bool("encrypted", c.p2pCipher != nil).
-		Int("predicted_candidates", len(candidates)).
-		Msg("P2P peer found, attempting connection")
-
-	// Offer sender is the initiator for stream-ID allocation.
-	go c.attemptP2P(ctx, resp.PeerAddr, resp.PeerTunnelID, true)
-}
-
-// deriveP2PCipher derives the E2E session cipher from the peer's public key.
-func (c *Client) deriveP2PCipher(peerPubKeyB64 string) error {
-	peerPubBytes, err := base64.StdEncoding.DecodeString(peerPubKeyB64)
-	if err != nil {
-		return fmt.Errorf("decode peer public key: %w", err)
-	}
-
-	c.mu.Lock()
-	keyPair := c.p2pKeyPair
-	c.mu.Unlock()
-
-	if keyPair == nil {
-		return fmt.Errorf("local key pair not generated")
-	}
-
-	cipher, err := p2p.DeriveSession(keyPair.Private, peerPubBytes)
-	if err != nil {
-		return fmt.Errorf("derive session: %w", err)
-	}
-
-	c.mu.Lock()
-	c.p2pCipher = cipher
-	c.mu.Unlock()
-
-	log.Info().Msg("P2P E2E session cipher derived successfully")
-	return nil
-}
-
-// attemptP2P attempts to establish a P2P connection with the given peer address.
-// isInitiator must be true on exactly one side; the other side passes false.
-// The initiator allocates odd stream IDs; the acceptor uses even IDs.
-// peerTunnelID is the peer's tunnel ID to address outgoing stream requests
-// to in "connect" mode (see startConnectListener); it's ignored otherwise.
-func (c *Client) attemptP2P(ctx context.Context, peerAddr, peerTunnelID string, isInitiator bool) {
-	// Parse peer endpoint.
-	peerEndpoint, err := c.parseEndpoint(peerAddr)
-	if err != nil {
-		log.Error().Err(err).Str("peer_addr", peerAddr).Msg("Failed to parse peer address")
-		c.sendP2PResult(ctx, false, "", err.Error())
-		return
-	}
-
-	log.Info().
-		Str("peer", peerAddr).
-		Bool("initiator", isInitiator).
-		Msg("Attempting P2P hole punching")
-
-	// Get cipher for authenticated hole punching.
-	c.mu.Lock()
-	cipher := c.p2pCipher
-	c.mu.Unlock()
-
-	// Attempt P2P connection through the manager (with optional cipher for authenticated probes).
-	conn, confirmedPeer, p2pErr := c.p2pManager.AttemptP2P(ctx, peerEndpoint, cipher)
-	if p2pErr != nil {
-		log.Warn().Err(p2pErr).Msg("P2P hole punching failed")
-		c.sendP2PResult(ctx, false, "", p2pErr.Error())
-		return
-	}
-
-	// Create multiplexed UDP transport over the P2P connection.
-	mux := p2p.NewUDPMux(conn, confirmedPeer, p2p.DefaultTransportConfig(), cipher, isInitiator)
-
-	// Create P2P close channel for graceful shutdown.
-	p2pCloseCh := make(chan struct{})
-
-	// P2P connection established!
-	c.mu.Lock()
-	c.p2pConn = conn
-	c.p2pPeer = confirmedPeer
-	c.p2pMux = mux
-	c.p2pCloseCh = p2pCloseCh
-	atomic.StoreUint32(&c.p2pMode, 1)
-	c.mu.Unlock()
-
-	peerAddrStr := confirmedPeer.String()
-	encrypted := cipher != nil
-	log.Info().
-		Str("peer", peerAddrStr).
-		Str("local", conn.LocalAddr().String()).
-		Bool("encrypted", encrypted).
-		Bool("initiator", isInitiator).
-		Msg("P2P connection established (mux)")
-
-	// Notify server of successful P2P connection.
-	c.sendP2PResult(ctx, true, peerAddrStr, "")
-
-	// Accept incoming P2P streams and proxy them to local service.
-	go c.acceptP2PStreams(ctx, mux, p2pCloseCh)
-
-	if encrypted {
-		fmt.Printf("  🎉 P2P Mode: Direct connection to %s (encrypted)\n", peerAddrStr)
-	} else {
-		fmt.Printf("  🎉 P2P Mode: Direct connection to %s\n", peerAddrStr)
-	}
-
-	// "Connect" mode: we're the initiator reaching a specific peer tunnel,
-	// so also open a local listener that proxies each accepted connection
-	// to the peer over this P2P mux (see startConnectListener).
-	if isInitiator && c.config.ConnectTarget != "" {
-		go c.startConnectListener(ctx, mux, peerTunnelID, p2pCloseCh)
-	}
-}
-
-// acceptP2PStreams accepts incoming multiplexed P2P streams and proxies each
-// one to the local service — exactly like the relay path but over P2P UDP.
-func (c *Client) acceptP2PStreams(ctx context.Context, mux *p2p.UDPMux, closeCh chan struct{}) {
-	log.Info().Msg("P2P accept loop started")
-	defer log.Info().Msg("P2P accept loop stopped")
-
-	for {
-		select {
-		case <-closeCh:
-			return
-		case <-c.closeCh:
-			return
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		stream, err := mux.AcceptStream()
-		if err != nil {
-			if mux.IsClosed() {
-				c.fallbackToRelay("P2P mux closed")
-				return
-			}
-			log.Warn().Err(err).Msg("P2P accept stream error, falling back to relay")
-			c.fallbackToRelay("P2P accept error")
-			return
-		}
-
-		// Each stream carries one logical request: read the StreamRequest
-		// header (length-prefixed protobuf) then proxy to local service.
-		go func(s *p2p.UDPStream) {
-			defer s.Close()
-
-			msg, readErr := proto.ReadControlMessage(s)
-			if readErr != nil {
-				log.Error().Err(readErr).Uint32("stream_id", s.StreamID()).
-					Msg("P2P: read stream request failed")
-				return
-			}
-			if msg.StreamRequest == nil {
-				log.Warn().Uint32("stream_id", s.StreamID()).
-					Msg("P2P: expected StreamRequest, got other message type")
-				return
-			}
-
-			atomic.AddUint64(&c.stats.Requests, 1)
-			c.forwardToLocal(ctx, s, msg.StreamRequest)
-		}(stream)
-	}
-}
-
-// startConnectListener implements the client side of `wormhole connect`: it
-// opens a local TCP listener on Config.LocalHost:LocalPort and, for every
-// accepted connection, proxies it over the P2P mux directly to the peer's
-// tunnel identified by peerTunnelID — completely bypassing the server
-// relay for the actual traffic (the server was only used for signaling).
-// There is intentionally no relay fallback here: connect mode only makes
-// sense when a direct P2P path to the peer exists, so a lost P2P mux closes
-// the listener rather than silently falling back to a relay path the
-// server has no way to support for an unregistered connect-mode session.
-func (c *Client) startConnectListener(ctx context.Context, mux *p2p.UDPMux, peerTunnelID string, closeCh chan struct{}) {
-	host := c.config.LocalHost
-	if host == "" {
-		host = defaultLocalHost
-	}
-	addr := net.JoinHostPort(host, fmt.Sprintf("%d", c.config.LocalPort))
-
-	lc := net.ListenConfig{}
-	ln, err := lc.Listen(ctx, protocolTCP, addr)
-	if err != nil {
-		log.Error().Err(err).Str("addr", addr).Msg("wormhole connect: failed to open local listener")
-		fmt.Printf("  ❌ wormhole connect: failed to listen on %s: %v\n", addr, err)
-		return
-	}
-	defer ln.Close()
-
-	fmt.Printf("  🔗 wormhole connect: forwarding %s -> peer tunnel %s (direct P2P)\n", addr, peerTunnelID)
-	log.Info().Str("addr", addr).Str("peer_tunnel_id", peerTunnelID).Msg("wormhole connect: listening for local connections")
-
-	go func() {
-		select {
-		case <-closeCh:
-		case <-c.closeCh:
-		case <-ctx.Done():
-		}
-		_ = ln.Close()
-	}()
-
-	for {
-		conn, acceptErr := ln.Accept()
-		if acceptErr != nil {
-			return
-		}
-		go c.proxyConnectConn(ctx, mux, conn, peerTunnelID)
-	}
-}
-
-// proxyConnectConn opens one P2P stream per accepted local connection,
-// sends a StreamRequest addressed to the peer's tunnel (mirroring what the
-// server does for a relay-mode TCP tunnel, see Server.handleTCPConnection),
-// and proxies bytes bidirectionally until either side closes.
-func (c *Client) proxyConnectConn(_ context.Context, mux *p2p.UDPMux, localConn net.Conn, peerTunnelID string) {
-	defer localConn.Close()
-
-	stream, err := mux.OpenStream()
-	if err != nil {
-		log.Error().Err(err).Msg("wormhole connect: failed to open P2P stream")
-		return
-	}
-	defer stream.Close()
-
-	streamReq := proto.NewStreamRequest(peerTunnelID, generateRequestID(), localConn.RemoteAddr().String(), proto.ProtocolTCP)
-	if writeErr := proto.WriteControlMessage(stream, streamReq); writeErr != nil {
-		log.Error().Err(writeErr).Msg("wormhole connect: failed to send stream request")
-		return
-	}
-
-	// p2p.UDPStream has no half-close, so — as in Server.handleTCPConnection
-	// and HTTPHandler.handleWebSocket (DP-04) — close both ends as soon as
-	// either direction finishes to unblock the other immediately rather
-	// than leaving it running until the deferred closes above happen to
-	// fire when this function eventually returns.
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		n, copyErr := copyWithPooledBuffer(stream, localConn)
-		if n > 0 {
-			atomic.AddUint64(&c.stats.BytesOut, uint64(n)) // #nosec G115
-		}
-		if copyErr != nil {
-			log.Debug().Err(copyErr).Msg("wormhole connect: copy local->peer failed")
-		}
-		_ = stream.Close()
-	}()
-	go func() {
-		defer wg.Done()
-		n, copyErr := copyWithPooledBuffer(localConn, stream)
-		if n > 0 {
-			atomic.AddUint64(&c.stats.BytesIn, uint64(n))
-		}
-		if copyErr != nil {
-			log.Debug().Err(copyErr).Msg("wormhole connect: copy peer->local failed")
-		}
-		_ = localConn.Close()
-	}()
-
-	wg.Wait()
-	atomic.AddUint64(&c.stats.Requests, 1)
-}
-
-// generateRequestID returns a random hex identifier for a StreamRequest
-// originated by this client (only used in "connect" mode — normally the
-// server originates StreamRequests and assigns the RequestID itself).
-func generateRequestID() string {
-	b := make([]byte, 8)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
-// parseEndpoint parses a string address into a p2p.Endpoint.
-func (c *Client) parseEndpoint(addr string) (p2p.Endpoint, error) {
-	host, portStr, err := net.SplitHostPort(addr)
-	if err != nil {
-		return p2p.Endpoint{}, fmt.Errorf("invalid address: %w", err)
-	}
-	port := 0
-	if _, scanErr := fmt.Sscanf(portStr, "%d", &port); scanErr != nil {
-		return p2p.Endpoint{}, fmt.Errorf("invalid port: %w", scanErr)
-	}
-	return p2p.Endpoint{IP: host, Port: port}, nil
-}
-
-// sendP2PResult sends the P2P connection result to the server.
-func (c *Client) sendP2PResult(ctx context.Context, success bool, peerAddr, errMsg string) {
-	c.mu.Lock()
-	mux := c.mux
-	tunnelID := c.tunnelID
-	c.mu.Unlock()
-
-	if mux == nil || mux.IsClosed() {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	stream, err := mux.OpenStreamContext(ctx)
-	if err != nil {
-		log.Debug().Err(err).Msg("Failed to open stream for P2P result")
-		return
-	}
-	defer stream.Close()
-
-	msg := proto.NewP2PResult(tunnelID, success, peerAddr, errMsg)
-	data, err := msg.Encode()
-	if err != nil {
-		log.Debug().Err(err).Msg("Failed to encode P2P result")
-		return
-	}
-
-	if err := stream.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		log.Debug().Err(err).Msg("Failed to set P2P result deadline")
-		return
-	}
-
-	if _, err := stream.WriteContext(ctx, data); err != nil {
-		log.Debug().Err(err).Msg("Failed to send P2P result")
-		return
-	}
-
-	log.Debug().
-		Bool("success", success).
-		Str("peer_addr", peerAddr).
-		Msg("P2P result sent to server")
+// addBytesIn, addBytesOut, addRequest, addReconnect, and setConnectionTime
+// implement statsRecorder, letting RelayClient/P2PSession record traffic
+// into Client's aggregate Stats without owning it themselves.
+func (c *Client) addBytesIn(n uint64)  { atomic.AddUint64(&c.stats.BytesIn, n) }
+func (c *Client) addBytesOut(n uint64) { atomic.AddUint64(&c.stats.BytesOut, n) }
+func (c *Client) addRequest()          { atomic.AddUint64(&c.stats.Requests, 1) }
+func (c *Client) addReconnect()        { atomic.AddUint64(&c.stats.Reconnects, 1) }
+
+func (c *Client) setConnectionTime(t time.Time) {
+	c.statsMu.Lock()
+	c.stats.ConnectionTime = t
+	c.statsMu.Unlock()
 }
 
 // IsP2PMode returns whether the client is using P2P mode.
 func (c *Client) IsP2PMode() bool {
-	return atomic.LoadUint32(&c.p2pMode) == 1
-}
-
-// handleP2PNotification handles incoming P2P notifications from the server.
-// This is called when another client wants to establish a P2P connection
-// with us. candidates carries any predicted peer ports received alongside
-// the offer response (Symmetric+Symmetric NAT port prediction); consuming
-// them in the hole-punch attempt itself is tracked in P3-3.
-func (c *Client) handleP2PNotification(ctx context.Context, resp *proto.P2POfferResponse, candidates []string) {
-	if !resp.Success || resp.PeerAddr == "" {
-		return
-	}
-
-	log.Info().
-		Str("peer_addr", resp.PeerAddr).
-		Str("peer_nat", resp.PeerNATType).
-		Bool("has_peer_key", resp.PeerPublicKey != "").
-		Int("predicted_candidates", len(candidates)).
-		Msg("Received P2P notification from server, attempting connection")
-
-	// Generate our ECDH key pair if not already done.
-	c.mu.Lock()
-	if c.p2pKeyPair == nil {
-		keyPair, keyErr := p2p.GenerateKeyPair()
-		if keyErr != nil {
-			c.mu.Unlock()
-			log.Error().Err(keyErr).Msg("Failed to generate ECDH key pair for P2P notification")
-			return
-		}
-		c.p2pKeyPair = keyPair
-	}
-	c.mu.Unlock()
-
-	// Derive session cipher from peer's public key if available.
-	if resp.PeerPublicKey != "" {
-		if derivErr := c.deriveP2PCipher(resp.PeerPublicKey); derivErr != nil {
-			log.Error().Err(derivErr).Msg("Failed to derive P2P session cipher from notification")
-			return
-		}
-	}
-
-	// Notified side is the acceptor for stream-ID allocation; it never
-	// initiates outgoing connect-mode streams, so peerTunnelID is unused.
-	go c.attemptP2P(ctx, resp.PeerAddr, "", false)
-}
-
-// fallbackToRelay switches from P2P back to relay mode.
-func (c *Client) fallbackToRelay(reason string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Only fallback if currently in P2P mode.
-	if atomic.LoadUint32(&c.p2pMode) != 1 {
-		return
-	}
-
-	log.Info().Str("reason", reason).Msg("Falling back to relay mode")
-
-	// Close P2P resources.
-	if c.p2pMux != nil {
-		_ = c.p2pMux.Close()
-		c.p2pMux = nil
-	}
-	if c.p2pConn != nil {
-		_ = c.p2pConn.Close()
-		c.p2pConn = nil
-	}
-	c.p2pPeer = nil
-	if c.p2pCloseCh != nil {
-		close(c.p2pCloseCh)
-		c.p2pCloseCh = nil
-	}
-	// Clear crypto state so a fresh key pair is generated on next attempt.
-	c.p2pKeyPair = nil
-	c.p2pCipher = nil
-
-	// Set mode back to relay.
-	atomic.StoreUint32(&c.p2pMode, 0)
-
-	// Notify manager.
-	c.p2pManager.FallbackToRelay(reason)
-
-	fmt.Printf("  ⚠️  Switched to Relay mode: %s\n", reason)
+	return c.p2p.IsP2PMode()
 }
 
 // GetP2PManager returns the P2P manager instance.
 func (c *Client) GetP2PManager() *p2p.Manager {
-	return c.p2pManager
+	return c.p2p.Manager()
+}
+
+// IsConnected returns whether the client is connected.
+func (c *Client) IsConnected() bool {
+	return c.relay.IsConnected()
+}
+
+// GetStats returns client statistics.
+func (c *Client) GetStats() Stats {
+	c.statsMu.Lock()
+	connTime := c.stats.ConnectionTime
+	c.statsMu.Unlock()
+
+	return Stats{
+		BytesIn:        atomic.LoadUint64(&c.stats.BytesIn),
+		BytesOut:       atomic.LoadUint64(&c.stats.BytesOut),
+		Requests:       atomic.LoadUint64(&c.stats.Requests),
+		Reconnects:     atomic.LoadUint64(&c.stats.Reconnects),
+		ConnectionTime: connTime,
+	}
+}
+
+// RequestStats sends a StatsRequest to the server and returns the session statistics.
+func (c *Client) RequestStats(ctx context.Context) (*proto.StatsResponse, error) {
+	return c.relay.RequestStats(ctx)
+}
+
+// CloseTunnel sends a CloseRequest to the server to gracefully close a tunnel.
+func (c *Client) CloseTunnel(ctx context.Context, tunnelID, reason string) error {
+	return c.relay.CloseTunnel(ctx, tunnelID, reason)
+}
+
+// ListActiveTunnels returns a copy of the currently active tunnels.
+func (c *Client) ListActiveTunnels() []ActiveTunnel {
+	return c.relay.ListActiveTunnels()
+}
+
+// ReloadTunnels updates the active tunnel set based on a new list of
+// definitions. See RelayClient.ReloadTunnels.
+func (c *Client) ReloadTunnels(ctx context.Context, newDefs []TunnelDef) {
+	c.relay.ReloadTunnels(ctx, newDefs)
+}
+
+// CreateTunnel registers a single new tunnel on an already-connected
+// client (U1). See RelayClient.CreateTunnel.
+func (c *Client) CreateTunnel(ctx context.Context, def TunnelDef) (*ActiveTunnel, error) {
+	return c.relay.CreateTunnel(ctx, def)
+}
+
+// DeleteTunnel closes and removes a single active tunnel by name (U1).
+// See RelayClient.DeleteTunnel.
+func (c *Client) DeleteTunnel(ctx context.Context, name string) error {
+	return c.relay.DeleteTunnel(ctx, name)
 }
 
 // Close closes the client.
 // It performs graceful shutdown by sending a CloseRequest to the server
 // before tearing down the connection.
-//
-//nolint:gocyclo // shutdown must coordinate all subsystems in one place
 func (c *Client) Close() error {
 	if !atomic.CompareAndSwapUint32(&c.closed, 0, 1) {
 		return nil
 	}
 
-	// Graceful shutdown: send CloseRequest to server before closing.
-	c.mu.Lock()
-	mux := c.mux
-	tunnelID := c.tunnelID
-	c.mu.Unlock()
-
-	if mux != nil && !mux.IsClosed() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		// In multi-tunnel mode, close all active tunnels.
-		c.activeTunnelsMu.RLock()
-		for _, at := range c.activeTunnels {
-			if err := c.CloseTunnel(ctx, at.TunnelID, "client shutting down"); err != nil {
-				log.Debug().Err(err).Str("tunnel", at.Def.Name).Msg("Graceful tunnel close failed")
-			}
-		}
-		c.activeTunnelsMu.RUnlock()
-		// Single-tunnel mode fallback.
-		if tunnelID != "" {
-			if err := c.CloseTunnel(ctx, tunnelID, "client shutting down"); err != nil {
-				log.Debug().Err(err).Msg("Graceful tunnel close failed (proceeding with shutdown)")
-			}
-		}
-		cancel()
-	}
+	// Graceful shutdown: close all active tunnels before tearing down
+	// the connection (no-op if not currently connected).
+	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	c.relay.CloseAllTunnels(closeCtx, "client shutting down")
+	cancel()
 
 	// Stop control server.
+	c.mu.Lock()
 	if c.ctrlServer != nil {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = c.ctrlServer.Shutdown(shutdownCtx)
-		cancel()
+		shutdownCancel()
 	}
+	c.mu.Unlock()
 
 	close(c.closeCh)
 
+	c.relay.Close()
+	c.p2p.Close()
+
 	c.mu.Lock()
-	if c.mux != nil {
-		_ = c.mux.Close()
-	}
-	if c.conn != nil {
-		_ = c.conn.Close()
-	}
-	// Close P2P resources in correct order.
-	if c.p2pCloseCh != nil {
-		close(c.p2pCloseCh)
-		c.p2pCloseCh = nil
-	}
-	if c.p2pMux != nil {
-		_ = c.p2pMux.Close()
-		c.p2pMux = nil
-	}
-	if c.p2pConn != nil {
-		_ = c.p2pConn.Close()
-		c.p2pConn = nil
-	}
-	c.p2pPeer = nil
 	if c.inspectorServer != nil {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
 		_ = c.inspectorServer.Shutdown(shutdownCtx)
@@ -1904,136 +499,6 @@ func (c *Client) Close() error {
 	c.mu.Unlock()
 
 	c.closeWg.Wait()
-	return nil
-}
-
-// IsConnected returns whether the client is connected.
-func (c *Client) IsConnected() bool {
-	return atomic.LoadUint32(&c.connected) == 1
-}
-
-// GetStats returns client statistics.
-func (c *Client) GetStats() Stats {
-	return Stats{
-		BytesIn:        atomic.LoadUint64(&c.stats.BytesIn),
-		BytesOut:       atomic.LoadUint64(&c.stats.BytesOut),
-		Requests:       atomic.LoadUint64(&c.stats.Requests),
-		Reconnects:     atomic.LoadUint64(&c.stats.Reconnects),
-		ConnectionTime: c.stats.ConnectionTime,
-	}
-}
-
-// RequestStats sends a StatsRequest to the server and returns the session statistics.
-func (c *Client) RequestStats(ctx context.Context) (*proto.StatsResponse, error) {
-	c.mu.Lock()
-	mux := c.mux
-	sessionID := c.sessionID
-	c.mu.Unlock()
-
-	if mux == nil || mux.IsClosed() {
-		return nil, fmt.Errorf("not connected")
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	stream, err := mux.OpenStreamContext(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("open stream: %w", err)
-	}
-	defer stream.Close()
-
-	if deadlineErr := stream.SetDeadline(time.Now().Add(10 * time.Second)); deadlineErr != nil {
-		return nil, fmt.Errorf("set deadline: %w", deadlineErr)
-	}
-
-	req := proto.NewStatsRequest(sessionID)
-	data, err := req.Encode()
-	if err != nil {
-		return nil, fmt.Errorf("encode stats request: %w", err)
-	}
-
-	if _, writeErr := stream.WriteContext(ctx, data); writeErr != nil {
-		return nil, fmt.Errorf("write stats request: %w", writeErr)
-	}
-
-	// Read response.
-	buf := make([]byte, 4096)
-	n, err := stream.ReadContext(ctx, buf)
-	if err != nil {
-		return nil, fmt.Errorf("read stats response: %w", err)
-	}
-
-	msg, err := proto.DecodeControlMessage(buf[:n])
-	if err != nil {
-		return nil, fmt.Errorf("decode stats response: %w", err)
-	}
-
-	if msg.StatsResponse == nil {
-		return nil, fmt.Errorf("unexpected response type (expected stats response)")
-	}
-
-	return msg.StatsResponse, nil
-}
-
-// CloseTunnel sends a CloseRequest to the server to gracefully close a tunnel.
-func (c *Client) CloseTunnel(ctx context.Context, tunnelID, reason string) error {
-	c.mu.Lock()
-	mux := c.mux
-	c.mu.Unlock()
-
-	if mux == nil || mux.IsClosed() {
-		return fmt.Errorf("not connected")
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	stream, err := mux.OpenStreamContext(ctx)
-	if err != nil {
-		return fmt.Errorf("open stream: %w", err)
-	}
-	defer stream.Close()
-
-	if deadlineErr := stream.SetDeadline(time.Now().Add(10 * time.Second)); deadlineErr != nil {
-		return fmt.Errorf("set deadline: %w", deadlineErr)
-	}
-
-	req := proto.NewCloseRequest(tunnelID, reason)
-	data, err := req.Encode()
-	if err != nil {
-		return fmt.Errorf("encode close request: %w", err)
-	}
-
-	if _, writeErr := stream.WriteContext(ctx, data); writeErr != nil {
-		return fmt.Errorf("write close request: %w", writeErr)
-	}
-
-	// Read response.
-	buf := make([]byte, 4096)
-	n, err := stream.ReadContext(ctx, buf)
-	if err != nil {
-		return fmt.Errorf("read close response: %w", err)
-	}
-
-	msg, err := proto.DecodeControlMessage(buf[:n])
-	if err != nil {
-		return fmt.Errorf("decode close response: %w", err)
-	}
-
-	if msg.CloseResponse == nil {
-		return fmt.Errorf("unexpected response type (expected close response)")
-	}
-
-	if !msg.CloseResponse.Success {
-		return fmt.Errorf("server rejected close request")
-	}
-
-	log.Info().
-		Str("tunnel_id", tunnelID).
-		Str("reason", reason).
-		Msg("Tunnel closed successfully")
-
 	return nil
 }
 

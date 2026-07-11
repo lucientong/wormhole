@@ -32,7 +32,7 @@ func TestNewClient(t *testing.T) {
 	assert.False(t, c.IsConnected())
 	assert.False(t, c.IsP2PMode())
 	assert.NotNil(t, c.inspector)
-	assert.NotNil(t, c.p2pManager)
+	assert.NotNil(t, c.p2p.manager)
 	assert.NotNil(t, c.closeCh)
 }
 
@@ -58,11 +58,11 @@ func TestClient_IsConnected(t *testing.T) {
 	assert.False(t, c.IsConnected())
 
 	// Simulate connected state.
-	atomic.StoreUint32(&c.connected, 1)
+	atomic.StoreUint32(&c.relay.connected, 1)
 	assert.True(t, c.IsConnected())
 
 	// Simulate disconnected state.
-	atomic.StoreUint32(&c.connected, 0)
+	atomic.StoreUint32(&c.relay.connected, 0)
 	assert.False(t, c.IsConnected())
 }
 
@@ -73,11 +73,11 @@ func TestClient_IsP2PMode(t *testing.T) {
 	assert.False(t, c.IsP2PMode())
 
 	// Simulate P2P mode.
-	atomic.StoreUint32(&c.p2pMode, 1)
+	atomic.StoreUint32(&c.p2p.mode, 1)
 	assert.True(t, c.IsP2PMode())
 
 	// Simulate relay mode.
-	atomic.StoreUint32(&c.p2pMode, 0)
+	atomic.StoreUint32(&c.p2p.mode, 0)
 	assert.False(t, c.IsP2PMode())
 }
 
@@ -115,18 +115,18 @@ func TestClient_GetPublicURL(t *testing.T) {
 	c := NewClient(cfg)
 
 	// Initially empty.
-	c.mu.Lock()
-	assert.Equal(t, "", c.publicURL)
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	assert.Equal(t, "", c.relay.publicURL)
+	c.relay.mu.Unlock()
 
 	// Set a public URL.
-	c.mu.Lock()
-	c.publicURL = "https://myapp.worm.io"
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.publicURL = "https://myapp.worm.io"
+	c.relay.mu.Unlock()
 
-	c.mu.Lock()
-	assert.Equal(t, "https://myapp.worm.io", c.publicURL)
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	assert.Equal(t, "https://myapp.worm.io", c.relay.publicURL)
+	c.relay.mu.Unlock()
 }
 
 func TestClient_Close(t *testing.T) {
@@ -164,9 +164,6 @@ func TestClient_Close_Idempotent(t *testing.T) {
 }
 
 func TestClient_ParseEndpoint(t *testing.T) {
-	cfg := DefaultConfig()
-	c := NewClient(cfg)
-
 	tests := []struct {
 		name    string
 		addr    string
@@ -211,7 +208,7 @@ func TestClient_ParseEndpoint(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ep, err := c.parseEndpoint(tt.addr)
+			ep, err := parseP2PEndpoint(tt.addr)
 			if tt.wantErr {
 				assert.Error(t, err)
 			} else {
@@ -228,7 +225,7 @@ func TestClient_FallbackToRelay_NotInP2PMode(t *testing.T) {
 	c := NewClient(cfg)
 
 	// Not in P2P mode, should be a no-op.
-	c.fallbackToRelay("test reason")
+	c.p2p.fallbackToRelay("test reason")
 	assert.False(t, c.IsP2PMode())
 }
 
@@ -237,17 +234,17 @@ func TestClient_FallbackToRelay_InP2PMode(t *testing.T) {
 	c := NewClient(cfg)
 
 	// Simulate being in P2P mode.
-	atomic.StoreUint32(&c.p2pMode, 1)
+	atomic.StoreUint32(&c.p2p.mode, 1)
 	assert.True(t, c.IsP2PMode())
 
-	c.fallbackToRelay("read error")
+	c.p2p.fallbackToRelay("read error")
 
 	assert.False(t, c.IsP2PMode())
-	assert.Nil(t, c.p2pMux)
-	assert.Nil(t, c.p2pConn)
-	assert.Nil(t, c.p2pPeer)
-	assert.Nil(t, c.p2pKeyPair)
-	assert.Nil(t, c.p2pCipher)
+	assert.Nil(t, c.p2p.udpMux)
+	assert.Nil(t, c.p2p.conn)
+	assert.Nil(t, c.p2p.peer)
+	assert.Nil(t, c.p2p.keyPair)
+	assert.Nil(t, c.p2p.cipher)
 }
 
 func TestClient_GetInspector(t *testing.T) {
@@ -324,9 +321,9 @@ func TestClient_Authenticate_Success(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	// Server goroutine: accept stream, validate token, send success.
 	go func() {
@@ -356,12 +353,12 @@ func TestClient_Authenticate_Success(t *testing.T) {
 		_, _ = stream.Write(data)
 	}()
 
-	err := c.authenticate(context.Background())
+	err := c.relay.authenticate(context.Background())
 	require.NoError(t, err)
 
-	c.mu.Lock()
-	assert.Equal(t, "mysubdomain", c.config.Subdomain)
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	assert.Equal(t, "mysubdomain", c.relay.config.Subdomain)
+	c.relay.mu.Unlock()
 }
 
 // TestClient_Authenticate_SendsRealCapabilities verifies DP-33: the
@@ -374,9 +371,9 @@ func TestClient_Authenticate_SendsRealCapabilities(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	reqCh := make(chan *proto.AuthRequest, 1)
 	go func() {
@@ -402,7 +399,7 @@ func TestClient_Authenticate_SendsRealCapabilities(t *testing.T) {
 		_, _ = stream.Write(data)
 	}()
 
-	require.NoError(t, c.authenticate(context.Background()))
+	require.NoError(t, c.relay.authenticate(context.Background()))
 
 	req := <-reqCh
 	assert.Contains(t, req.Capabilities, "multi-tunnel")
@@ -418,9 +415,9 @@ func TestClient_Authenticate_StoresServerCapabilities(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	go func() {
 		stream, err := serverMux.AcceptStream()
@@ -440,10 +437,10 @@ func TestClient_Authenticate_StoresServerCapabilities(t *testing.T) {
 		_, _ = stream.Write(data)
 	}()
 
-	require.NoError(t, c.authenticate(context.Background()))
+	require.NoError(t, c.relay.authenticate(context.Background()))
 
-	assert.True(t, c.serverSupports("multi-tunnel"))
-	assert.False(t, c.serverSupports("p2p"))
+	assert.True(t, c.relay.ServerSupports("multi-tunnel"))
+	assert.False(t, c.relay.ServerSupports("p2p"))
 }
 
 // TestClient_ServerSupports_UnknownDefaultsTrue verifies that before any
@@ -452,18 +449,20 @@ func TestClient_Authenticate_StoresServerCapabilities(t *testing.T) {
 // supported rather than blocking behavior on missing information.
 func TestClient_ServerSupports_UnknownDefaultsTrue(t *testing.T) {
 	c := NewClient(DefaultConfig())
-	assert.True(t, c.serverSupports("p2p"))
-	assert.True(t, c.serverSupports("anything"))
+	assert.True(t, c.relay.ServerSupports("p2p"))
+	assert.True(t, c.relay.ServerSupports("anything"))
 }
 
 func TestClient_Capabilities_ReflectsP2PConfig(t *testing.T) {
-	withP2P := NewClient(DefaultConfig())
-	withP2P.config.P2PEnabled = true
-	assert.Contains(t, withP2P.capabilities(), "p2p")
+	cfgWith := DefaultConfig()
+	cfgWith.P2PEnabled = true
+	withP2P := NewClient(cfgWith)
+	assert.Contains(t, withP2P.relay.capabilities(), "p2p")
 
-	withoutP2P := NewClient(DefaultConfig())
-	withoutP2P.config.P2PEnabled = false
-	assert.NotContains(t, withoutP2P.capabilities(), "p2p")
+	cfgWithout := DefaultConfig()
+	cfgWithout.P2PEnabled = false
+	withoutP2P := NewClient(cfgWithout)
+	assert.NotContains(t, withoutP2P.relay.capabilities(), "p2p")
 }
 
 func TestClient_Authenticate_Failure(t *testing.T) {
@@ -472,9 +471,9 @@ func TestClient_Authenticate_Failure(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	// Server goroutine: reject auth.
 	go func() {
@@ -495,7 +494,7 @@ func TestClient_Authenticate_Failure(t *testing.T) {
 		_, _ = stream.Write(data)
 	}()
 
-	err := c.authenticate(context.Background())
+	err := c.relay.authenticate(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "rejected authentication")
 }
@@ -506,7 +505,7 @@ func TestClient_Authenticate_NilMux(t *testing.T) {
 	c := NewClient(cfg)
 
 	// mux is nil.
-	err := c.authenticate(context.Background())
+	err := c.relay.authenticate(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not connected")
 }
@@ -518,9 +517,9 @@ func TestClient_RegisterTunnel_Success(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	// Server goroutine: accept stream, read register, send success.
 	go func() {
@@ -549,13 +548,13 @@ func TestClient_RegisterTunnel_Success(t *testing.T) {
 		_, _ = stream.Write(data)
 	}()
 
-	err := c.registerTunnel(context.Background())
+	err := c.relay.registerTunnel(context.Background())
 	require.NoError(t, err)
 
-	c.mu.Lock()
-	assert.Equal(t, "tunnel-123", c.tunnelID)
-	assert.Equal(t, "https://myapp.example.com", c.publicURL)
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	assert.Equal(t, "tunnel-123", c.relay.tunnelID)
+	assert.Equal(t, "https://myapp.example.com", c.relay.publicURL)
+	c.relay.mu.Unlock()
 }
 
 func TestClient_RegisterTunnel_Failure(t *testing.T) {
@@ -564,9 +563,9 @@ func TestClient_RegisterTunnel_Failure(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	go func() {
 		stream, err := serverMux.AcceptStream()
@@ -586,7 +585,7 @@ func TestClient_RegisterTunnel_Failure(t *testing.T) {
 		_, _ = stream.Write(data)
 	}()
 
-	err := c.registerTunnel(context.Background())
+	err := c.relay.registerTunnel(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "registration failed")
 }
@@ -595,7 +594,7 @@ func TestClient_RegisterTunnel_NilMux(t *testing.T) {
 	cfg := DefaultConfig()
 	c := NewClient(cfg)
 
-	err := c.registerTunnel(context.Background())
+	err := c.relay.registerTunnel(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not connected")
 }
@@ -606,14 +605,14 @@ func TestClient_RegisterTunnel_InvalidPort(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	// Server side not needed since it will fail before writing.
 	_ = serverMux
 
-	err := c.registerTunnel(context.Background())
+	err := c.relay.registerTunnel(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid local port")
 }
@@ -626,9 +625,9 @@ func TestClient_CreateTunnel_Success(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	go func() {
 		stream, err := serverMux.AcceptStream()
@@ -667,7 +666,7 @@ func TestClient_CreateTunnel_Success(t *testing.T) {
 func TestClient_CreateTunnel_DuplicateName(t *testing.T) {
 	cfg := DefaultConfig()
 	c := NewClient(cfg)
-	c.activeTunnels = map[string]*ActiveTunnel{
+	c.relay.activeTunnels = map[string]*ActiveTunnel{
 		"db": {Def: TunnelDef{Name: "db", LocalPort: 5432}, TunnelID: "tid-existing"},
 	}
 
@@ -684,10 +683,10 @@ func TestClient_DeleteTunnel_Success(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
-	c.activeTunnels = map[string]*ActiveTunnel{
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
+	c.relay.activeTunnels = map[string]*ActiveTunnel{
 		"db": {Def: TunnelDef{Name: "db", LocalPort: 5432}, TunnelID: "tunnel-db"},
 	}
 
@@ -733,9 +732,9 @@ func TestClient_SendPing_Success(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	// Server goroutine: accept stream, read ping, send pong.
 	go func() {
@@ -763,7 +762,7 @@ func TestClient_SendPing_Success(t *testing.T) {
 		_, _ = stream.Write(data)
 	}()
 
-	err := c.sendPing(context.Background(), 42)
+	err := c.relay.sendPing(context.Background(), 42)
 	require.NoError(t, err)
 }
 
@@ -771,7 +770,7 @@ func TestClient_SendPing_NilMux(t *testing.T) {
 	cfg := DefaultConfig()
 	c := NewClient(cfg)
 
-	err := c.sendPing(context.Background(), 1)
+	err := c.relay.sendPing(context.Background(), 1)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not connected")
 }
@@ -784,9 +783,9 @@ func TestClient_DeriveP2PCipher_Success(t *testing.T) {
 	localKeyPair, err := p2p.GenerateKeyPair()
 	require.NoError(t, err)
 
-	c.mu.Lock()
-	c.p2pKeyPair = localKeyPair
-	c.mu.Unlock()
+	c.p2p.mu.Lock()
+	c.p2p.keyPair = localKeyPair
+	c.p2p.mu.Unlock()
 
 	// Generate a peer key pair.
 	peerKeyPair, err := p2p.GenerateKeyPair()
@@ -794,12 +793,12 @@ func TestClient_DeriveP2PCipher_Success(t *testing.T) {
 
 	peerPubB64 := base64.StdEncoding.EncodeToString(peerKeyPair.Public)
 
-	err = c.deriveP2PCipher(peerPubB64)
+	err = c.p2p.deriveP2PCipher(peerPubB64)
 	require.NoError(t, err)
 
-	c.mu.Lock()
-	assert.NotNil(t, c.p2pCipher)
-	c.mu.Unlock()
+	c.p2p.mu.Lock()
+	assert.NotNil(t, c.p2p.cipher)
+	c.p2p.mu.Unlock()
 }
 
 func TestClient_DeriveP2PCipher_InvalidBase64(t *testing.T) {
@@ -808,11 +807,11 @@ func TestClient_DeriveP2PCipher_InvalidBase64(t *testing.T) {
 
 	localKeyPair, err := p2p.GenerateKeyPair()
 	require.NoError(t, err)
-	c.mu.Lock()
-	c.p2pKeyPair = localKeyPair
-	c.mu.Unlock()
+	c.p2p.mu.Lock()
+	c.p2p.keyPair = localKeyPair
+	c.p2p.mu.Unlock()
 
-	err = c.deriveP2PCipher("not-valid-base64!!!")
+	err = c.p2p.deriveP2PCipher("not-valid-base64!!!")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "decode peer public key")
 }
@@ -826,7 +825,7 @@ func TestClient_DeriveP2PCipher_NilKeyPair(t *testing.T) {
 	require.NoError(t, err)
 	peerPubB64 := base64.StdEncoding.EncodeToString(peerKeyPair.Public)
 
-	err = c.deriveP2PCipher(peerPubB64)
+	err = c.p2p.deriveP2PCipher(peerPubB64)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "local key pair not generated")
 }
@@ -858,7 +857,7 @@ func TestClient_HandleStream_StreamRequest(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		c.handleStream(context.Background(), clientStream)
+		c.relay.handleStream(context.Background(), clientStream)
 	}()
 
 	// Wait for handleStream to finish (it should fail to dial quickly).
@@ -886,10 +885,10 @@ func TestClient_Close_WithMux(t *testing.T) {
 	clientMux, err := tunnel.Client(clientConn, muxCfg)
 	require.NoError(t, err)
 
-	c.mu.Lock()
-	c.mux = clientMux
-	c.conn = clientConn
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.conn = clientConn
+	c.relay.mu.Unlock()
 
 	err = c.Close()
 	assert.NoError(t, err)
@@ -1147,9 +1146,9 @@ func TestClient_HeartbeatLoop(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	// Count pings received by the server.
 	var pingCount int32
@@ -1187,7 +1186,7 @@ func TestClient_HeartbeatLoop(t *testing.T) {
 
 	// heartbeatLoop expects closeWg to be set up.
 	c.closeWg.Add(1)
-	go c.heartbeatLoop(ctx)
+	go c.relay.heartbeatLoop(ctx)
 
 	// Let it run for enough time to send several pings.
 	time.Sleep(250 * time.Millisecond)
@@ -1212,9 +1211,9 @@ func TestClient_HeartbeatLoop_MuxClosed(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, _ := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	// Close mux immediately.
 	_ = clientMux.Close()
@@ -1223,7 +1222,7 @@ func TestClient_HeartbeatLoop_MuxClosed(t *testing.T) {
 	defer cancel()
 
 	c.closeWg.Add(1)
-	go c.heartbeatLoop(ctx)
+	go c.relay.heartbeatLoop(ctx)
 
 	// Should exit quickly since mux is closed.
 	done := make(chan struct{})
@@ -1253,9 +1252,9 @@ func TestClient_HeartbeatLoop_ClosesMuxAfterConsecutiveFailures(t *testing.T) {
 
 	clientMux, serverMux := newClientMuxPair(t)
 	defer serverMux.Close()
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	// Server side never accepts/responds to any stream, so every ping
 	// times out after HeartbeatTimeout and counts as a failure.
@@ -1264,7 +1263,7 @@ func TestClient_HeartbeatLoop_ClosesMuxAfterConsecutiveFailures(t *testing.T) {
 	defer cancel()
 
 	c.closeWg.Add(1)
-	go c.heartbeatLoop(ctx)
+	go c.relay.heartbeatLoop(ctx)
 
 	done := make(chan struct{})
 	go func() {
@@ -1296,7 +1295,7 @@ func TestClient_ConnectWithRetry_MaxAttempts(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	err := c.connectWithRetry(ctx)
+	err := c.relay.Run(ctx)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "max reconnection attempts reached")
 
@@ -1320,7 +1319,7 @@ func TestClient_ConnectWithRetry_ContextCancel(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- c.connectWithRetry(ctx)
+		errCh <- c.relay.Run(ctx)
 	}()
 
 	// Cancel after first failure's backoff starts.
@@ -1345,7 +1344,7 @@ func TestClient_ConnectWithRetry_CloseCh(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- c.connectWithRetry(ctx)
+		errCh <- c.relay.Run(ctx)
 	}()
 
 	// Signal close.
@@ -1368,9 +1367,9 @@ func TestClient_HandleConnection_UnblocksOnMuxClose(t *testing.T) {
 
 	clientMux, serverMux := newClientMuxPair(t)
 	defer serverMux.Close()
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1378,7 +1377,7 @@ func TestClient_HandleConnection_UnblocksOnMuxClose(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		c.handleConnection(ctx)
+		c.relay.handleConnection(ctx)
 	}()
 
 	// Simulate a network failure: close the mux out-of-band, without
@@ -1392,7 +1391,7 @@ func TestClient_HandleConnection_UnblocksOnMuxClose(t *testing.T) {
 		t.Fatal("handleConnection should return promptly when the mux is closed externally")
 	}
 
-	assert.Equal(t, uint32(0), c.connected)
+	assert.Equal(t, uint32(0), c.relay.connected)
 }
 
 // --- handleConnection + acceptStreams tests ---
@@ -1407,14 +1406,14 @@ func TestClient_AcceptStreams(t *testing.T) {
 	c.inspector.SetEnabled(false)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	c.closeWg.Add(1)
-	go c.acceptStreams(ctx)
+	go c.relay.acceptStreams(ctx)
 
 	// Server opens 3 streams, each with a StreamRequest.
 	for i := 0; i < 3; i++ {
@@ -1448,10 +1447,10 @@ func TestClient_SendP2PResult_Success(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.tunnelID = "tunnel-42"
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.tunnelID = "tunnel-42"
+	c.relay.mu.Unlock()
 
 	// Server goroutine: accept stream, read P2P result.
 	resultCh := make(chan *proto.P2PResult, 1)
@@ -1475,7 +1474,7 @@ func TestClient_SendP2PResult_Success(t *testing.T) {
 		resultCh <- msg.P2PResult
 	}()
 
-	c.sendP2PResult(context.Background(), true, "5.6.7.8:9000", "")
+	c.p2p.sendP2PResult(context.Background(), c.relay, true, "5.6.7.8:9000", "")
 
 	select {
 	case result := <-resultCh:
@@ -1494,15 +1493,15 @@ func TestClient_SendP2PResult_ClosedMux(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, _ := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	// Close mux.
 	_ = clientMux.Close()
 
 	// Should not panic or block.
-	c.sendP2PResult(context.Background(), false, "", "test error")
+	c.p2p.sendP2PResult(context.Background(), c.relay, false, "", "test error")
 }
 
 // TestClient_HandleP2PNotification verifies that handleP2PNotification
@@ -1526,15 +1525,15 @@ func TestClient_HandleP2PNotification_KeyDerivation(t *testing.T) {
 
 	// handleP2PNotification will start attemptP2P in a goroutine,
 	// which will fail (no real peer). We just verify key derivation works.
-	c.handleP2PNotification(context.Background(), resp, nil)
+	c.p2p.HandleNotification(context.Background(), c.relay, resp, nil)
 
 	// Give a moment for the goroutine to start.
 	time.Sleep(50 * time.Millisecond)
 
-	c.mu.Lock()
-	assert.NotNil(t, c.p2pKeyPair, "key pair should be generated")
-	assert.NotNil(t, c.p2pCipher, "cipher should be derived from peer key")
-	c.mu.Unlock()
+	c.p2p.mu.Lock()
+	assert.NotNil(t, c.p2p.keyPair, "key pair should be generated")
+	assert.NotNil(t, c.p2p.cipher, "cipher should be derived from peer key")
+	c.p2p.mu.Unlock()
 }
 
 // TestClient_HandleP2PNotification_NoSuccess verifies that handleP2PNotification
@@ -1549,11 +1548,11 @@ func TestClient_HandleP2PNotification_NoSuccess(t *testing.T) {
 	}
 
 	// Should return immediately without generating keys.
-	c.handleP2PNotification(context.Background(), resp, nil)
+	c.p2p.HandleNotification(context.Background(), c.relay, resp, nil)
 
-	c.mu.Lock()
-	assert.Nil(t, c.p2pKeyPair)
-	c.mu.Unlock()
+	c.p2p.mu.Lock()
+	assert.Nil(t, c.p2p.keyPair)
+	c.p2p.mu.Unlock()
 }
 
 // TestClient_ForwardToLocal_HTTPWithInspector verifies that when the inspector
@@ -1669,22 +1668,22 @@ func TestClient_ResolveLocalAddr_KnownTunnelID(t *testing.T) {
 	cfg.LocalPort = 9999 // Should NOT be used when TunnelID matches.
 	c := NewClient(cfg)
 
-	c.activeTunnelsMu.Lock()
-	c.activeTunnels["web"] = &ActiveTunnel{
+	c.relay.activeTunnelsMu.Lock()
+	c.relay.activeTunnels["web"] = &ActiveTunnel{
 		Def:      TunnelDef{Name: "web", LocalHost: "127.0.0.1", LocalPort: 3000},
 		TunnelID: "web-tunnel-id",
 	}
-	c.activeTunnels["api"] = &ActiveTunnel{
+	c.relay.activeTunnels["api"] = &ActiveTunnel{
 		Def:      TunnelDef{Name: "api", LocalHost: "10.0.0.5", LocalPort: 8080},
 		TunnelID: "api-tunnel-id",
 	}
-	c.activeTunnelsMu.Unlock()
+	c.relay.activeTunnelsMu.Unlock()
 
-	host, port := c.resolveLocalAddr("api-tunnel-id")
+	host, port := c.relay.ResolveLocalAddr("api-tunnel-id")
 	assert.Equal(t, "10.0.0.5", host)
 	assert.Equal(t, 8080, port)
 
-	host, port = c.resolveLocalAddr("web-tunnel-id")
+	host, port = c.relay.ResolveLocalAddr("web-tunnel-id")
 	assert.Equal(t, "127.0.0.1", host)
 	assert.Equal(t, 3000, port)
 }
@@ -1698,18 +1697,18 @@ func TestClient_ResolveLocalAddr_UnknownOrEmptyTunnelID(t *testing.T) {
 	cfg.LocalPort = 4000
 	c := NewClient(cfg)
 
-	host, port := c.resolveLocalAddr("")
+	host, port := c.relay.ResolveLocalAddr("")
 	assert.Equal(t, "127.0.0.1", host)
 	assert.Equal(t, 4000, port)
 
-	c.activeTunnelsMu.Lock()
-	c.activeTunnels["web"] = &ActiveTunnel{
+	c.relay.activeTunnelsMu.Lock()
+	c.relay.activeTunnels["web"] = &ActiveTunnel{
 		Def:      TunnelDef{Name: "web", LocalHost: "127.0.0.1", LocalPort: 3000},
 		TunnelID: "web-tunnel-id",
 	}
-	c.activeTunnelsMu.Unlock()
+	c.relay.activeTunnelsMu.Unlock()
 
-	host, port = c.resolveLocalAddr("unknown-tunnel-id")
+	host, port = c.relay.ResolveLocalAddr("unknown-tunnel-id")
 	assert.Equal(t, "127.0.0.1", host)
 	assert.Equal(t, 4000, port)
 }
@@ -1885,7 +1884,7 @@ func TestClient_HandleStream_DefaultBranch(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		c.handleStream(context.Background(), clientStream)
+		c.relay.handleStream(context.Background(), clientStream)
 	}()
 
 	select {
@@ -1918,7 +1917,7 @@ func TestClient_HandleStream_ReadError(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		c.handleStream(context.Background(), clientStream)
+		c.relay.handleStream(context.Background(), clientStream)
 	}()
 
 	select {
@@ -1949,7 +1948,7 @@ func TestClient_HandleStream_DecodeError(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		c.handleStream(context.Background(), clientStream)
+		c.relay.handleStream(context.Background(), clientStream)
 	}()
 
 	select {
@@ -2033,7 +2032,7 @@ func TestClient_HandleStream_P2POfferResponse(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		c.handleStream(context.Background(), clientStream)
+		c.relay.handleStream(context.Background(), clientStream)
 	}()
 
 	select {
@@ -2047,10 +2046,10 @@ func TestClient_HandleStream_P2POfferResponse(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// The P2P key pair should have been generated and cipher derived.
-	c.mu.Lock()
-	assert.NotNil(t, c.p2pKeyPair, "key pair should be generated from P2POfferResponse")
-	assert.NotNil(t, c.p2pCipher, "cipher should be derived from P2POfferResponse")
-	c.mu.Unlock()
+	c.p2p.mu.Lock()
+	assert.NotNil(t, c.p2p.keyPair, "key pair should be generated from P2POfferResponse")
+	assert.NotNil(t, c.p2p.cipher, "cipher should be derived from P2POfferResponse")
+	c.p2p.mu.Unlock()
 
 	_ = serverStream.Close()
 }
@@ -2090,7 +2089,7 @@ func TestClient_HandleStream_P2PCandidatesThenOfferResponse(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		c.handleStream(context.Background(), clientStream)
+		c.relay.handleStream(context.Background(), clientStream)
 	}()
 
 	select {
@@ -2103,10 +2102,10 @@ func TestClient_HandleStream_P2PCandidatesThenOfferResponse(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	c.mu.Lock()
-	assert.NotNil(t, c.p2pKeyPair, "key pair should be generated from the terminal P2POfferResponse")
-	assert.NotNil(t, c.p2pCipher, "cipher should be derived from the terminal P2POfferResponse")
-	c.mu.Unlock()
+	c.p2p.mu.Lock()
+	assert.NotNil(t, c.p2p.keyPair, "key pair should be generated from the terminal P2POfferResponse")
+	assert.NotNil(t, c.p2p.cipher, "cipher should be derived from the terminal P2POfferResponse")
+	c.p2p.mu.Unlock()
 
 	_ = serverStream.Close()
 }
@@ -2153,7 +2152,7 @@ func TestClient_AcceptP2PStreams_ForwardsRequest(t *testing.T) {
 	clientMux := p2p.NewUDPMux(conn2, peer1Addr, p2p.DefaultTransportConfig(), nil, false)
 
 	closeCh := make(chan struct{})
-	go c.acceptP2PStreams(context.Background(), clientMux, closeCh)
+	go c.p2p.acceptP2PStreams(context.Background(), clientMux, closeCh)
 
 	// Server opens a stream and sends a StreamRequest.
 	stream, err := serverMux.OpenStream()
@@ -2184,13 +2183,13 @@ func TestClient_AcceptP2PStreams_FallbackOnClose(t *testing.T) {
 	defer conn1.Close()
 
 	clientMux := p2p.NewUDPMux(conn2, peer2Addr, p2p.DefaultTransportConfig(), nil, false)
-	atomic.StoreUint32(&c.p2pMode, 1)
+	atomic.StoreUint32(&c.p2p.mode, 1)
 
 	closeCh := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		c.acceptP2PStreams(context.Background(), clientMux, closeCh)
+		c.p2p.acceptP2PStreams(context.Background(), clientMux, closeCh)
 	}()
 
 	// Close the mux to trigger fallback.
@@ -2218,14 +2217,14 @@ func TestClient_HandleP2POfferResponse_FailureDoesNotAttemptP2P(t *testing.T) {
 			c := NewClient(cfg)
 
 			resp := &proto.P2POfferResponse{Success: false, Error: "no target specified"}
-			c.handleP2POfferResponse(context.Background(), resp, nil)
+			c.p2p.handleOfferResponse(context.Background(), c.relay, resp, nil)
 
 			// No hole-punch attempt means p2pMode stays 0 and no cipher/key
 			// pair gets derived from a (non-existent) peer key.
 			assert.False(t, c.IsP2PMode())
-			c.mu.Lock()
-			assert.Nil(t, c.p2pCipher)
-			c.mu.Unlock()
+			c.p2p.mu.Lock()
+			assert.Nil(t, c.p2p.cipher)
+			c.p2p.mu.Unlock()
 		})
 	}
 }
@@ -2269,7 +2268,7 @@ func TestClient_ProxyConnectConn_ForwardsStreamRequestAndBytes(t *testing.T) {
 	localServerConn := <-localServerConnCh
 	defer localServerConn.Close()
 
-	go c.proxyConnectConn(context.Background(), initiatorMux, localServerConn, "peer-tunnel-42")
+	go c.p2p.proxyConnectConn(initiatorMux, localServerConn, "peer-tunnel-42")
 
 	// Peer side: accept the stream, verify the StreamRequest, then echo.
 	peerStream, err := peerMux.AcceptStream()
@@ -2333,7 +2332,7 @@ func TestClient_StartConnectListener_ProxiesLocalConnections(t *testing.T) {
 
 	closeCh := make(chan struct{})
 	defer close(closeCh)
-	go c.startConnectListener(context.Background(), initiatorMux, "peer-tunnel-1", closeCh)
+	go c.p2p.startConnectListener(context.Background(), initiatorMux, "peer-tunnel-1", closeCh)
 
 	// Give the listener a moment to bind before dialing.
 	time.Sleep(100 * time.Millisecond)
@@ -2424,23 +2423,23 @@ func TestClient_Close_WithP2PResources(t *testing.T) {
 	peerKP, _ := p2p.GenerateKeyPair()
 	cipher, _ := p2p.DeriveSession(kp.Private, peerKP.Public)
 
-	c.mu.Lock()
-	c.p2pConn = newFakePacketConn(pConn)
+	c.p2p.mu.Lock()
+	c.p2p.conn = newFakePacketConn(pConn)
 	// p2pTransport intentionally nil — Close handles nil transport gracefully.
-	c.p2pPeer = &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 5000}
-	c.p2pCloseCh = make(chan struct{})
-	c.p2pKeyPair = kp
-	c.p2pCipher = cipher
-	c.mu.Unlock()
+	c.p2p.peer = &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 5000}
+	c.p2p.sessionCloseCh = make(chan struct{})
+	c.p2p.keyPair = kp
+	c.p2p.cipher = cipher
+	c.p2p.mu.Unlock()
 
 	err := c.Close()
 	assert.NoError(t, err)
 
 	// Verify P2P resources were cleaned up.
-	c.mu.Lock()
-	assert.Nil(t, c.p2pConn)
-	assert.Nil(t, c.p2pPeer)
-	c.mu.Unlock()
+	c.p2p.mu.Lock()
+	assert.Nil(t, c.p2p.conn)
+	assert.Nil(t, c.p2p.peer)
+	c.p2p.mu.Unlock()
 }
 
 // TestClient_FallbackToRelay_WithResources verifies fallbackToRelay properly
@@ -2456,26 +2455,26 @@ func TestClient_FallbackToRelay_WithResources(t *testing.T) {
 	peerKP, _ := p2p.GenerateKeyPair()
 	cipher, _ := p2p.DeriveSession(kp.Private, peerKP.Public)
 
-	c.mu.Lock()
-	c.p2pConn = newFakePacketConn(pConn)
+	c.p2p.mu.Lock()
+	c.p2p.conn = newFakePacketConn(pConn)
 	// p2pTransport nil — fallback handles nil gracefully.
-	c.p2pPeer = &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 5000}
-	c.p2pCloseCh = make(chan struct{})
-	c.p2pKeyPair = kp
-	c.p2pCipher = cipher
-	c.mu.Unlock()
-	atomic.StoreUint32(&c.p2pMode, 1)
+	c.p2p.peer = &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 5000}
+	c.p2p.sessionCloseCh = make(chan struct{})
+	c.p2p.keyPair = kp
+	c.p2p.cipher = cipher
+	c.p2p.mu.Unlock()
+	atomic.StoreUint32(&c.p2p.mode, 1)
 
-	c.fallbackToRelay("test reason with resources")
+	c.p2p.fallbackToRelay("test reason with resources")
 
 	assert.False(t, c.IsP2PMode())
-	c.mu.Lock()
-	assert.Nil(t, c.p2pConn)
-	assert.Nil(t, c.p2pPeer)
-	assert.Nil(t, c.p2pKeyPair)
-	assert.Nil(t, c.p2pCipher)
-	assert.Nil(t, c.p2pCloseCh, "close channel should be nil after fallback")
-	c.mu.Unlock()
+	c.p2p.mu.Lock()
+	assert.Nil(t, c.p2p.conn)
+	assert.Nil(t, c.p2p.peer)
+	assert.Nil(t, c.p2p.keyPair)
+	assert.Nil(t, c.p2p.cipher)
+	assert.Nil(t, c.p2p.sessionCloseCh, "close channel should be nil after fallback")
+	c.p2p.mu.Unlock()
 }
 
 // TestClient_Connect_DialFailure verifies that connect returns an error when
@@ -2488,7 +2487,7 @@ func TestClient_Connect_DialFailure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	err := c.connect(ctx)
+	err := c.relay.connect(ctx)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "dial server")
 }
@@ -2501,9 +2500,9 @@ func TestClient_Authenticate_UnexpectedResponse(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	go func() {
 		stream, err := serverMux.AcceptStream()
@@ -2524,7 +2523,7 @@ func TestClient_Authenticate_UnexpectedResponse(t *testing.T) {
 		_, _ = stream.Write(data)
 	}()
 
-	err := c.authenticate(context.Background())
+	err := c.relay.authenticate(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unexpected response type")
 }
@@ -2537,9 +2536,9 @@ func TestClient_RegisterTunnel_UnexpectedResponse(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	go func() {
 		stream, err := serverMux.AcceptStream()
@@ -2560,7 +2559,7 @@ func TestClient_RegisterTunnel_UnexpectedResponse(t *testing.T) {
 		_, _ = stream.Write(data)
 	}()
 
-	err := c.registerTunnel(context.Background())
+	err := c.relay.registerTunnel(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unexpected response type")
 }
@@ -2688,7 +2687,7 @@ func TestBuildTLSConfig_Defaults(t *testing.T) {
 	cfg.TLSEnabled = true
 
 	c := NewClient(cfg)
-	tlsCfg, err := c.buildTLSConfig()
+	tlsCfg, err := c.relay.buildTLSConfig()
 	require.NoError(t, err)
 
 	assert.Equal(t, uint16(tls.VersionTLS12), tlsCfg.MinVersion)
@@ -2705,7 +2704,7 @@ func TestBuildTLSConfig_Insecure(t *testing.T) {
 	cfg.TLSInsecure = true
 
 	c := NewClient(cfg)
-	tlsCfg, err := c.buildTLSConfig()
+	tlsCfg, err := c.relay.buildTLSConfig()
 	require.NoError(t, err)
 
 	assert.True(t, tlsCfg.InsecureSkipVerify)
@@ -2731,7 +2730,7 @@ func TestBuildTLSConfig_ServerNameFromAddr(t *testing.T) {
 			cfg.TLSEnabled = true
 
 			c := NewClient(cfg)
-			tlsCfg, err := c.buildTLSConfig()
+			tlsCfg, err := c.relay.buildTLSConfig()
 			require.NoError(t, err)
 			assert.Equal(t, tt.expectSNI, tlsCfg.ServerName)
 		})
@@ -2746,7 +2745,7 @@ func TestBuildTLSConfig_InvalidCAFile(t *testing.T) {
 	cfg.TLSCACert = "/nonexistent/ca-cert.pem"
 
 	c := NewClient(cfg)
-	_, err := c.buildTLSConfig()
+	_, err := c.relay.buildTLSConfig()
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "read CA certificate")
 }
@@ -2767,7 +2766,7 @@ func TestBuildTLSConfig_InvalidCACert(t *testing.T) {
 	cfg.TLSCACert = tmpFile.Name()
 
 	c := NewClient(cfg)
-	_, err = c.buildTLSConfig()
+	_, err = c.relay.buildTLSConfig()
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to parse CA certificate")
 }
@@ -2825,10 +2824,10 @@ func TestClient_RequestStats_Success(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.sessionID = "session-abc"
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.sessionID = "session-abc"
+	c.relay.mu.Unlock()
 
 	// Server goroutine: accept stream, read StatsRequest, send StatsResponse.
 	go func() {
@@ -2889,9 +2888,9 @@ func TestClient_RequestStats_ClosedMux(t *testing.T) {
 	clientMux, _ := newClientMuxPair(t)
 	_ = clientMux.Close()
 
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	stats, err := c.RequestStats(context.Background())
 	require.Error(t, err)
@@ -2906,9 +2905,9 @@ func TestClient_RequestStats_UnexpectedResponse(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	go func() {
 		stream, err := serverMux.AcceptStream()
@@ -2942,9 +2941,9 @@ func TestClient_CloseTunnel_Success(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	// Server goroutine: accept stream, read CloseRequest, send success CloseResponse.
 	go func() {
@@ -2984,9 +2983,9 @@ func TestClient_CloseTunnel_Rejected(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	go func() {
 		stream, err := serverMux.AcceptStream()
@@ -3030,9 +3029,9 @@ func TestClient_CloseTunnel_ClosedMux(t *testing.T) {
 	clientMux, _ := newClientMuxPair(t)
 	_ = clientMux.Close()
 
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	err := c.CloseTunnel(context.Background(), "tunnel-closed", "test")
 	require.Error(t, err)
@@ -3046,9 +3045,9 @@ func TestClient_CloseTunnel_UnexpectedResponse(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
 
 	go func() {
 		stream, err := serverMux.AcceptStream()
@@ -3081,10 +3080,10 @@ func TestClient_Close_GracefulShutdown(t *testing.T) {
 	c := NewClient(cfg)
 
 	clientMux, serverMux := newClientMuxPair(t)
-	c.mu.Lock()
-	c.mux = clientMux
-	c.tunnelID = "tunnel-graceful"
-	c.mu.Unlock()
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.tunnelID = "tunnel-graceful"
+	c.relay.mu.Unlock()
 
 	// Server goroutine: accept the close stream and respond.
 	closeReceived := make(chan string, 1)

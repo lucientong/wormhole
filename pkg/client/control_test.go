@@ -18,13 +18,10 @@ import (
 
 // buildClientWithTunnels returns a minimal Client pre-populated with active tunnels.
 func buildClientWithTunnels(defs []ActiveTunnel) *Client {
-	c := &Client{
-		activeTunnels: make(map[string]*ActiveTunnel),
-		closeCh:       make(chan struct{}),
-	}
+	c := NewClient(DefaultConfig())
 	for i := range defs {
 		d := defs[i]
-		c.activeTunnels[d.Def.Name] = &d
+		c.relay.activeTunnels[d.Def.Name] = &d
 	}
 	return c
 }
@@ -40,15 +37,13 @@ func TestListActiveTunnels_MultiTunnel(t *testing.T) {
 }
 
 func TestListActiveTunnels_SingleTunnelFallback(t *testing.T) {
-	c := &Client{
-		activeTunnels: make(map[string]*ActiveTunnel),
-		closeCh:       make(chan struct{}),
-		tunnelID:      "single-tid",
-		publicURL:     "https://xyz.example.com",
-	}
-	c.config.LocalPort = 5000
-	c.config.LocalHost = "127.0.0.1"
-	c.config.Protocol = protocolHTTP
+	cfg := DefaultConfig()
+	cfg.LocalPort = 5000
+	cfg.LocalHost = "127.0.0.1"
+	cfg.Protocol = protocolHTTP
+	c := NewClient(cfg)
+	c.relay.tunnelID = "single-tid"
+	c.relay.publicURL = "https://xyz.example.com"
 
 	list := c.ListActiveTunnels()
 	require.Len(t, list, 1)
@@ -57,10 +52,7 @@ func TestListActiveTunnels_SingleTunnelFallback(t *testing.T) {
 }
 
 func TestListActiveTunnels_Empty(t *testing.T) {
-	c := &Client{
-		activeTunnels: make(map[string]*ActiveTunnel),
-		closeCh:       make(chan struct{}),
-	}
+	c := NewClient(DefaultConfig())
 	list := c.ListActiveTunnels()
 	assert.Empty(t, list)
 }
@@ -92,7 +84,7 @@ func TestHandleCtrlTunnels_JSON(t *testing.T) {
 }
 
 func TestHandleCtrlTunnels_MethodNotAllowed(t *testing.T) {
-	c := &Client{activeTunnels: make(map[string]*ActiveTunnel), closeCh: make(chan struct{})}
+	c := NewClient(DefaultConfig())
 
 	req := httptest.NewRequest(http.MethodPut, "/tunnels", nil)
 	w := httptest.NewRecorder()
@@ -104,7 +96,7 @@ func TestHandleCtrlTunnels_MethodNotAllowed(t *testing.T) {
 // ─── Control API: create/delete (U1) ─────────────────────────────────────
 
 func TestHandleCtrlCreateTunnel_InvalidBody(t *testing.T) {
-	c := &Client{activeTunnels: make(map[string]*ActiveTunnel), closeCh: make(chan struct{})}
+	c := NewClient(DefaultConfig())
 
 	req := httptest.NewRequest(http.MethodPost, "/tunnels", strings.NewReader("not json"))
 	w := httptest.NewRecorder()
@@ -114,7 +106,7 @@ func TestHandleCtrlCreateTunnel_InvalidBody(t *testing.T) {
 }
 
 func TestHandleCtrlCreateTunnel_MissingName(t *testing.T) {
-	c := &Client{activeTunnels: make(map[string]*ActiveTunnel), closeCh: make(chan struct{})}
+	c := NewClient(DefaultConfig())
 
 	body, _ := json.Marshal(createTunnelRequest{LocalPort: 8080})
 	req := httptest.NewRequest(http.MethodPost, "/tunnels", bytes.NewReader(body))
@@ -126,7 +118,7 @@ func TestHandleCtrlCreateTunnel_MissingName(t *testing.T) {
 }
 
 func TestHandleCtrlCreateTunnel_RejectsUDP(t *testing.T) {
-	c := &Client{activeTunnels: make(map[string]*ActiveTunnel), closeCh: make(chan struct{})}
+	c := NewClient(DefaultConfig())
 
 	body, _ := json.Marshal(createTunnelRequest{Name: "db", LocalPort: 5432, Protocol: protocolUDP})
 	req := httptest.NewRequest(http.MethodPost, "/tunnels", bytes.NewReader(body))
@@ -151,7 +143,7 @@ func TestHandleCtrlCreateTunnel_DuplicateName(t *testing.T) {
 }
 
 func TestHandleCtrlDeleteTunnel_NotFound(t *testing.T) {
-	c := &Client{activeTunnels: make(map[string]*ActiveTunnel), closeCh: make(chan struct{})}
+	c := NewClient(DefaultConfig())
 
 	req := httptest.NewRequest(http.MethodDelete, "/tunnels/missing", nil)
 	req.SetPathValue("name", "missing")
@@ -176,7 +168,7 @@ func TestCreateTunnel_DuplicateName(t *testing.T) {
 // TestDeleteTunnel_NotFound verifies DeleteTunnel itself rejects an
 // unknown tunnel name without touching the mux.
 func TestDeleteTunnel_NotFound(t *testing.T) {
-	c := &Client{activeTunnels: make(map[string]*ActiveTunnel), closeCh: make(chan struct{})}
+	c := NewClient(DefaultConfig())
 
 	err := c.DeleteTunnel(context.Background(), "missing")
 	require.Error(t, err)

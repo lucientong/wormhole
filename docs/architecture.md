@@ -24,6 +24,7 @@
 - [Hot-Path Allocation Pooling (P3-6 Batch B)](#hot-path-allocation-pooling-p3-6-batch-b)
 - [Context Propagation (P3-6 Batch C)](#context-propagation-p3-6-batch-c)
 - [God-Object Decomposition, Server Side (P3-6 Batch D)](#god-object-decomposition-server-side-p3-6-batch-d)
+- [God-Object Decomposition, Client Side (P3-6 Batch D)](#god-object-decomposition-client-side-p3-6-batch-d)
 - [Data Flow Summary](#data-flow-summary)
 
 ---
@@ -109,7 +110,9 @@ Wormhole is a Client-Server architecture tunneling tool. The core idea is:
 
 | Component | Location | Responsibility |
 |-----------|----------|----------------|
-| `Client` | `pkg/client/client.go` | Core controller; connection, multi-tunnel, hot-reload, reconnection |
+| `Client` | `pkg/client/client.go` | Composition root; wires up `RelayClient`/`P2PSession`, aggregates `Stats`, owns the inspector and local control/inspector HTTP servers, and implements the `localForwarder`/`statsRecorder` callbacks both components use (P3-6 batch D) |
+| `RelayClient` | `pkg/client/relay_client.go` | Control-plane connection lifecycle: dial (+TLS), auth (with token refresh), single-/multi-tunnel registration, heartbeat, accepting inbound streams, and the reconnect loop |
+| `P2PSession` | `pkg/client/p2p_session.go` | `wormhole connect` / P2P hole-punching lifecycle: NAT discovery, ECDH key exchange, hole punching, the multiplexed P2P transport, and the connect-mode local listener |
 | `FileConfig` | `pkg/client/config_file.go` | YAML config file loader + validator |
 | Control API | `pkg/client/control.go` | Local HTTP server (`/tunnels`) for `wormhole tunnels list` |
 | `Inspector` | `pkg/inspector/inspector.go` | HTTP traffic capture and recording |
@@ -1381,7 +1384,7 @@ Once `ReadContext`/`WriteContext` existed, `golangci-lint`'s `contextcheck` anal
 
 ## God-Object Decomposition, Server Side (P3-6 Batch D)
 
-The fourth and riskiest P3-6 sub-batch addresses the data-plane review's finding that `Server` had accreted roughly 15 distinct responsibilities into one ~2,200-line struct (routing, client-session bookkeeping, TCP port allocation, cluster heartbeat, HTTP/WebSocket/TCP forwarding, stream-budget accounting, and P2P signaling all lived on the same receiver). Given the risk, this sub-batch is itself split into two checkpoints verified independently: the server side (this section) and a follow-up client side (`RelayClient`/`P2PSession`, not yet started).
+The fourth and riskiest P3-6 sub-batch addresses the data-plane review's finding that `Server` had accreted roughly 15 distinct responsibilities into one ~2,200-line struct (routing, client-session bookkeeping, TCP port allocation, cluster heartbeat, HTTP/WebSocket/TCP forwarding, stream-budget accounting, and P2P signaling all lived on the same receiver). Given the risk, this sub-batch is itself split into two checkpoints verified independently: the server side (this section) and the client side (`RelayClient`/`P2PSession`, see [below](#god-object-decomposition-client-side-p3-6-batch-d)).
 
 ### Three New Components
 
@@ -1422,6 +1425,40 @@ Updating the test suite's server constructors to go through `NewServer(config)` 
 ### Verification
 
 `go build ./...`, `go vet ./...`, `golangci-lint run ./...` (0 issues), `gosec -exclude=G115 -exclude-dir=web -exclude-dir=pkg/proto/pb ./...` (0 issues, matching CI's exact invocation), and `go test -race ./...` all pass; `pkg/server` coverage held at 78.0%, essentially unchanged from before the split.
+
+---
+
+## God-Object Decomposition, Client Side (P3-6 Batch D)
+
+The second checkpoint of batch D applies the same methodology to the client's mirror-image god object: `Client` (`pkg/client/client.go`) had grown to ~2,100 lines covering control-plane connection/auth/reconnect, multi-tunnel registration, heartbeat, and the entire `wormhole connect` P2P subsystem (NAT discovery, ECDH key exchange, hole punching, the P2P data plane) — all guarded by one `c.mu`.
+
+### Two New Components
+
+`Client` is now a composition root: `NewClient` constructs `RelayClient` and `P2PSession` and wires them together with a handful of callbacks, but no longer owns their connection/session state directly.
+
+```
+NewClient(config)
+  ├── p2p   := newP2PSession(config, manager, forwarder, stats, closeCh)   // P2PSession
+  └── relay := newRelayClient(config, forwarder, stats, p2p.Manager(),
+                               closeCh, &closeWg)                          // RelayClient
+       relay.setAfterConnect(p2p.MaybeSendOffer)                          // wire callbacks
+       relay.setNotificationHandler(p2p.HandleNotification)
+```
+
+| Component | File | Owns |
+|-----------|------|------|
+| `RelayClient` | `pkg/client/relay_client.go` | The control-plane `net.Conn`/`tunnel.Mux`, `connected` flag (atomic), auth + token-refresh, single-/multi-tunnel registration and the `activeTunnels` map, the heartbeat goroutine, and the reconnect loop (`Run`) |
+| `P2PSession` | `pkg/client/p2p_session.go` | The P2P `net.PacketConn`/`*p2p.UDPMux`, ECDH `KeyPair`/`SessionCipher`, `mode` flag (atomic: relay vs. P2P), the hole-punch attempt (`attemptP2P`), and the `wormhole connect` local listener (`startConnectListener`/`proxyConnectConn`) |
+
+Both components depend on `Client` only through two small consumer-side interfaces it implements — `localForwarder` (hand a stream off to be proxied to the local service) and `statsRecorder` (report bytes/connections into the aggregate `Stats`) — so neither `RelayClient` nor `P2PSession` needs to know `Client` exists as a concrete type. `P2PSession` talks back to `RelayClient` only through the minimal `RelayChannel` interface (send a P2P result over the control connection), not the full `RelayClient` surface. `Client` retains its own `c.mu` only for state it still owns directly (the local control/inspector HTTP servers); connection state lives in `relay.mu`, and P2P session state lives in `p2p.mu`.
+
+### Test Fallout
+
+Unlike the server-side checkpoint, migrating `client_test.go` and `control_test.go` to construct clients via `NewClient(config)` (instead of hand-built `&Client{...}` literals) did not surface any behavioral bugs — the client's original locking was already reasonably self-consistent. The bulk of the work was mechanical: retargeting field/method accesses (e.g. `c.mux` → `c.relay.mux`, `c.p2pManager` → `c.p2p.manager`) and re-pointing each `c.mu.Lock()`/`Unlock()` block at `c.relay.mu` or `c.p2p.mu` depending on which component's state it actually protects.
+
+### Verification
+
+`go build ./...`, `go vet ./...`, `golangci-lint run ./...` (0 issues), `gosec -exclude=G115 -exclude-dir=web -exclude-dir=pkg/proto/pb ./...` (0 issues), and `go test -race ./...` all pass; `pkg/client` coverage improved slightly from 70.8% to 71.5%. This closes out P3-6 batch D in full (server + client).
 
 ---
 
