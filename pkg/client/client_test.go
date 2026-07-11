@@ -363,6 +363,108 @@ func TestClient_Authenticate_Success(t *testing.T) {
 	c.mu.Unlock()
 }
 
+// TestClient_Authenticate_SendsRealCapabilities verifies DP-33: the
+// AuthRequest carries the client's actual feature set (reflecting
+// Config.P2PEnabled) instead of an empty/placeholder list.
+func TestClient_Authenticate_SendsRealCapabilities(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Token = "valid-token"
+	cfg.P2PEnabled = true
+	c := NewClient(cfg)
+
+	clientMux, serverMux := newClientMuxPair(t)
+	c.mu.Lock()
+	c.mux = clientMux
+	c.mu.Unlock()
+
+	reqCh := make(chan *proto.AuthRequest, 1)
+	go func() {
+		stream, err := serverMux.AcceptStream()
+		if err != nil {
+			return
+		}
+		defer stream.Close()
+
+		buf := make([]byte, 4096)
+		n, err := stream.Read(buf)
+		if err != nil {
+			return
+		}
+		msg, err := proto.DecodeControlMessage(buf[:n])
+		if err != nil || msg.AuthRequest == nil {
+			return
+		}
+		reqCh <- msg.AuthRequest
+
+		resp := proto.NewAuthResponse(true, "", "mysubdomain", "", "session-123")
+		data, _ := resp.Encode()
+		_, _ = stream.Write(data)
+	}()
+
+	require.NoError(t, c.authenticate(context.Background()))
+
+	req := <-reqCh
+	assert.Contains(t, req.Capabilities, "multi-tunnel")
+	assert.Contains(t, req.Capabilities, "p2p")
+}
+
+// TestClient_Authenticate_StoresServerCapabilities verifies DP-33: the
+// server's advertised Capabilities from AuthResponse are retained so
+// serverSupports can gate optional client behavior on them.
+func TestClient_Authenticate_StoresServerCapabilities(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Token = "valid-token"
+	c := NewClient(cfg)
+
+	clientMux, serverMux := newClientMuxPair(t)
+	c.mu.Lock()
+	c.mux = clientMux
+	c.mu.Unlock()
+
+	go func() {
+		stream, err := serverMux.AcceptStream()
+		if err != nil {
+			return
+		}
+		defer stream.Close()
+
+		buf := make([]byte, 4096)
+		if _, err := stream.Read(buf); err != nil {
+			return
+		}
+
+		resp := proto.NewAuthResponse(true, "", "mysubdomain", "", "session-123")
+		resp.AuthResponse.Capabilities = []string{"multi-tunnel"} // No "p2p".
+		data, _ := resp.Encode()
+		_, _ = stream.Write(data)
+	}()
+
+	require.NoError(t, c.authenticate(context.Background()))
+
+	assert.True(t, c.serverSupports("multi-tunnel"))
+	assert.False(t, c.serverSupports("p2p"))
+}
+
+// TestClient_ServerSupports_UnknownDefaultsTrue verifies that before any
+// AuthResponse has been received (or against an older server that never
+// sends Capabilities), serverSupports treats every capability as
+// supported rather than blocking behavior on missing information.
+func TestClient_ServerSupports_UnknownDefaultsTrue(t *testing.T) {
+	c := NewClient(DefaultConfig())
+	assert.True(t, c.serverSupports("p2p"))
+	assert.True(t, c.serverSupports("anything"))
+}
+
+func TestClient_Capabilities_ReflectsP2PConfig(t *testing.T) {
+	withP2P := NewClient(DefaultConfig())
+	withP2P.config.P2PEnabled = true
+	assert.Contains(t, withP2P.capabilities(), "p2p")
+
+	withoutP2P := NewClient(DefaultConfig())
+	withoutP2P.config.P2PEnabled = false
+	assert.NotContains(t, withoutP2P.capabilities(), "p2p")
+}
+
 func TestClient_Authenticate_Failure(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Token = "invalid-token"
@@ -513,6 +615,115 @@ func TestClient_RegisterTunnel_InvalidPort(t *testing.T) {
 	err := c.registerTunnel(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid local port")
+}
+
+// TestClient_CreateTunnel_Success verifies the full end-to-end handshake
+// for U1's imperative CreateTunnel: registration succeeds and the new
+// tunnel becomes visible via ListActiveTunnels.
+func TestClient_CreateTunnel_Success(t *testing.T) {
+	cfg := DefaultConfig()
+	c := NewClient(cfg)
+
+	clientMux, serverMux := newClientMuxPair(t)
+	c.mu.Lock()
+	c.mux = clientMux
+	c.mu.Unlock()
+
+	go func() {
+		stream, err := serverMux.AcceptStream()
+		if err != nil {
+			return
+		}
+		defer stream.Close()
+
+		buf := make([]byte, 4096)
+		n, err := stream.Read(buf)
+		if err != nil {
+			return
+		}
+		msg, err := proto.DecodeControlMessage(buf[:n])
+		if err != nil || msg.RegisterRequest == nil {
+			return
+		}
+		assert.Equal(t, uint32(5432), msg.RegisterRequest.LocalPort)
+
+		resp := proto.NewRegisterResponse(true, "", "tunnel-db", "tcp://relay.example.com:12345", 12345)
+		data, _ := resp.Encode()
+		_, _ = stream.Write(data)
+	}()
+
+	at, err := c.CreateTunnel(context.Background(), TunnelDef{Name: "db", LocalPort: 5432, Protocol: protocolTCP})
+	require.NoError(t, err)
+	assert.Equal(t, "tunnel-db", at.TunnelID)
+
+	list := c.ListActiveTunnels()
+	require.Len(t, list, 1)
+	assert.Equal(t, "db", list[0].Def.Name)
+}
+
+// TestClient_CreateTunnel_DuplicateName verifies CreateTunnel rejects a
+// name collision without opening a new stream/registration at all.
+func TestClient_CreateTunnel_DuplicateName(t *testing.T) {
+	cfg := DefaultConfig()
+	c := NewClient(cfg)
+	c.activeTunnels = map[string]*ActiveTunnel{
+		"db": {Def: TunnelDef{Name: "db", LocalPort: 5432}, TunnelID: "tid-existing"},
+	}
+
+	_, err := c.CreateTunnel(context.Background(), TunnelDef{Name: "db", LocalPort: 9999})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already exists")
+}
+
+// TestClient_DeleteTunnel_Success verifies the full end-to-end
+// CloseRequest handshake for U1's imperative DeleteTunnel, and that the
+// tunnel is removed from the active set afterward.
+func TestClient_DeleteTunnel_Success(t *testing.T) {
+	cfg := DefaultConfig()
+	c := NewClient(cfg)
+
+	clientMux, serverMux := newClientMuxPair(t)
+	c.mu.Lock()
+	c.mux = clientMux
+	c.mu.Unlock()
+	c.activeTunnels = map[string]*ActiveTunnel{
+		"db": {Def: TunnelDef{Name: "db", LocalPort: 5432}, TunnelID: "tunnel-db"},
+	}
+
+	go func() {
+		stream, err := serverMux.AcceptStream()
+		if err != nil {
+			return
+		}
+		defer stream.Close()
+
+		buf := make([]byte, 4096)
+		n, err := stream.Read(buf)
+		if err != nil {
+			return
+		}
+		msg, err := proto.DecodeControlMessage(buf[:n])
+		if err != nil || msg.CloseRequest == nil {
+			return
+		}
+		assert.Equal(t, "tunnel-db", msg.CloseRequest.TunnelID)
+
+		resp := proto.NewCloseResponse(true)
+		data, _ := resp.Encode()
+		_, _ = stream.Write(data)
+	}()
+
+	require.NoError(t, c.DeleteTunnel(context.Background(), "db"))
+	assert.Empty(t, c.ListActiveTunnels())
+}
+
+// TestClient_DeleteTunnel_NotFound verifies DeleteTunnel rejects an
+// unknown tunnel name without touching the mux.
+func TestClient_DeleteTunnel_NotFound(t *testing.T) {
+	c := NewClient(DefaultConfig())
+	err := c.DeleteTunnel(context.Background(), "missing")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not found")
 }
 
 func TestClient_SendPing_Success(t *testing.T) {
@@ -2349,8 +2560,6 @@ func TestParseProtocol(t *testing.T) {
 		{"HTTPS", proto.ProtocolHTTPS},
 		{protocolTCP, proto.ProtocolTCP},
 		{"TCP", proto.ProtocolTCP},
-		{"udp", proto.ProtocolUDP},
-		{"UDP", proto.ProtocolUDP},
 		{"ws", proto.ProtocolWebSocket},
 		{"websocket", proto.ProtocolWebSocket},
 		{"WebSocket", proto.ProtocolWebSocket},
@@ -2358,6 +2567,13 @@ func TestParseProtocol(t *testing.T) {
 		{"gRPC", proto.ProtocolGRPC},
 		{"unknown", proto.ProtocolHTTP},
 		{"ftp", proto.ProtocolHTTP},
+		// udp is deliberately unrecognized by parseProtocol (V1): the server
+		// has no UDP dataplane, so ValidateProtocolString rejects it before
+		// parseProtocol would ever see it in practice; here it just falls
+		// through to the same "unrecognized" default as any other bogus
+		// value, which is the safe behavior if validation is ever bypassed.
+		{protocolUDP, proto.ProtocolHTTP},
+		{"UDP", proto.ProtocolHTTP},
 	}
 
 	for _, tt := range tests {
@@ -2366,6 +2582,36 @@ func TestParseProtocol(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+// ============================================================================
+// V1: ValidateProtocolString Tests
+// ============================================================================
+
+// TestValidateProtocolString verifies the accepted/rejected protocol
+// strings for --protocol and the YAML config file's protocol field,
+// notably that "udp" gets a specific, actionable rejection message (V1:
+// the server has no UDP dataplane, so silently treating it as HTTP would
+// be misleading).
+func TestValidateProtocolString(t *testing.T) {
+	valid := []string{"", "http", "HTTP", "https", "tcp", "TCP", "ws", "websocket", "grpc"}
+	for _, in := range valid {
+		t.Run("valid_"+in, func(t *testing.T) {
+			assert.NoError(t, ValidateProtocolString(in))
+		})
+	}
+
+	err := ValidateProtocolString(protocolUDP)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "UDP")
+
+	err = ValidateProtocolString("UDP")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "UDP")
+
+	err = ValidateProtocolString("ftp")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid protocol")
 }
 
 // ============================================================================

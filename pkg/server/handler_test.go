@@ -425,6 +425,59 @@ func TestHTTPHandler_ForwardHTTP_ClientError(t *testing.T) {
 	assert.Equal(t, http.StatusBadGateway, rec.Code)
 }
 
+// TestHTTPHandler_ServeHTTP_RejectsSaturatedGlobalLimit verifies DP-03:
+// once the global concurrent-stream budget is exhausted, ServeHTTP
+// rejects new requests with 503 instead of opening another stream.
+func TestHTTPHandler_ServeHTTP_RejectsSaturatedGlobalLimit(t *testing.T) {
+	server := newTestServer()
+	server.config.MaxConcurrentStreams = 1
+	server.config.MaxStreamsPerClient = 0 // isolate the global limit
+	router := NewRouter("test.example.com")
+	handler := NewHTTPHandler(router, server)
+
+	session := &ClientSession{ID: "occupier", Subdomain: "busy"}
+	require.NoError(t, router.RegisterSubdomain("busy", session))
+
+	// Occupy the only global slot and never release it.
+	occupierRelease, err := server.tryAcquireStreamSlot(session)
+	require.NoError(t, err)
+	defer occupierRelease()
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "busy.test.example.com"
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+}
+
+// TestHTTPHandler_ServeHTTP_RejectsSaturatedPerClientLimit verifies
+// DP-27: a single client hitting its own per-client stream cap gets 503
+// even though the global budget still has room.
+func TestHTTPHandler_ServeHTTP_RejectsSaturatedPerClientLimit(t *testing.T) {
+	server := newTestServer()
+	server.config.MaxConcurrentStreams = 0 // isolate the per-client limit
+	server.config.MaxStreamsPerClient = 1
+	router := NewRouter("test.example.com")
+	handler := NewHTTPHandler(router, server)
+
+	session := &ClientSession{ID: "noisy-client", Subdomain: "noisy"}
+	require.NoError(t, router.RegisterSubdomain("noisy", session))
+
+	occupierRelease, err := server.tryAcquireStreamSlot(session)
+	require.NoError(t, err)
+	defer occupierRelease()
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "noisy.test.example.com"
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+}
+
 func TestSendStreamRequest(t *testing.T) {
 	server := newTestServer()
 	router := NewRouter("test.example.com")

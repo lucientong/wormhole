@@ -19,7 +19,8 @@ type TunnelDef struct {
 	// LocalHost is the local host to forward to (defaults to 127.0.0.1).
 	LocalHost string
 
-	// Protocol is the tunnel protocol: http, tcp, udp, ws, grpc (default: http).
+	// Protocol is the tunnel protocol: http, https, tcp, ws, grpc (default:
+	// http). "udp" is not supported — see ValidateProtocolString.
 	Protocol string
 
 	// Subdomain is the requested subdomain (optional).
@@ -64,8 +65,10 @@ type Config struct {
 	// TLSCACert is the path to a custom CA certificate for verifying the server.
 	TLSCACert string
 
-	// Protocol is the tunnel protocol type (e.g. "http", "tcp", "udp", "ws", "grpc").
-	// Defaults to "http" if empty.
+	// Protocol is the tunnel protocol type (e.g. "http", "tcp", "ws", "grpc").
+	// Defaults to "http" if empty. "udp" is deliberately not supported (V1):
+	// the server has no UDP dataplane, so use ValidateProtocolString to
+	// reject it (and any other invalid value) before it reaches here.
 	Protocol string
 
 	// Hostname is the custom hostname for routing (optional).

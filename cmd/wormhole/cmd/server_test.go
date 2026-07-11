@@ -1,11 +1,14 @@
 package cmd
 
 import (
+	"os"
 	"testing"
+	"time"
 
 	"github.com/lucientong/wormhole/pkg/server"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // newTLSTestCmd returns a bare *cobra.Command carrying only the "tunnel-tls"
@@ -141,4 +144,92 @@ func TestBuildServerConfig_ClusterFlags(t *testing.T) {
 	assert.Equal(t, "hunter2", config.AuthRedisPassword)
 	assert.Equal(t, 3, config.AuthRedisDB)
 	assert.Equal(t, server.PersistenceRedis, config.Persistence)
+}
+
+// TestBuildServerConfig_ResourceLimitFlags verifies the P3-6 batch A
+// resource-limit flags (DP-03/DP-27) and the graceful-shutdown timeout
+// (DP-26) are wired from their CLI globals into server.Config.
+func TestBuildServerConfig_ResourceLimitFlags(t *testing.T) {
+	withServerGlobals(t, false, false, "", "", "")
+	cmd := newTLSTestCmd()
+
+	origStreams, origPerClient, origShutdown := serverMaxConcurrentStrms, serverMaxStreamsPerCli, serverShutdownTimeout
+	t.Cleanup(func() {
+		serverMaxConcurrentStrms, serverMaxStreamsPerCli, serverShutdownTimeout = origStreams, origPerClient, origShutdown
+	})
+
+	serverMaxConcurrentStrms = 42
+	serverMaxStreamsPerCli = 7
+	serverShutdownTimeout = 30 * time.Second
+
+	config := buildServerConfig(cmd)
+
+	assert.Equal(t, 42, config.MaxConcurrentStreams)
+	assert.Equal(t, 7, config.MaxStreamsPerClient)
+	assert.Equal(t, 30*time.Second, config.ShutdownTimeout)
+}
+
+// TestApplyTunnelTLSDefaultsExplicit_MatchesFlagBehavior verifies the U4
+// refactor (extracting applyTunnelTLSDefaultsExplicit out of
+// applyTunnelTLSDefaults) preserves the exact same S4 defaulting rule so
+// the YAML config-file path (which has no cobra flags to check
+// Changed() on) gets identical behavior to the --tunnel-tls flag path.
+func TestApplyTunnelTLSDefaultsExplicit_MatchesFlagBehavior(t *testing.T) {
+	// Not explicit + require-auth + real domain → defaults on.
+	cfg := server.DefaultConfig()
+	cfg.RequireAuth = true
+	cfg.Domain = "tunnel.example.com"
+	applyTunnelTLSDefaultsExplicit(&cfg, false, false)
+	assert.True(t, cfg.TunnelTLSEnabled)
+	assert.True(t, cfg.AutoTLS)
+
+	// Explicit false overrides the would-be default.
+	cfg2 := server.DefaultConfig()
+	cfg2.RequireAuth = true
+	cfg2.Domain = "tunnel.example.com"
+	applyTunnelTLSDefaultsExplicit(&cfg2, true, false)
+	assert.False(t, cfg2.TunnelTLSEnabled)
+
+	// Explicit true is honored even without require-auth/domain.
+	cfg3 := server.DefaultConfig()
+	applyTunnelTLSDefaultsExplicit(&cfg3, true, true)
+	assert.True(t, cfg3.TunnelTLSEnabled)
+}
+
+// TestRunServer_ConfigFileTunnelTLSDefault_EndToEnd exercises the U4
+// config-file loading path (LoadServerFileConfig → ToServerConfig →
+// applyTunnelTLSDefaultsExplicit) the same way runServer wires them
+// together, verifying a config file that enables --require-auth with a
+// real domain but never mentions tls.tunnel_tls_enabled still gets the
+// same S4 auto-default as the equivalent CLI flags would.
+func TestRunServer_ConfigFileTunnelTLSDefault_EndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/server.yml"
+	require.NoError(t, os.WriteFile(path, []byte("domain: tunnel.example.com\nrequire_auth: true\nauth_secret: my-secret-key-at-least-16-chars\n"), 0o600))
+
+	fc, err := server.LoadServerFileConfig(path)
+	require.NoError(t, err)
+
+	config := fc.ToServerConfig(server.DefaultConfig())
+	applyTunnelTLSDefaultsExplicit(&config, fc.TLS.TunnelTLSEnabled != nil, config.TunnelTLSEnabled)
+
+	assert.True(t, config.RequireAuth)
+	assert.True(t, config.TunnelTLSEnabled, "should auto-default on, matching CLI --require-auth + --domain behavior")
+	assert.True(t, config.AutoTLS)
+}
+
+// TestBuildServerConfig_MinClientVersion verifies the P3-6 batch A
+// --min-client-version flag (DP-30) is wired into server.Config.
+func TestBuildServerConfig_MinClientVersion(t *testing.T) {
+	withServerGlobals(t, false, false, "", "", "")
+	cmd := newTLSTestCmd()
+
+	origVersion := serverMinClientVersion
+	t.Cleanup(func() { serverMinClientVersion = origVersion })
+
+	serverMinClientVersion = "0.6.4"
+
+	config := buildServerConfig(cmd)
+
+	assert.Equal(t, "0.6.4", config.MinClientVersion)
 }

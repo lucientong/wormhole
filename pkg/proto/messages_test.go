@@ -432,6 +432,61 @@ func TestDecodeControlMessage_BothFormats(t *testing.T) {
 	assert.Equal(t, fromPB.RegisterRequest.PathPrefix, fromJSON.RegisterRequest.PathPrefix)
 }
 
+// --- DP-17: DecodeControlMessage must reject fully-empty UNKNOWN messages ---
+
+// TestDecodeControlMessage_RejectsEmptyProtobuf verifies that bytes which
+// protobuf-unmarshal "successfully" into an all-zero message (Type ==
+// UNKNOWN, no payload) are rejected rather than silently treated as a
+// valid decode — this is exactly the shape that malformed/garbage input
+// collapses into under protobuf's permissive wire format.
+func TestDecodeControlMessage_RejectsEmptyProtobuf(t *testing.T) {
+	msg := &ControlMessage{} // Type defaults to MessageTypeUnknown, no payload.
+	data, err := msg.Encode()
+	require.NoError(t, err)
+
+	_, decErr := DecodeControlMessage(data)
+	assert.Error(t, decErr)
+}
+
+// TestDecodeControlMessage_RejectsGarbageBytes covers the original DP-17
+// report more directly: arbitrary bytes that aren't a valid control
+// message at all must return an error, not an empty-but-"successful"
+// ControlMessage.
+func TestDecodeControlMessage_RejectsGarbageBytes(t *testing.T) {
+	garbageInputs := [][]byte{
+		{},                      // Empty input: protobuf unmarshals this to a zero message trivially.
+		{0x00, 0x00, 0x00},      // Looks like padding/zeros.
+		[]byte("not a message"), // Plain text, not protobuf or JSON.
+	}
+	for _, data := range garbageInputs {
+		_, decErr := DecodeControlMessage(data)
+		assert.Error(t, decErr, "garbage input %q should not decode successfully", data)
+	}
+}
+
+// TestDecodeControlMessage_AllowsUnrecognizedButNonEmptyType verifies
+// that a deliberate, forward-compatible message using a MessageType this
+// build doesn't recognize (but that isn't the zero UNKNOWN sentinel) is
+// still accepted — DP-17 only targets the fully-empty garbage shape, not
+// legitimate protocol evolution.
+func TestDecodeControlMessage_AllowsUnrecognizedButNonEmptyType(t *testing.T) {
+	msg := &ControlMessage{Type: MessageType(255)}
+	data, err := msg.Encode()
+	require.NoError(t, err)
+
+	decoded, decErr := DecodeControlMessage(data)
+	require.NoError(t, decErr)
+	assert.Equal(t, MessageType(255), decoded.Type)
+}
+
+// TestDecodeControlMessage_RejectsEmptyJSON mirrors the protobuf case for
+// the JSON fallback path: `{}` parses to a valid-looking-but-empty
+// ControlMessage and should be rejected the same way.
+func TestDecodeControlMessage_RejectsEmptyJSON(t *testing.T) {
+	_, decErr := DecodeControlMessage([]byte("{}"))
+	assert.Error(t, decErr)
+}
+
 // --- WriteControlMessage / ReadControlMessage framing ---
 
 // TestWriteReadControlMessage_RoundTrip verifies the length-prefix framing works

@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/lucientong/wormhole/pkg/server"
 	"github.com/rs/zerolog/log"
@@ -35,6 +36,11 @@ var (
 	serverAdminHost          string
 	serverMaxClients         int
 	serverMaxTunnelsPerCli   int
+	serverMaxConcurrentStrms int
+	serverMaxStreamsPerCli   int
+	serverShutdownTimeout    time.Duration
+	serverMinClientVersion   string
+	serverConfigFile         string
 	serverAuditEnabled       bool
 	serverAuditPersistence   string
 	serverAuditPath          string
@@ -94,11 +100,15 @@ Examples:
   wormhole server --require-auth --auth-secret my-secret --persistence sqlite
 
   # Specify custom database path
-  wormhole server --require-auth --auth-secret my-secret --persistence sqlite --persistence-path /var/lib/wormhole/data.db`,
+  wormhole server --require-auth --auth-secret my-secret --persistence sqlite --persistence-path /var/lib/wormhole/data.db
+
+  # Start from a YAML config file instead of flags (U4)
+  wormhole server -c server.yml`,
 	Run: runServer,
 }
 
 func init() {
+	serverCmd.Flags().StringVarP(&serverConfigFile, "config", "c", "", "Path to YAML server config file; when set, flags below are ignored in favor of the file's settings")
 	serverCmd.Flags().IntVarP(&serverPort, "port", "p", 7000, "Port to listen on for client connections")
 	serverCmd.Flags().StringVar(&serverHost, "host", "0.0.0.0", "Host to bind to")
 	serverCmd.Flags().StringVarP(&serverDomain, "domain", "d", "", "Domain for generating tunnel URLs (env: WORMHOLE_DOMAIN)")
@@ -117,6 +127,10 @@ func init() {
 	serverCmd.Flags().StringVar(&serverAdminHost, "admin-host", "127.0.0.1", "Host for admin API (default: 127.0.0.1 for safety)")
 	serverCmd.Flags().IntVar(&serverMaxClients, "max-clients", 1000, "Maximum concurrent clients (0 = unlimited)")
 	serverCmd.Flags().IntVar(&serverMaxTunnelsPerCli, "max-tunnels-per-client", 0, "Maximum tunnels per client (0 = unlimited)")
+	serverCmd.Flags().IntVar(&serverMaxConcurrentStrms, "max-concurrent-streams", 10000, "Maximum concurrent data-plane streams (HTTP/WebSocket/TCP) across all clients; saturating returns 503/drops the connection instead of queuing (0 = unlimited)")
+	serverCmd.Flags().IntVar(&serverMaxStreamsPerCli, "max-streams-per-client", 500, "Maximum concurrent data-plane streams for a single client, independent of --max-concurrent-streams (0 = unlimited)")
+	serverCmd.Flags().DurationVar(&serverShutdownTimeout, "shutdown-timeout", 15*time.Second, "How long to wait for in-flight HTTP/admin requests to finish on shutdown before forcing them closed")
+	serverCmd.Flags().StringVar(&serverMinClientVersion, "min-client-version", "", "Reject clients reporting an older semantic version, e.g. 0.6.0 (default: disabled). Clients with a non-semver version (e.g. dev builds) are never rejected")
 	serverCmd.Flags().BoolVar(&serverAuditEnabled, "audit", false, "Enable structured audit logging")
 	serverCmd.Flags().StringVar(&serverAuditPersistence, "audit-persistence", "memory", "Audit storage backend: memory (default) or sqlite")
 	serverCmd.Flags().StringVar(&serverAuditPath, "audit-path", "", "Path to SQLite audit database (default: ~/.wormhole/audit.db)")
@@ -156,10 +170,19 @@ func init() {
 // plaintext (no domain, no manual cert/key), a warning is logged so the
 // operator knows tokens are transmitted unencrypted.
 func applyTunnelTLSDefaults(cmd *cobra.Command, config *server.Config) {
+	applyTunnelTLSDefaultsExplicit(config, cmd.Flags().Changed("tunnel-tls"), serverTunnelTLS)
+}
+
+// applyTunnelTLSDefaultsExplicit is applyTunnelTLSDefaults' core logic,
+// parameterized on whether the caller explicitly set TunnelTLSEnabled
+// (and to what value) instead of reading cobra flag-changed state
+// directly — this lets the YAML config-file path (U4) reuse the exact
+// same S4 defaulting/warning behavior as the --tunnel-tls flag path.
+func applyTunnelTLSDefaultsExplicit(config *server.Config, explicit bool, value bool) {
 	hasRealDomain := config.Domain != "" && config.Domain != defaultDomain
 
-	config.TunnelTLSEnabled = serverTunnelTLS
-	if !cmd.Flags().Changed("tunnel-tls") {
+	config.TunnelTLSEnabled = value
+	if !explicit {
 		config.TunnelTLSEnabled = config.TLSEnabled || (config.RequireAuth && hasRealDomain)
 	}
 
@@ -204,6 +227,10 @@ func buildServerConfig(cmd *cobra.Command) server.Config {
 	config.PersistencePath = serverPersistencePath
 	config.MaxClients = serverMaxClients
 	config.MaxTunnelsPerClient = serverMaxTunnelsPerCli
+	config.MaxConcurrentStreams = serverMaxConcurrentStrms
+	config.MaxStreamsPerClient = serverMaxStreamsPerCli
+	config.ShutdownTimeout = serverShutdownTimeout
+	config.MinClientVersion = serverMinClientVersion
 
 	applyTunnelTLSDefaults(cmd, &config)
 
@@ -243,9 +270,25 @@ func buildServerConfig(cmd *cobra.Command) server.Config {
 
 func runServer(cmd *cobra.Command, _ []string) {
 	config := buildServerConfig(cmd)
+	if serverConfigFile != "" {
+		fc, err := server.LoadServerFileConfig(serverConfigFile)
+		if err != nil {
+			log.Fatal().Err(err).Str("path", serverConfigFile).Msg("Failed to load config file")
+		}
+		// The file fully replaces flag-derived settings (besides the
+		// TLS/persistence/audit defaults DefaultConfig() already applied),
+		// mirroring `wormhole client -c` — mixing flags and a config file
+		// for the same run would make it unclear which one wins.
+		config = fc.ToServerConfig(server.DefaultConfig())
+		applyTunnelTLSDefaultsExplicit(&config, fc.TLS.TunnelTLSEnabled != nil, config.TunnelTLSEnabled)
+	}
 
-	// Warn if admin API is exposed on non-loopback without a token.
-	if config.AdminToken == "" && serverAdminHost != "127.0.0.1" && serverAdminHost != "::1" && serverAdminHost != "localhost" {
+	// Warn if admin API is exposed on non-loopback without a token. Derived
+	// from the resolved config.AdminAddr (not the --admin-host flag global)
+	// so this also works correctly when config came from a YAML file (U4).
+	adminHost, _, splitErr := net.SplitHostPort(config.AdminAddr)
+	isLoopbackAdminHost := splitErr == nil && (adminHost == "127.0.0.1" || adminHost == "::1" || adminHost == "localhost")
+	if config.AdminToken == "" && !isLoopbackAdminHost {
 		log.Warn().
 			Str("admin_addr", config.AdminAddr).
 			Msg("WARNING: Admin API is bound to a non-loopback address without --admin-token; " +

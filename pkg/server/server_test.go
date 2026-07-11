@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -10,11 +11,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -577,6 +580,139 @@ func TestServer_AuthenticateClient_Success(t *testing.T) {
 
 	// Verify client received successful response.
 	require.NoError(t, <-errCh)
+}
+
+// TestServer_AuthenticateClient_ReturnsRealCapabilities verifies DP-33:
+// a successful AuthResponse carries the server's actual feature set
+// rather than an empty/placeholder Capabilities list.
+func TestServer_AuthenticateClient_ReturnsRealCapabilities(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.RequireAuth = true
+	cfg.AuthTokens = []string{"valid-token"}
+	cfg.AuthTimeout = 5 * time.Second
+	s := NewServer(cfg)
+
+	clientMux, serverMux := newMuxPair(t)
+	sessionID := "test-session-id"
+
+	respCh := make(chan *proto.AuthResponse, 1)
+	go func() {
+		stream, openErr := clientMux.OpenStream()
+		if openErr != nil {
+			return
+		}
+		defer stream.Close()
+
+		req := proto.NewAuthRequest("valid-token", "1.0.0", "myapp")
+		data, _ := req.Encode()
+		_, _ = stream.Write(data)
+
+		buf := make([]byte, 4096)
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			return
+		}
+		msg, decErr := proto.DecodeControlMessage(buf[:n])
+		if decErr != nil || msg.AuthResponse == nil {
+			return
+		}
+		respCh <- msg.AuthResponse
+	}()
+
+	_, _, err := s.authenticateClient(serverMux, sessionID)
+	require.NoError(t, err)
+
+	resp := <-respCh
+	require.NotNil(t, resp)
+	assert.Contains(t, resp.Capabilities, "p2p")
+	assert.Contains(t, resp.Capabilities, "multi-tunnel")
+}
+
+// TestServer_CheckClientVersion covers DP-30's version-gating logic
+// directly, including the "unparseable version is never rejected" rule.
+func TestServer_CheckClientVersion(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MinClientVersion = "0.6.4"
+	s := NewServer(cfg)
+
+	assert.Empty(t, s.checkClientVersion("0.6.4"), "equal version should be allowed")
+	assert.Empty(t, s.checkClientVersion("0.7.0"), "newer version should be allowed")
+	assert.Empty(t, s.checkClientVersion("dev"), "unparseable version should never be rejected")
+	assert.Empty(t, s.checkClientVersion(""), "empty version should never be rejected")
+	assert.NotEmpty(t, s.checkClientVersion("0.6.3"), "older version should be rejected")
+}
+
+// TestServer_Capabilities_ReflectsConfig verifies DP-33's capability
+// list grows with optional features actually wired up on this instance,
+// rather than being a static/hardcoded list.
+func TestServer_Capabilities_ReflectsConfig(t *testing.T) {
+	base := NewServer(DefaultConfig())
+	baseCaps := base.capabilities()
+	assert.Contains(t, baseCaps, "p2p")
+	assert.Contains(t, baseCaps, "multi-tunnel")
+	assert.NotContains(t, baseCaps, "cluster")
+	assert.NotContains(t, baseCaps, "audit")
+
+	auditCfg := DefaultConfig()
+	auditCfg.AuditEnabled = true
+	auditSrv := NewServer(auditCfg)
+	assert.Contains(t, auditSrv.capabilities(), "audit")
+}
+
+func TestServer_CheckClientVersion_Disabled(t *testing.T) {
+	cfg := DefaultConfig() // MinClientVersion left empty.
+	s := NewServer(cfg)
+
+	assert.Empty(t, s.checkClientVersion("0.0.1"), "check should be a no-op when MinClientVersion is unset")
+}
+
+// TestServer_AuthenticateClient_RejectsOldVersion verifies the full
+// handshake path: a client older than MinClientVersion gets a failure
+// AuthResponse and authenticateClient returns an error, without ever
+// reaching token validation.
+func TestServer_AuthenticateClient_RejectsOldVersion(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.RequireAuth = true
+	cfg.AuthTokens = []string{"valid-token"}
+	cfg.AuthTimeout = 5 * time.Second
+	cfg.MinClientVersion = "0.6.4"
+	s := NewServer(cfg)
+
+	clientMux, serverMux := newMuxPair(t)
+	sessionID := "test-session-id"
+
+	respCh := make(chan *proto.AuthResponse, 1)
+	go func() {
+		stream, openErr := clientMux.OpenStream()
+		if openErr != nil {
+			return
+		}
+		defer stream.Close()
+
+		req := proto.NewAuthRequest("valid-token", "0.6.0", "myapp")
+		data, _ := req.Encode()
+		_, _ = stream.Write(data)
+
+		buf := make([]byte, 4096)
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			return
+		}
+		msg, decErr := proto.DecodeControlMessage(buf[:n])
+		if decErr != nil || msg.AuthResponse == nil {
+			return
+		}
+		respCh <- msg.AuthResponse
+	}()
+
+	_, _, err := s.authenticateClient(serverMux, sessionID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "rejected")
+
+	resp := <-respCh
+	require.NotNil(t, resp)
+	assert.False(t, resp.Success)
+	assert.Contains(t, resp.Error, "0.6.4")
 }
 
 func TestServer_AuthenticateClient_InvalidToken(t *testing.T) {
@@ -1632,6 +1768,136 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 	_ = extConn.Close()
 	<-handlerDone
 	<-clientDone
+}
+
+// TestServer_TryAcquireStreamSlot_GlobalLimit verifies DP-03: once the
+// global cap is reached, further acquisitions fail regardless of client,
+// and releasing frees the slot back up.
+func TestServer_TryAcquireStreamSlot_GlobalLimit(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxConcurrentStreams = 2
+	cfg.MaxStreamsPerClient = 0
+	s := NewServer(cfg)
+
+	clientA := &ClientSession{ID: "a"}
+	clientB := &ClientSession{ID: "b"}
+
+	release1, err := s.tryAcquireStreamSlot(clientA)
+	require.NoError(t, err)
+	release2, err := s.tryAcquireStreamSlot(clientB)
+	require.NoError(t, err)
+
+	// Third acquisition (any client) must fail: global budget is exhausted.
+	_, err = s.tryAcquireStreamSlot(clientA)
+	assert.ErrorIs(t, err, errStreamSlotSaturated)
+
+	// Releasing one slot frees capacity back up.
+	release1()
+	release3, err := s.tryAcquireStreamSlot(clientB)
+	require.NoError(t, err)
+
+	release2()
+	release3()
+	assert.Equal(t, int64(0), s.activeDataStreams)
+}
+
+// TestServer_TryAcquireStreamSlot_PerClientLimit verifies DP-27: a single
+// client can be capped independently of the global budget, and a
+// different client is unaffected by the first client's saturation.
+func TestServer_TryAcquireStreamSlot_PerClientLimit(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxConcurrentStreams = 0
+	cfg.MaxStreamsPerClient = 1
+	s := NewServer(cfg)
+
+	noisy := &ClientSession{ID: "noisy"}
+	quiet := &ClientSession{ID: "quiet"}
+
+	release, err := s.tryAcquireStreamSlot(noisy)
+	require.NoError(t, err)
+
+	// Same client, second stream: rejected by its own per-client cap.
+	_, err = s.tryAcquireStreamSlot(noisy)
+	assert.ErrorIs(t, err, errStreamSlotSaturated)
+
+	// A different client still has its own independent budget.
+	quietRelease, err := s.tryAcquireStreamSlot(quiet)
+	require.NoError(t, err)
+
+	release()
+	quietRelease()
+	assert.Equal(t, int32(0), noisy.activeDataStreams)
+	assert.Equal(t, int32(0), quiet.activeDataStreams)
+}
+
+// TestServer_TryAcquireStreamSlot_ReleaseIsIdempotent guards against a
+// double-release double-decrementing the counters below zero, which
+// would silently widen the effective limit over time.
+func TestServer_TryAcquireStreamSlot_ReleaseIsIdempotent(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxConcurrentStreams = 1
+	cfg.MaxStreamsPerClient = 1
+	s := NewServer(cfg)
+
+	client := &ClientSession{ID: "c"}
+	release, err := s.tryAcquireStreamSlot(client)
+	require.NoError(t, err)
+
+	release()
+	release() // second call must be a no-op.
+
+	assert.Equal(t, int64(0), s.activeDataStreams)
+	assert.Equal(t, int32(0), client.activeDataStreams)
+}
+
+// TestServer_HandleTCPConnection_RejectsWhenSaturated verifies DP-03/DP-27
+// apply to the raw TCP tunnel path too, not just HTTP: once the stream
+// budget is exhausted, handleTCPConnection must not open a stream to the
+// tunnel client at all, and must simply drop the external connection.
+func TestServer_HandleTCPConnection_RejectsWhenSaturated(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxConcurrentStreams = 1
+	s := NewServer(cfg)
+
+	clientMux, serverMux := newMuxPair(t)
+	defer clientMux.Close()
+	defer serverMux.Close()
+
+	client := &ClientSession{ID: "tcp-saturated-client", Mux: serverMux}
+
+	// Occupy the only slot.
+	occupierRelease, err := s.tryAcquireStreamSlot(client)
+	require.NoError(t, err)
+
+	// The tunnel client must never see a stream open attempt.
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		_, acceptErr := clientMux.AcceptStream()
+		assert.Error(t, acceptErr, "no stream should have been opened while saturated")
+	}()
+
+	extConn, proxyConn := net.Pipe()
+	defer extConn.Close()
+
+	handlerDone := make(chan struct{})
+	go func() {
+		defer close(handlerDone)
+		s.handleTCPConnection(proxyConn, client, "test-tunnel")
+	}()
+
+	select {
+	case <-handlerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleTCPConnection should return immediately when saturated")
+	}
+
+	// Now free the slot and close the mux so the AcceptStream goroutine
+	// above unblocks with an error instead of hanging forever.
+	occupierRelease()
+	_ = clientMux.Close()
+	_ = serverMux.Close()
+	<-acceptDone
 }
 
 // TestServer_HandleTCPConnection_ClientMuxClosed verifies that when the
@@ -3504,4 +3770,141 @@ func TestProto_NewStatsResponse(t *testing.T) {
 	assert.Equal(t, uint64(2048), msg.StatsResponse.BytesReceived)
 	assert.Equal(t, uint64(100), msg.StatsResponse.RequestsHandled)
 	assert.Equal(t, uint64(3600), msg.StatsResponse.UptimeSeconds)
+}
+
+// TestServer_Shutdown_DrainsInFlightHTTPRequest is the DP-26 regression
+// test: it drives a real HTTP request through the actual s.httpServer
+// (listening on a real TCP port, not the in-process httptest.Recorder
+// used by handler_test.go) while the backend is deliberately slow, then
+// triggers Shutdown mid-request. Before the fix, Shutdown closed
+// s.httpListener directly, which would have reset the in-flight
+// connection instead of letting the slow handler finish.
+func TestServer_Shutdown_DrainsInFlightHTTPRequest(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ListenAddr = "127.0.0.1:0"
+	cfg.HTTPAddr = "127.0.0.1:0"
+	cfg.AdminAddr = "127.0.0.1:0"
+	cfg.MuxConfig.KeepAliveInterval = 0
+	cfg.ShutdownTimeout = 5 * time.Second
+
+	s := NewServer(cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	startErrCh := make(chan error, 1)
+	go func() {
+		startErrCh <- s.Start(ctx)
+	}()
+
+	// Wait for listeners to be bound (race-detector-safe, unlike a fixed sleep).
+	select {
+	case <-s.listenersReady:
+	case <-time.After(time.Second):
+		t.Fatal("server did not become ready in time")
+	}
+
+	// Wire up a fake tunnel client: server-side mux is registered with
+	// the router under "slowapp", client-side mux plays the role of the
+	// backend, deliberately sleeping before responding so the request
+	// is still in flight when Shutdown runs.
+	clientConn, serverConn := net.Pipe()
+	muxCfg := tunnel.DefaultMuxConfig()
+	muxCfg.KeepAliveInterval = 0
+	serverMux, err := tunnel.Server(serverConn, muxCfg)
+	require.NoError(t, err)
+	defer serverMux.Close()
+	clientMux, err := tunnel.Client(clientConn, muxCfg)
+	require.NoError(t, err)
+	defer clientMux.Close()
+
+	session := &ClientSession{
+		ID:        "slow-backend-session",
+		Subdomain: "slowapp",
+		Mux:       serverMux,
+		CreatedAt: time.Now(),
+		LastSeen:  time.Now(),
+	}
+	require.NoError(t, s.router.RegisterSubdomain("slowapp", session))
+
+	const backendDelay = 400 * time.Millisecond
+	clientDone := make(chan struct{})
+	go func() {
+		defer close(clientDone)
+		stream, acceptErr := clientMux.AcceptStream()
+		if acceptErr != nil {
+			return
+		}
+		defer stream.Close()
+
+		br := bufio.NewReader(stream)
+		if _, decErr := proto.ReadControlMessage(br); decErr != nil {
+			return
+		}
+		httpReq, parseErr := http.ReadRequest(br)
+		if parseErr != nil {
+			return
+		}
+		_ = httpReq.Body.Close()
+
+		// Simulate a slow local backend so the HTTP request is still
+		// in flight when the test triggers Shutdown below.
+		time.Sleep(backendDelay)
+
+		body := "slow response completed"
+		resp := &http.Response{
+			StatusCode:    http.StatusOK,
+			Proto:         "HTTP/1.1",
+			ProtoMajor:    1,
+			ProtoMinor:    1,
+			Header:        http.Header{"Content-Type": {"text/plain"}},
+			Body:          io.NopCloser(strings.NewReader(body)),
+			ContentLength: int64(len(body)),
+		}
+		_ = resp.Write(stream)
+	}()
+
+	// Fire the HTTP request at the real listener in the background.
+	type result struct {
+		status int
+		body   string
+		err    error
+	}
+	respCh := make(chan result, 1)
+	go func() {
+		req, reqErr := http.NewRequest(http.MethodGet, "http://"+s.httpListener.Addr().String()+"/", nil)
+		if reqErr != nil {
+			respCh <- result{err: reqErr}
+			return
+		}
+		req.Host = "slowapp.localhost"
+		httpClient := &http.Client{Timeout: 5 * time.Second}
+		resp, doErr := httpClient.Do(req)
+		if doErr != nil {
+			respCh <- result{err: doErr}
+			return
+		}
+		defer resp.Body.Close()
+		b, readErr := io.ReadAll(resp.Body)
+		respCh <- result{status: resp.StatusCode, body: string(b), err: readErr}
+	}()
+
+	// Let the request reach the slow handler, then shut down while it's
+	// still sleeping.
+	time.Sleep(backendDelay / 4)
+	shutdownStart := time.Now()
+	cancel()
+
+	require.NoError(t, <-startErrCh)
+	shutdownElapsed := time.Since(shutdownStart)
+
+	<-clientDone
+	res := <-respCh
+
+	require.NoError(t, res.err)
+	assert.Equal(t, http.StatusOK, res.status)
+	assert.Contains(t, res.body, "slow response completed")
+
+	// Shutdown must have waited for the slow handler (it started well
+	// after backendDelay/4 had already elapsed), proving it drained the
+	// in-flight request instead of yanking the listener out from under it.
+	assert.GreaterOrEqual(t, shutdownElapsed, backendDelay/2)
 }

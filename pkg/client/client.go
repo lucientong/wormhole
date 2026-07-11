@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,6 +38,20 @@ const protocolHTTP = "http"
 // protocolTCP is the canonical string for TCP dialing and the TCP tunnel protocol.
 const protocolTCP = "tcp"
 
+// protocolHTTPS, protocolWebSocket, and protocolGRPC are the canonical
+// strings for the remaining supported tunnel protocols (see parseProtocol
+// and validProtocolStrings).
+const (
+	protocolHTTPS     = "https"
+	protocolWebSocket = "websocket"
+	protocolGRPC      = "grpc"
+)
+
+// protocolUDP is the (rejected) tunnel protocol string checked by
+// ValidateProtocolString — see validProtocolStrings' doc for why it's not
+// in that list (V1: the server has no UDP dataplane).
+const protocolUDP = "udp"
+
 // Client is the wormhole client.
 // ActiveTunnel holds runtime state for a registered tunnel.
 type ActiveTunnel struct {
@@ -56,6 +71,12 @@ type Client struct {
 	publicURL string
 	tunnelID  string
 	sessionID string // Server-assigned session ID (for reconnect awareness).
+
+	// serverCapabilities is the feature set the server advertised in its
+	// AuthResponse (DP-33). nil/empty means either not-yet-authenticated
+	// or an older server that doesn't send this field — both treated as
+	// "unknown" by serverSupports, not "supports nothing".
+	serverCapabilities []string
 
 	// Multi-tunnel state (populated after registration).
 	// Single-tunnel mode uses publicURL/tunnelID directly;
@@ -299,6 +320,40 @@ func (c *Client) buildTLSConfig() (*tls.Config, error) {
 	return tlsConfig, nil
 }
 
+// capabilities returns the set of optional protocol features this client
+// build actually supports/wants, advertised to the server via
+// AuthRequest.Capabilities (DP-33). "multi-tunnel" is unconditional;
+// "p2p" reflects whether P2P is enabled in this client's config.
+func (c *Client) capabilities() []string {
+	caps := []string{"multi-tunnel"}
+	if c.config.P2PEnabled {
+		caps = append(caps, "p2p")
+	}
+	return caps
+}
+
+// serverSupports reports whether the server advertised the given
+// capability in its AuthResponse. An empty/nil capabilities list (no
+// AuthResponse.Capabilities received yet, or an older server that
+// predates this field) is treated as "unknown" and returns true, so
+// behavior against older servers is unaffected — this only actively
+// gates behavior once a server has explicitly told us its feature set.
+func (c *Client) serverSupports(name string) bool {
+	c.mu.Lock()
+	caps := c.serverCapabilities
+	c.mu.Unlock()
+
+	if len(caps) == 0 {
+		return true
+	}
+	for _, capability := range caps {
+		if capability == name {
+			return true
+		}
+	}
+	return false
+}
+
 // authenticateWithRefresh calls authenticate() and, if the server rejects the
 // current token and Config.OnAuthFailure is set (e.g. wired to an OAuth2
 // refresh_token grant by the CLI layer), attempts to obtain a fresh token
@@ -346,8 +401,10 @@ func (c *Client) authenticate(ctx context.Context) error {
 		return fmt.Errorf("set auth deadline: %w", deadlineErr)
 	}
 
-	// Send auth request.
+	// Send auth request, advertising this client's real feature set
+	// (DP-33) rather than leaving Capabilities empty.
 	req := proto.NewAuthRequest(c.config.Token, version.Short(), c.config.Subdomain)
+	req.AuthRequest.Capabilities = c.capabilities()
 	data, err := req.Encode()
 	if err != nil {
 		return fmt.Errorf("encode auth request: %w", err)
@@ -392,9 +449,19 @@ func (c *Client) authenticate(ctx context.Context) error {
 		c.mu.Unlock()
 	}
 
+	// Remember what the server actually supports (DP-33) so optional
+	// behavior, like attempting a P2P offer, can be gated on it instead
+	// of assumed. An empty list means an older server that predates this
+	// field — treated as "unknown", not "supports nothing" (see
+	// serverSupports).
+	c.mu.Lock()
+	c.serverCapabilities = resp.Capabilities
+	c.mu.Unlock()
+
 	log.Info().
 		Str("session_id", resp.SessionID).
 		Str("subdomain", resp.Subdomain).
+		Strs("server_capabilities", resp.Capabilities).
 		Msg("Authenticated with server")
 
 	return nil
@@ -681,6 +748,57 @@ func (c *Client) ReloadTunnels(ctx context.Context, newDefs []TunnelDef) {
 	}
 }
 
+// CreateTunnel registers a single new tunnel on an already-connected
+// client and adds it to the active tunnel set (U1), for imperative
+// tunnel management via the control API (`wormhole tunnels create`) as a
+// complement to the declarative config-file + SIGHUP reload path
+// (ReloadTunnels). Returns an error if a tunnel with the same name is
+// already active or if registration fails.
+func (c *Client) CreateTunnel(ctx context.Context, def TunnelDef) (*ActiveTunnel, error) {
+	c.activeTunnelsMu.RLock()
+	_, exists := c.activeTunnels[def.Name]
+	c.activeTunnelsMu.RUnlock()
+	if exists {
+		return nil, fmt.Errorf("tunnel %q already exists", def.Name)
+	}
+
+	at, err := c.registerOneTunnel(ctx, def)
+	if err != nil {
+		return nil, err
+	}
+
+	c.activeTunnelsMu.Lock()
+	if c.activeTunnels == nil {
+		c.activeTunnels = make(map[string]*ActiveTunnel, 1)
+	}
+	c.activeTunnels[def.Name] = at
+	c.activeTunnelsMu.Unlock()
+
+	return at, nil
+}
+
+// DeleteTunnel closes and removes a single active tunnel by name (U1),
+// the imperative counterpart to CreateTunnel. Returns an error if no
+// tunnel with that name is currently active.
+func (c *Client) DeleteTunnel(ctx context.Context, name string) error {
+	c.activeTunnelsMu.RLock()
+	at, exists := c.activeTunnels[name]
+	c.activeTunnelsMu.RUnlock()
+	if !exists {
+		return fmt.Errorf("tunnel %q not found", name)
+	}
+
+	if err := c.CloseTunnel(ctx, at.TunnelID, "removed via tunnels delete"); err != nil {
+		return err
+	}
+
+	c.activeTunnelsMu.Lock()
+	delete(c.activeTunnels, name)
+	c.activeTunnelsMu.Unlock()
+
+	return nil
+}
+
 // handleConnection handles an active connection. It blocks until the
 // connection is lost (mux closed, e.g. due to network failure) or the
 // application shuts down (ctx.Done() / c.closeCh), whichever happens
@@ -692,8 +810,10 @@ func (c *Client) handleConnection(ctx context.Context) {
 	go c.acceptStreams(ctx)
 	go c.heartbeatLoop(ctx)
 
-	// Attempt P2P offer (non-blocking).
-	if c.config.P2PEnabled && c.p2pManager.IsEnabled() {
+	// Attempt P2P offer (non-blocking). Skipped if the server explicitly
+	// told us (DP-33) it doesn't support P2P relay — an older server that
+	// sent no Capabilities is treated as "unknown" and still attempted.
+	if c.config.P2PEnabled && c.p2pManager.IsEnabled() && c.serverSupports("p2p") {
 		c.closeWg.Go(func() {
 			c.sendP2POffer(ctx)
 		})
@@ -880,22 +1000,38 @@ func (c *Client) dialAndProxy(ctx context.Context, inReader io.Reader, outWriter
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// InReader -> Local.
+	// InReader -> Local. When the remote side is done sending (EOF/error
+	// on inReader), half-close localConn's write side so the local
+	// service sees EOF and can finish responding, instead of leaving it
+	// blocked waiting for more input that will never arrive (DP-04):
+	// without this, the "Local -> OutWriter" goroutine below could block
+	// forever on a local service that never closes its own connection,
+	// leaking both goroutines and localConn past dialAndProxy's return.
 	go func() {
 		defer wg.Done()
 		n, _ := io.Copy(localConn, inReader)
 		if n > 0 {
 			atomic.AddUint64(&c.stats.BytesIn, uint64(n))
 		}
+		if cw, ok := localConn.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		} else {
+			_ = localConn.Close()
+		}
 	}()
 
-	// Local -> OutWriter.
+	// Local -> OutWriter. When the local service is done responding,
+	// there's nothing left to proxy from it, so fully close localConn to
+	// unblock the InReader -> Local direction above (e.g. a blocked
+	// Write to a half-closed peer) instead of leaving it dangling until
+	// the remote side happens to close on its own.
 	go func() {
 		defer wg.Done()
 		n, _ := io.Copy(outWriter, localConn)
 		if n > 0 {
 			atomic.AddUint64(&c.stats.BytesOut, uint64(n)) // #nosec G115
 		}
+		_ = localConn.Close()
 	}()
 
 	wg.Wait()
@@ -1456,6 +1592,11 @@ func (c *Client) proxyConnectConn(_ context.Context, mux *p2p.UDPMux, localConn 
 		return
 	}
 
+	// p2p.UDPStream has no half-close, so — as in Server.handleTCPConnection
+	// and HTTPHandler.handleWebSocket (DP-04) — close both ends as soon as
+	// either direction finishes to unblock the other immediately rather
+	// than leaving it running until the deferred closes above happen to
+	// fire when this function eventually returns.
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -1465,6 +1606,7 @@ func (c *Client) proxyConnectConn(_ context.Context, mux *p2p.UDPMux, localConn 
 		if n > 0 {
 			atomic.AddUint64(&c.stats.BytesOut, uint64(n)) // #nosec G115
 		}
+		_ = stream.Close()
 	}()
 	go func() {
 		defer wg.Done()
@@ -1472,6 +1614,7 @@ func (c *Client) proxyConnectConn(_ context.Context, mux *p2p.UDPMux, localConn 
 		if n > 0 {
 			atomic.AddUint64(&c.stats.BytesIn, uint64(n))
 		}
+		_ = localConn.Close()
 	}()
 
 	wg.Wait()
@@ -1894,22 +2037,51 @@ func (c *Client) GetInspector() *inspector.Inspector {
 }
 
 // parseProtocol converts a protocol string to a proto.Protocol value.
-// Returns proto.ProtocolHTTP if the input is empty or unrecognized.
+// Returns proto.ProtocolHTTP if the input is empty or unrecognized. Callers
+// that need to surface a real error for an invalid --protocol/config value
+// should call ValidateProtocolString first — this function is intentionally
+// total (never errors) since it also backs runtime dispatch, which must
+// have some deterministic fallback if validation is ever bypassed.
 func parseProtocol(s string) proto.Protocol {
 	switch strings.ToLower(s) {
 	case protocolHTTP, "":
 		return proto.ProtocolHTTP
-	case "https":
+	case protocolHTTPS:
 		return proto.ProtocolHTTPS
 	case protocolTCP:
 		return proto.ProtocolTCP
-	case "udp":
-		return proto.ProtocolUDP
-	case "ws", "websocket":
+	case "ws", protocolWebSocket:
 		return proto.ProtocolWebSocket
-	case "grpc":
+	case protocolGRPC:
 		return proto.ProtocolGRPC
 	default:
 		return proto.ProtocolHTTP
 	}
+}
+
+// validProtocolStrings lists the tunnel protocol values accepted by
+// --protocol / the YAML config file's protocol field. UDP is deliberately
+// excluded (V1): the server has no UDP dataplane handling at all — it would
+// silently register the tunnel as if it were HTTP, which is broken and
+// misleading rather than merely unsupported. Once the server implements a
+// real UDP tunnel path, add it back here alongside the server-side work.
+var validProtocolStrings = []string{protocolHTTP, protocolHTTPS, protocolTCP, "ws", protocolWebSocket, protocolGRPC}
+
+// ValidateProtocolString returns an error if s isn't empty and isn't one of
+// validProtocolStrings — in particular, it rejects "udp" with a specific,
+// actionable message instead of the generic "invalid protocol" error, since
+// that's the one value most likely to be tried based on stale docs/habit
+// from other tunnel tools.
+func ValidateProtocolString(s string) error {
+	if s == "" {
+		return nil
+	}
+	lower := strings.ToLower(s)
+	if lower == protocolUDP {
+		return fmt.Errorf("protocol %q is not supported: the server has no UDP dataplane implementation yet (tracked as a future enhancement); use tcp for a raw byte-stream tunnel instead", s)
+	}
+	if slices.Contains(validProtocolStrings, lower) {
+		return nil
+	}
+	return fmt.Errorf("invalid protocol %q: must be one of %s", s, strings.Join(validProtocolStrings, ", "))
 }

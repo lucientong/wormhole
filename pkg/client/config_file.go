@@ -117,6 +117,9 @@ func (fc *FileConfig) validate() error {
 		if t.LocalPort <= 0 || t.LocalPort > 65535 {
 			return fmt.Errorf("tunnel %q: local_port must be in 1–65535, got %d", name, t.LocalPort)
 		}
+		if err := ValidateProtocolString(t.Protocol); err != nil {
+			return fmt.Errorf("tunnel %q: %w", name, err)
+		}
 	}
 	return nil
 }

@@ -20,6 +20,7 @@
 - [Security Model](#security-model)
 - [Multi-Tunnel Configuration & Hot-Reload](#multi-tunnel-configuration--hot-reload)
 - [HA / Multi-Node Control Plane](#ha--multi-node-control-plane)
+- [Robustness & Protocol Hardening (P3-6 Batch A)](#robustness--protocol-hardening-p3-6-batch-a)
 - [Data Flow Summary](#data-flow-summary)
 
 ---
@@ -116,7 +117,7 @@ Wormhole is a Client-Server architecture tunneling tool. The core idea is:
 
 | Package | Location | Responsibility |
 |---------|----------|----------------|
-| `tunnel` | `pkg/tunnel/` | Multiplexer, frame codec, stream management, connection pool |
+| `tunnel` | `pkg/tunnel/` | Multiplexer, frame codec, stream management |
 | `proto` | `pkg/proto/` | Control protocol (Protobuf encoding + JSON fallback) |
 | `auth` | `pkg/auth/` | HMAC tokens, OIDC/JWT, OAuth Device Flow, credentials, RBAC, rate limiting, audit logging + store |
 | `p2p` | `pkg/p2p/` | STUN (IPv4/IPv6), NAT discovery, UDP hole punching, port prediction, reliable UDP (UDPMux + UDPStream + ARQ), E2E encryption (X25519 + AES-256-GCM) |
@@ -704,15 +705,6 @@ Reconnection is only useful if connection loss is actually detected. `tunnel.Mux
 
 `heartbeatLoop()` also selects on `mux.CloseNotify()` so it exits promptly rather than only checking mux health when its ticker fires. After **3 consecutive** ping failures, it proactively calls `mux.Close()` — this is what turns a silently-stalled connection (TCP still "open" but no longer responsive) into a detected connection loss, closing the loop with the mechanism above.
 
-### Connection Pool
-
-`pkg/tunnel/pool.go` provides connection pool management:
-
-- Reuses existing Mux connections
-- Health checks (periodic Ping)
-- Automatic cleanup of expired connections
-- Pre-establishes connections to reduce first-request latency
-
 ---
 
 ## Authentication & Authorization
@@ -1244,6 +1236,51 @@ TCP tunnels are **node-local only**: a TCP tunnel's listener lives on whichever 
 - `MaxClients` limits concurrent online clients
 - TCP port allocation range restriction (default 10000-20000)
 - Per-IP connection tracking for rate limiting
+
+---
+
+## Robustness & Protocol Hardening (P3-6 Batch A)
+
+The first sub-batch of the P3-6 architecture-refactoring phase closed out a set of correctness gaps found in the `review-v0.6.md` audit and removed dead code, without touching the hot-path allocation/context work reserved for batches B/C or the god-object decomposition reserved for batch D.
+
+### Graceful Shutdown (DP-26)
+
+`Server` now holds the `*http.Server` values it constructs for the HTTP and admin listeners (previously they were only passed to `ListenAndServe`/`ListenAndServeTLS` and discarded). `Server.Shutdown()` calls `http.Server.Shutdown(ctx)` on each with a bounded timeout (`ShutdownTimeout`, default 10s) before closing the tunnel listener, so in-flight HTTP/admin requests get a chance to finish instead of having their connections yanked out from under them on `SIGTERM`.
+
+### Bidirectional Proxy Half-Close (DP-04)
+
+Both the WebSocket and TCP tunnel proxy paths pump two directions concurrently (client→local and local→client) with `io.Copy`. Previously, if one direction hit EOF/error first, the *other* direction only unblocked once its own read timed out or the peer independently closed — for a mostly-one-way conversation (e.g. a long-poll or an idle keep-alive) this could stall a stream's teardown for the full read timeout. Now the first direction to finish explicitly triggers a close/`CloseWrite` on the other side's connection, so both directions unwind immediately regardless of which one errors first.
+
+### Concurrent Stream Limits (DP-03 / DP-27)
+
+Two new server flags cap how many data-plane streams (HTTP/WebSocket/TCP proxy streams, not control-channel streams) can be open at once:
+
+- `--max-concurrent-streams` (default 10000): a global, process-wide counter. When the limit is hit, new stream requests are rejected outright (not queued) so a spike in traffic degrades predictably (fast rejections) instead of unboundedly growing goroutines/memory.
+- `--max-streams-per-client` (default 500): the same idea scoped to a single client connection, so one misbehaving or unusually busy tenant can't starve every other client's share of the global limit.
+
+Both are implemented as `atomic.Int64` counters incremented before a stream is dispatched and decremented when it completes; acquiring is non-blocking (`CompareAndSwap`-style check-then-increment), matching the "reject fast" philosophy rather than adding a blocking semaphore that could itself become a queuing hazard.
+
+### Control-Frame Validation (DP-17)
+
+`DecodeControlMessage` previously accepted any bytes that protobuf could unmarshal without error — including all-zero or garbage input that happens to decode to `MessageType_MESSAGE_TYPE_UNKNOWN` with every oneof field unset. That's now explicitly rejected (`errUnknownEmptyMessage`) since it can only be malformed/corrupted input, never a legitimate message. The check is narrow by design: a message with `Type == UNKNOWN` that *does* carry a recognized payload (session or P2P) is still accepted, preserving forward compatibility for future message types a newer client might send to an older server.
+
+### Protocol Version Gating & Real Capability Advertisement (DP-30 / DP-33)
+
+- **Version gating**: `pkg/version` gained a minimal semver parser/comparator (`ParseSemver`, `Compare`) — deliberately not a full semver library, since Wormhole only needs `MAJOR.MINOR.PATCH` comparison, not pre-release/build-metadata ordering. The server's new `--min-client-version` flag rejects `AuthRequest`s from clients reporting an older version, with a clear auth-failure reason. Clients built from a non-tagged source (e.g. `dev`, empty string) fail semver parsing and are deliberately *never* rejected — version gating is an opt-in operator control, not a hard requirement for running unreleased builds.
+- **Real capabilities**: `AuthResponse.Capabilities` previously didn't exist / was always empty. The server now populates it from `Server.capabilities()`, which derives the list (`p2p`, `multi-tunnel`, `cluster`, `audit`, ...) from the server's actual runtime configuration rather than a hardcoded aspirational list. The client stores the server's advertised capabilities and gates optional behavior on them — e.g. `sendP2POffer` is now skipped entirely if the server didn't advertise `"p2p"`, instead of always attempting an offer and relying on the server to silently ignore it. An absent/empty capability list (e.g. from an older server that predates this field) is treated as "unknown, assume supported" for backward compatibility.
+
+### Dead Code Removal (DP-15)
+
+`pkg/tunnel/pool.go` implemented a connection-pooling abstraction that was never wired into any caller — `Client`/`Server` always create a fresh `Mux` per connection rather than pulling from a pool. It and its tests were removed rather than kept as unreachable code that only adds maintenance burden and coverage noise.
+
+### UDP Protocol Cleanup (V1)
+
+The client CLI and config file previously listed `udp` as an accepted `--protocol` value even though the server has no UDP dataplane implementation (only the P2P subsystem uses UDP, as a *transport* underneath the reliable `UDPMux`/`UDPStream` layer — never exposed as a raw tunnel protocol). `ValidateProtocolString` now explicitly rejects `udp` with an actionable error message at the client/config-file layer, instead of silently falling back to HTTP semantics or letting a confusing failure surface deep in the server. `parseProtocol` (used at lower layers, e.g. persisted state) still defaults unrecognized strings to HTTP rather than erroring, preserving backward compatibility for already-persisted config.
+
+### CLI Parity (U1 / U4)
+
+- **`wormhole tunnels create/delete` (U1)**: the client's control API (`pkg/client/control.go`, gated behind `--ctrl-port` like the existing `list` endpoint) gained `POST /tunnels` and `DELETE /tunnels/{name}`, backed by new `Client.CreateTunnel`/`Client.DeleteTunnel` methods that register/unregister a tunnel on an already-running client process. This is the imperative counterpart to editing the YAML config and sending `SIGHUP` — useful for scripting or ad hoc tunnels without touching the client's persisted config at all. Tunnels added this way are not persisted; they don't survive a client restart unless also added to the config file.
+- **`wormhole server -c server.yml` (U4)**: `pkg/server/config_file.go` mirrors the client's existing `FileConfig`/`LoadClientFileConfig` pattern — a `FileConfig` struct maps the YAML schema to server settings (including custom `time.Duration` string parsing), `validate()` catches malformed values (bad durations, unknown persistence/backend enum values) at load time rather than failing confusingly deep inside `Config` consumers, and `ToServerConfig(base)` merges only explicitly-set fields onto a base config (typically `DefaultConfig()`), leaving everything else untouched. Boolean fields that need a real tri-state (unset / explicitly false / explicitly true) — like `EnableMetrics` — use `*bool` rather than `bool`, since a plain `bool` can't distinguish "not mentioned in the file" from "set to false".
 
 ---
 

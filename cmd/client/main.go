@@ -52,7 +52,7 @@ func main() {
 	tlsEnabled := flag.Bool("tls", false, "Enable TLS for server connection")
 	tlsInsecure := flag.Bool("tls-insecure", false, "Skip TLS certificate verification (dev only)")
 	tlsCA := flag.String("tls-ca", "", "Path to custom CA certificate for TLS verification")
-	protocol := flag.String("protocol", "http", "Tunnel protocol: http, https, tcp, udp, ws, grpc")
+	protocol := flag.String("protocol", "http", "Tunnel protocol: http, https, tcp, ws, grpc")
 	hostname := flag.String("hostname", "", "Custom hostname for routing")
 	pathPrefix := flag.String("path-prefix", "", "Path-based routing prefix")
 	saveConfig := flag.Bool("save", false, "Save configuration to ~/.wormhole/config.yaml")
@@ -64,6 +64,10 @@ func main() {
 		With().
 		Timestamp().
 		Logger()
+
+	if err := client.ValidateProtocolString(*protocol); err != nil {
+		log.Fatal().Err(err).Msg("Invalid -protocol")
+	}
 
 	// Handle clear-token command.
 	if *clearToken {

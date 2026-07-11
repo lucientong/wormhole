@@ -17,6 +17,7 @@ import (
 	"github.com/lucientong/wormhole/pkg/p2p"
 	"github.com/lucientong/wormhole/pkg/proto"
 	"github.com/lucientong/wormhole/pkg/tunnel"
+	"github.com/lucientong/wormhole/pkg/version"
 	"github.com/rs/zerolog/log"
 )
 
@@ -29,6 +30,11 @@ const (
 	natTypePortRestrictedCone = "Port Restricted Cone"
 )
 
+// defaultShutdownTimeout is used when Config.ShutdownTimeout is unset
+// (DP-26): it bounds how long Shutdown waits for http.Server.Shutdown
+// to drain in-flight HTTP/admin requests before forcing them closed.
+const defaultShutdownTimeout = 15 * time.Second
+
 // Server is the wormhole server.
 type Server struct {
 	config Config
@@ -37,6 +43,14 @@ type Server struct {
 	tunnelListener net.Listener
 	httpListener   net.Listener
 	adminListener  net.Listener
+
+	// httpServer/adminServer are held so Shutdown can call their
+	// Shutdown(ctx) instead of just closing the underlying listener
+	// (DP-26): closing the listener alone stops new connections but
+	// hard-cuts in-flight requests, since http.Server.Serve returns
+	// immediately on a closed listener without draining anything.
+	httpServer  *http.Server
+	adminServer *http.Server
 
 	router        *Router
 	httpHandler   *HTTPHandler
@@ -67,6 +81,18 @@ type Server struct {
 	// stateStoreHealthy tracks whether the most recent heartbeat/route
 	// refresh against stateStore succeeded, surfaced via /health (H9).
 	stateStoreHealthy atomic.Bool
+
+	// activeDataStreams counts data-plane streams currently proxying
+	// (HTTP forward, WebSocket, TCP tunnel) across all clients, bounded
+	// by config.MaxConcurrentStreams (DP-03). Manipulated only via
+	// tryAcquireStreamSlot/releaseStreamSlot.
+	activeDataStreams int64
+
+	// listenersReady is closed once Start has bound tunnelListener,
+	// httpListener and adminListener (and built httpServer/adminServer),
+	// giving callers/tests a race-detector-safe way to wait for startup
+	// instead of a fixed sleep.
+	listenersReady chan struct{}
 
 	// Shutdown.
 	closed  uint32
@@ -102,6 +128,11 @@ type ClientSession struct {
 	// re-register them to refresh their TTL (H1) without needing to
 	// recompute what should still be registered from scratch.
 	clusterRoutes []RouteEntry
+
+	// activeDataStreams counts this client's own in-flight data-plane
+	// streams, bounded by config.MaxStreamsPerClient (DP-27) independent
+	// of the global activeDataStreams cap on Server.
+	activeDataStreams int32
 
 	mu sync.Mutex
 }
@@ -152,9 +183,10 @@ func NewServer(config Config) *Server {
 	applyClusterNodeIDDefault(&config)
 
 	s := &Server{
-		config:  config,
-		clients: make(map[string]*ClientSession),
-		closeCh: make(chan struct{}),
+		config:         config,
+		clients:        make(map[string]*ClientSession),
+		closeCh:        make(chan struct{}),
+		listenersReady: make(chan struct{}),
 		stats: Stats{
 			StartTime: time.Now(),
 		},
@@ -344,6 +376,25 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	s.adminListener = adminLn
 
+	// Build the *http.Server instances synchronously, before the
+	// goroutines that call Serve() on them are spawned below, so
+	// Shutdown (DP-26) can safely read s.httpServer/s.adminServer
+	// without racing their assignment.
+	s.httpServer = &http.Server{
+		Handler:        s.httpHandler,
+		ReadTimeout:    s.config.ReadTimeout,
+		WriteTimeout:   s.config.WriteTimeout,
+		IdleTimeout:    s.config.IdleTimeout,
+		MaxHeaderBytes: 1 << 20, // 1 MB — mitigate large-header DoS.
+	}
+	s.adminServer = &http.Server{
+		Handler:        s.adminAPI.Handler(),
+		ReadTimeout:    10 * time.Second,
+		WriteTimeout:   10 * time.Second,
+		MaxHeaderBytes: 1 << 20, // 1 MB — mitigate large-header DoS.
+	}
+	close(s.listenersReady)
+
 	// Start ACME HTTP-01 challenge server if AutoTLS is enabled. This is
 	// needed whenever *either* the HTTP or the tunnel listener sources its
 	// certificate from AutoTLS (S4 can enable AutoTLS purely to serve the
@@ -386,7 +437,11 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Wait for shutdown.
 	<-ctx.Done()
-	return s.Shutdown()
+	// ctx is already Done here, so there's nothing meaningful left to
+	// propagate to Shutdown; it deliberately derives its own bounded
+	// context.WithTimeout(context.Background(), ShutdownTimeout) for the
+	// graceful drain instead (DP-26).
+	return s.Shutdown() //nolint:contextcheck // ctx already canceled; Shutdown uses its own bounded timeout
 }
 
 // Shutdown gracefully shuts down the server.
@@ -398,16 +453,44 @@ func (s *Server) Shutdown() error {
 	log.Info().Msg("Shutting down server...")
 	close(s.closeCh)
 
-	// Close listeners.
+	// Close the tunnel listener directly: it's a raw net.Listener (the
+	// tunnel protocol is our own framing, not net/http), so there's no
+	// http.Server to ask for a graceful drain.
 	if s.tunnelListener != nil {
 		_ = s.tunnelListener.Close()
 	}
-	if s.httpListener != nil {
-		_ = s.httpListener.Close()
+
+	// Gracefully drain the HTTP and admin API servers (DP-26): unlike
+	// closing the listener directly, http.Server.Shutdown(ctx) stops
+	// accepting new connections immediately but lets in-flight handlers
+	// finish (up to ShutdownTimeout) before returning, so a request that's
+	// mid-flight when an operator sends SIGTERM completes normally instead
+	// of getting its connection yanked out from under it.
+	shutdownTimeout := s.config.ShutdownTimeout
+	if shutdownTimeout <= 0 {
+		shutdownTimeout = defaultShutdownTimeout
 	}
-	if s.adminListener != nil {
-		_ = s.adminListener.Close()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+
+	var httpShutdownWg sync.WaitGroup
+	if s.httpServer != nil {
+		httpShutdownWg.Go(func() {
+			if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
+				log.Warn().Err(err).Msg("HTTP server did not shut down gracefully within ShutdownTimeout; forcing close")
+				_ = s.httpServer.Close()
+			}
+		})
 	}
+	if s.adminServer != nil {
+		httpShutdownWg.Go(func() {
+			if err := s.adminServer.Shutdown(shutdownCtx); err != nil {
+				log.Warn().Err(err).Msg("Admin server did not shut down gracefully within ShutdownTimeout; forcing close")
+				_ = s.adminServer.Close()
+			}
+		})
+	}
+	httpShutdownWg.Wait()
 
 	// Close port allocator.
 	if s.portAllocator != nil {
@@ -849,33 +932,30 @@ func (s *Server) authenticateClient(mux *tunnel.Mux, sessionID string) (*auth.Cl
 	}
 
 	if msg.Type != proto.MessageTypeAuthRequest || msg.AuthRequest == nil {
-		// Send rejection and return error.
-		resp := proto.NewAuthResponse(false, "expected auth request", "", "", "")
-		if data, encErr := resp.Encode(); encErr == nil {
-			_, _ = stream.Write(data)
-		}
+		s.sendAuthFailure(stream, "expected auth request")
 		return nil, "", fmt.Errorf("expected auth request, got type %d", msg.Type)
 	}
 
 	authReq := msg.AuthRequest
 
+	// Reject clients reporting a version older than MinClientVersion, if
+	// configured (DP-30). Unparseable versions (e.g. "dev" builds) are
+	// never rejected — see Config.MinClientVersion doc.
+	if rejectMsg := s.checkClientVersion(authReq.Version); rejectMsg != "" {
+		s.sendAuthFailure(stream, rejectMsg)
+		return nil, "", fmt.Errorf("client version %q rejected: %s", authReq.Version, rejectMsg)
+	}
+
 	// Validate token.
 	claims, err := s.authenticator.ValidateToken(authReq.Token)
 	if err != nil {
-		// Send failure response.
-		resp := proto.NewAuthResponse(false, "authentication failed: "+err.Error(), "", "", "")
-		if data, encErr := resp.Encode(); encErr == nil {
-			_, _ = stream.Write(data)
-		}
+		s.sendAuthFailure(stream, "authentication failed: "+err.Error())
 		return nil, "", fmt.Errorf("validate token: %w", err)
 	}
 
 	// Check connect permission.
 	if !auth.HasPermission(claims, auth.PermissionConnect) {
-		resp := proto.NewAuthResponse(false, "insufficient permissions", "", "", "")
-		if data, encErr := resp.Encode(); encErr == nil {
-			_, _ = stream.Write(data)
-		}
+		s.sendAuthFailure(stream, "insufficient permissions")
 		return nil, "", fmt.Errorf("role %s lacks connect permission", claims.Role)
 	}
 
@@ -885,8 +965,12 @@ func (s *Server) authenticateClient(mux *tunnel.Mux, sessionID string) (*auth.Cl
 		subdomain = generateSubdomain()
 	}
 
-	// Send success response with the pre-generated session ID.
+	// Send success response with the pre-generated session ID and this
+	// node's real feature set (DP-33), so clients can gate optional
+	// behavior (e.g. P2P offers) on what the server actually supports
+	// instead of assuming.
 	resp := proto.NewAuthResponse(true, "", subdomain, "", sessionID)
+	resp.AuthResponse.Capabilities = s.capabilities()
 	data, err := resp.Encode()
 	if err != nil {
 		return nil, "", fmt.Errorf("encode auth response: %w", err)
@@ -903,6 +987,51 @@ func (s *Server) authenticateClient(mux *tunnel.Mux, sessionID string) (*auth.Cl
 		Msg("Authentication successful")
 
 	return claims, subdomain, nil
+}
+
+// sendAuthFailure encodes and best-effort writes a failure AuthResponse
+// to the auth stream. Errors are intentionally swallowed: the caller
+// already has (or is about to construct) a more specific error to
+// return, and the peer will observe the closed/EOF'd stream either way
+// if the write itself fails.
+func (s *Server) sendAuthFailure(stream *tunnel.Stream, reason string) {
+	resp := proto.NewAuthResponse(false, reason, "", "", "")
+	if data, encErr := resp.Encode(); encErr == nil {
+		_, _ = stream.Write(data)
+	}
+}
+
+// checkClientVersion returns a non-empty human-readable rejection reason
+// if clientVersion is older than Config.MinClientVersion, and "" if the
+// client should be allowed to proceed (either the check is disabled, the
+// client is new enough, or the version isn't a parseable semver — e.g. a
+// "dev" build, which we always allow rather than guess).
+func (s *Server) checkClientVersion(clientVersion string) string {
+	if s.config.MinClientVersion == "" {
+		return ""
+	}
+	cmp, err := version.Compare(clientVersion, s.config.MinClientVersion)
+	if err != nil || cmp >= 0 {
+		return ""
+	}
+	return fmt.Sprintf("client version %s is older than the minimum supported version %s; please upgrade wormhole",
+		clientVersion, s.config.MinClientVersion)
+}
+
+// capabilities returns the set of optional protocol features this server
+// instance actually supports (DP-33), reported to clients via
+// AuthResponse.Capabilities so they can gate optional behavior instead of
+// assuming a fixed feature set. "p2p" and "multi-tunnel" relay/routing are
+// unconditional server-side; cluster/audit reflect this node's config.
+func (s *Server) capabilities() []string {
+	caps := []string{"p2p", "multi-tunnel"}
+	if s.stateStore != nil {
+		caps = append(caps, "cluster")
+	}
+	if s.auditLogger != nil {
+		caps = append(caps, "audit")
+	}
+	return caps
 }
 
 // handleClientStreams handles streams from a client.
@@ -1594,35 +1723,22 @@ func (s *Server) findPeerBySubdomain(targetSubdomain string, initiator *ClientSe
 	return nil, "", errP2PTargetTunnelMeta
 }
 
-// serveHTTP serves HTTP requests using the new HTTPHandler.
+// serveHTTP serves HTTP requests on the already-constructed s.httpServer
+// (built synchronously in Start, before this goroutine is spawned, so
+// Shutdown never races on s.httpServer being nil-vs-assigned).
 func (s *Server) serveHTTP() {
 	defer s.closeWg.Done()
 
-	server := &http.Server{
-		Handler:        s.httpHandler,
-		ReadTimeout:    s.config.ReadTimeout,
-		WriteTimeout:   s.config.WriteTimeout,
-		IdleTimeout:    s.config.IdleTimeout,
-		MaxHeaderBytes: 1 << 20, // 1 MB — mitigate large-header DoS.
-	}
-
-	if err := server.Serve(s.httpListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := s.httpServer.Serve(s.httpListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Error().Err(err).Msg("HTTP server error")
 	}
 }
 
-// serveAdmin serves the admin API using the new AdminAPI handler.
+// serveAdmin serves the admin API on the already-constructed s.adminServer.
 func (s *Server) serveAdmin() {
 	defer s.closeWg.Done()
 
-	server := &http.Server{
-		Handler:        s.adminAPI.Handler(),
-		ReadTimeout:    10 * time.Second,
-		WriteTimeout:   10 * time.Second,
-		MaxHeaderBytes: 1 << 20, // 1 MB — mitigate large-header DoS.
-	}
-
-	if err := server.Serve(s.adminListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := s.adminServer.Serve(s.adminListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Error().Err(err).Msg("Admin server error")
 	}
 }
@@ -1728,9 +1844,82 @@ func (s *Server) serveTCPTunnel(ln net.Listener, client *ClientSession, tunnelID
 	}
 }
 
+// errStreamSlotSaturated is returned by tryAcquireStreamSlot when either
+// the global or per-client data-plane stream cap (DP-03/DP-27) is full.
+var errStreamSlotSaturated = errors.New("server: concurrent stream limit reached")
+
+// tryAcquireStreamSlot reserves one concurrent data-plane stream slot for
+// client, enforcing both config.MaxConcurrentStreams (global) and
+// config.MaxStreamsPerClient (per-client). On success it returns a release
+// func that MUST be called exactly once when the stream finishes. On
+// failure it returns errStreamSlotSaturated and a nil release func; the
+// caller should reject the request (503 for HTTP, drop for raw TCP)
+// instead of queuing, so a saturated server fails fast rather than piling
+// up unbounded goroutines/memory behind the limit.
+func (s *Server) tryAcquireStreamSlot(client *ClientSession) (release func(), err error) {
+	if s.config.MaxConcurrentStreams > 0 && !tryIncrementBounded64(&s.activeDataStreams, int64(s.config.MaxConcurrentStreams)) {
+		return nil, errStreamSlotSaturated
+	}
+	if s.config.MaxStreamsPerClient > 0 && !tryIncrementBounded32(&client.activeDataStreams, int32(s.config.MaxStreamsPerClient)) {
+		if s.config.MaxConcurrentStreams > 0 {
+			atomic.AddInt64(&s.activeDataStreams, -1)
+		}
+		return nil, errStreamSlotSaturated
+	}
+
+	var released atomic.Bool
+	return func() {
+		if !released.CompareAndSwap(false, true) {
+			return
+		}
+		if s.config.MaxStreamsPerClient > 0 {
+			atomic.AddInt32(&client.activeDataStreams, -1)
+		}
+		if s.config.MaxConcurrentStreams > 0 {
+			atomic.AddInt64(&s.activeDataStreams, -1)
+		}
+	}, nil
+}
+
+// tryIncrementBounded64 atomically increments *counter and returns true,
+// unless it is already >= limit, in which case it leaves *counter
+// unchanged and returns false.
+func tryIncrementBounded64(counter *int64, limit int64) bool {
+	for {
+		cur := atomic.LoadInt64(counter)
+		if cur >= limit {
+			return false
+		}
+		if atomic.CompareAndSwapInt64(counter, cur, cur+1) {
+			return true
+		}
+	}
+}
+
+// tryIncrementBounded32 is tryIncrementBounded64 for int32 counters.
+func tryIncrementBounded32(counter *int32, limit int32) bool {
+	for {
+		cur := atomic.LoadInt32(counter)
+		if cur >= limit {
+			return false
+		}
+		if atomic.CompareAndSwapInt32(counter, cur, cur+1) {
+			return true
+		}
+	}
+}
+
 // handleTCPConnection handles a single raw TCP connection by proxying it through the tunnel.
 func (s *Server) handleTCPConnection(conn net.Conn, client *ClientSession, tunnelID string) {
 	defer conn.Close()
+
+	// DP-03/DP-27: bound concurrent TCP tunnel streams before opening one.
+	release, slotErr := s.tryAcquireStreamSlot(client)
+	if slotErr != nil {
+		log.Warn().Str("client", client.ID).Msg("TCP tunnel connection rejected: concurrent stream limit reached")
+		return
+	}
+	defer release()
 
 	// Open stream to client.
 	stream, err := client.Mux.OpenStreamContext(context.Background())
@@ -1747,10 +1936,18 @@ func (s *Server) handleTCPConnection(conn net.Conn, client *ClientSession, tunne
 		return
 	}
 
-	// Bidirectional proxy.
-	done := make(chan struct{}, 2)
+	// Bidirectional proxy. tunnel.Stream has no CloseWrite/CloseRead, so
+	// the only way to unblock a still-running direction once its peer
+	// direction has errored out is to close both ends (DP-04): waiting
+	// on just the first-to-finish direction and relying on the deferred
+	// conn.Close()/stream.Close() at function return left the other
+	// direction's io loop running (and its goroutine leaked past this
+	// function's scope) until that deferred close happened to land.
+	var wg sync.WaitGroup
+	wg.Add(2)
 
 	go func() {
+		defer wg.Done()
 		buf := make([]byte, 32*1024)
 		for {
 			n, readErr := conn.Read(buf)
@@ -1761,10 +1958,11 @@ func (s *Server) handleTCPConnection(conn net.Conn, client *ClientSession, tunne
 				break
 			}
 		}
-		done <- struct{}{}
+		_ = stream.Close()
 	}()
 
 	go func() {
+		defer wg.Done()
 		buf := make([]byte, 32*1024)
 		for {
 			n, readErr := stream.Read(buf)
@@ -1775,10 +1973,10 @@ func (s *Server) handleTCPConnection(conn net.Conn, client *ClientSession, tunne
 				break
 			}
 		}
-		done <- struct{}{}
+		_ = conn.Close()
 	}()
 
-	<-done
+	wg.Wait()
 }
 
 // removeClient removes a client from the server.

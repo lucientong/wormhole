@@ -66,6 +66,20 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// DP-03/DP-27: bound concurrent data-plane streams (global and
+	// per-client) before opening one for this request, so a saturated
+	// server/client fails fast with 503 instead of spawning an unbounded
+	// number of proxy goroutines.
+	release, slotErr := h.server.tryAcquireStreamSlot(client)
+	if slotErr != nil {
+		http.Error(w, "Server busy: too many concurrent streams", http.StatusServiceUnavailable)
+		if h.server.metrics != nil {
+			h.server.metrics.RequestsTotal.WithLabelValues("http", "rejected_saturated").Inc()
+		}
+		return
+	}
+	defer release()
+
 	// Check if this is a WebSocket upgrade request.
 	if isWebSocketUpgrade(r) {
 		h.handleWebSocket(client, w, r)
@@ -187,21 +201,29 @@ func (h *HTTPHandler) handleWebSocket(client *ClientSession, w http.ResponseWrit
 		}
 	}
 
-	// Bidirectional proxy.
-	done := make(chan struct{}, 2)
+	// Bidirectional proxy. As in handleTCPConnection (DP-04), close the
+	// *write* side of each direction as soon as its io.Copy finishes, so
+	// the other direction's blocked Read unblocks immediately instead of
+	// leaking a goroutine until the deferred closes above happen to run.
+	// (Closing what a direction *read* from — instead of what it *wrote*
+	// to — would leave the peer goroutine's Read with nothing to wake it
+	// up, deadlocking both.)
+	var wg sync.WaitGroup
+	wg.Add(2)
 
 	go func() {
-		_, _ = io.Copy(clientConn, stream)
-		done <- struct{}{}
+		defer wg.Done()
+		_, _ = io.Copy(clientConn, stream) // reads stream, writes clientConn
+		_ = clientConn.Close()
 	}()
 
 	go func() {
-		_, _ = io.Copy(stream, clientConn)
-		done <- struct{}{}
+		defer wg.Done()
+		_, _ = io.Copy(stream, clientConn) // reads clientConn, writes stream
+		_ = stream.Close()
 	}()
 
-	// Wait for either direction to finish.
-	<-done
+	wg.Wait()
 }
 
 // sendStreamRequest sends the stream metadata to the tunnel client.

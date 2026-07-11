@@ -88,6 +88,12 @@ type Config struct {
 	// IdleTimeout is the idle timeout for connections.
 	IdleTimeout time.Duration
 
+	// ShutdownTimeout bounds how long Shutdown waits for in-flight HTTP
+	// and admin API requests to finish via http.Server.Shutdown(ctx)
+	// (DP-26) before the process moves on to closing everything else.
+	// 0 falls back to defaultShutdownTimeout.
+	ShutdownTimeout time.Duration
+
 	// MaxClients is the maximum number of concurrent clients.
 	// 0 means unlimited.
 	MaxClients int
@@ -95,6 +101,22 @@ type Config struct {
 	// MaxTunnelsPerClient is the maximum number of tunnels a single client can register.
 	// 0 means unlimited.
 	MaxTunnelsPerClient int
+
+	// MaxConcurrentStreams bounds the total number of data-plane streams
+	// (HTTP forward, WebSocket, TCP tunnel) proxying concurrently across
+	// all clients (DP-03). MaxClients only bounds connection *count*, not
+	// per-connection concurrency, so a handful of clients issuing many
+	// simultaneous requests could otherwise spawn unbounded goroutines.
+	// 0 means unlimited. Saturating this returns 503 (HTTP) or drops the
+	// connection (TCP) rather than queuing, to keep worst-case resource
+	// use bounded instead of trading it for unbounded added latency.
+	MaxConcurrentStreams int
+
+	// MaxStreamsPerClient bounds concurrent data-plane streams for a
+	// single client (DP-27), independent of MaxConcurrentStreams, so one
+	// noisy/malicious client can't exhaust the global budget by itself.
+	// 0 means unlimited.
+	MaxStreamsPerClient int
 
 	// RequireAuth requires authentication for connections.
 	RequireAuth bool
@@ -222,6 +244,16 @@ type Config struct {
 	// reaches ClusterNodeAddr directly. Requests with no such header at
 	// all (ordinary external traffic) are unaffected either way.
 	ClusterSecret string
+
+	// MinClientVersion, when set, rejects the auth handshake of any
+	// client reporting an older semantic version (DP-30) — useful during
+	// a rolling upgrade to require clients to update before a breaking
+	// wire/behavior change goes live. Must be a "MAJOR.MINOR.PATCH"
+	// string (an optional leading "v" is accepted). Left empty (the
+	// default) disables the check entirely. Clients reporting a
+	// non-semver version (e.g. "dev" builds) are never rejected by this
+	// check, since they have no meaningful version to compare.
+	MinClientVersion string
 }
 
 // DefaultConfig returns the default server configuration.
@@ -238,8 +270,11 @@ func DefaultConfig() Config {
 		ReadTimeout:            30 * time.Second,
 		WriteTimeout:           30 * time.Second,
 		IdleTimeout:            5 * time.Minute,
+		ShutdownTimeout:        15 * time.Second,
 		MaxClients:             1000,
-		MaxTunnelsPerClient:    0, // Unlimited by default.
+		MaxTunnelsPerClient:    0,     // Unlimited by default.
+		MaxConcurrentStreams:   10000, // Global data-plane stream cap (DP-03).
+		MaxStreamsPerClient:    500,   // Per-client data-plane stream cap (DP-27).
 		RequireAuth:            false,
 		AuthTimeout:            10 * time.Second,
 		RateLimitEnabled:       true,

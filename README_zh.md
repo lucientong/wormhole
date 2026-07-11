@@ -122,8 +122,9 @@ wormhole connect peer-a --local 9090               # 在 peer B 上执行
 - **认证授权**：HMAC-SHA256 签名 Token + 角色权限控制（admin/member/viewer），支持预共享 Token 快速接入
 - **OIDC/SSO**：OIDC Discovery + JWKS JWT 校验；OAuth2 设备码流程支持命令行登录；凭证持久化到 `~/.wormhole/credentials.json`
 - **审计日志**：结构化事件（认证、隧道、P2P）存储在内存（环形缓冲）或 SQLite；通过 Admin API 查询，支持 CSV/JSON 导出
-- **多隧道配置**：YAML 配置文件定义多个隧道；SIGHUP 触发差量热重载；本地控制 API（`--ctrl-port`）支持 `wormhole tunnels list`
+- **多隧道配置**：YAML 配置文件定义多个隧道（客户端和服务端均支持，通过 `--config`/`-c`）；SIGHUP 触发差量热重载；本地控制 API（`--ctrl-port`）支持 `wormhole tunnels list/create/delete`——无需重启即可给运行中的 client 增删隧道
 - **HA / 多节点**：可插拔的 `StateStore` 接口；内存（单节点）或 Redis 后端；集群心跳周期刷新每条路由的 TTL，子域名/hostname/path 路由均可跨节点索引；跨节点代理通过 `httputil.ReverseProxy` 转发，并附带 `--cluster-secret` 校验；TCP 隧道在 HA 下仅限节点本地（详见[架构文档](docs/architecture_zh.md#ha--多节点控制面)）
+- **资源上限与版本协商**：`--max-concurrent-streams`/`--max-streams-per-client` 限制并发数据流数量（全局 + 单客户端），防止负载过高时资源被打爆；`--min-client-version` 拒绝低于指定语义化版本的 client；server 在鉴权阶段广播真实能力集（`p2p`/`multi-tunnel`/`cluster`/`audit` 等），client 据此决定是否尝试可选行为（例如是否发送 P2P offer），而不是盲目假设对端支持
 
 ### 组件
 
@@ -174,6 +175,41 @@ wormhole server \
   --tls
 ```
 
+### 服务器配置文件
+
+除了长长的命令行参数，服务器也可以从 YAML 文件加载配置（`--config` / `-c`），风格与客户端的 `--config` 文件一致：
+
+```yaml
+# server.yml
+listen_addr: :7000
+http_addr: :80
+admin_addr: 127.0.0.1:7001
+domain: tunnel.example.com
+
+tls:
+  enabled: true
+
+require_auth: true
+auth_secret: my-secret-key-at-least-16-chars
+min_client_version: 0.6.0
+
+max_concurrent_streams: 10000
+max_streams_per_client: 500
+
+persistence:
+  type: sqlite
+
+audit:
+  enabled: true
+  retention_days: 90
+```
+
+```bash
+wormhole server -c server.yml
+```
+
+只有文件中出现的字段才会覆盖默认值——省略的字段保持对应命令行参数的默认行为，所以一个只写 `domain:` 的最小文件也是合法的。
+
 ## 配置
 
 ### 客户端选项
@@ -191,7 +227,7 @@ wormhole server \
 | `--tls` | 启用 TLS 连接 | false |
 | `--tls-insecure` | 跳过 TLS 证书验证（仅开发环境） | false |
 | `--tls-ca` | 自定义 CA 证书路径 | 无 |
-| `--protocol` / `-P` | 隧道协议：http、https、tcp、udp、ws、grpc | `http` |
+| `--protocol` / `-P` | 隧道协议：http、https、tcp、ws、grpc（udp 会被拒绝——服务端尚未实现 UDP 数据面） | `http` |
 | `--hostname` | 自定义域名路由 | 无 |
 | `--path-prefix` | 路径前缀路由 | 无 |
 
@@ -213,12 +249,16 @@ wormhole server \
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
+| `--config` / `-c` | YAML 服务器配置文件路径；文件中明确设置的字段会覆盖下方的命令行默认值（见[示例](#服务器配置文件)） | 无 |
 | `--port` | 隧道监听端口 | `7000` |
 | `--host` | 绑定地址 | `0.0.0.0` |
 | `--http-port` | HTTP 流量端口 | `80` |
 | `--admin-port` | 管理 API 端口 | `7001` |
 | `--admin-host` | 管理 API 绑定地址（安全：默认仅监听本地） | `127.0.0.1` |
 | `--domain` | 隧道 URL 域名（环境变量：`WORMHOLE_DOMAIN`） | `localhost` |
+| `--max-concurrent-streams` | 所有客户端合计的最大并发数据流数；超出上限会拒绝新流而非排队等待（0 = 不限制） | `10000` |
+| `--max-streams-per-client` | 单个客户端的最大并发数据流数，独立于上面的全局上限（0 = 不限制） | `500` |
+| `--min-client-version` | 拒绝声明版本低于此值的 client，例如 `0.6.0`；版本号不是标准 semver 的 client（如 dev 构建）永远不会被拒绝 | （禁用） |
 | `--tls` | 启用 TLS（设置域名时自动申请证书） | false |
 | `--tunnel-tls` | 隧道控制链路 TLS（默认跟随 `--tls`；**当 `--require-auth` 且配置了真实 `--domain` 时也默认开启**，见 [安全](#安全)） | 见说明 |
 | `--cert` | TLS 证书文件路径 | 无 |
@@ -287,6 +327,17 @@ wormhole client --config ~/.wormhole/tunnels.yaml --ctrl-port 7100
 wormhole tunnels list --ctrl-port 7100
 # 或直接：
 curl http://localhost:7100/tunnels
+
+# 无需重启即可给运行中的 client 动态新增一条隧道
+wormhole tunnels create db --local 5432 --protocol tcp --ctrl-port 7100
+# 或直接：
+curl -X POST http://localhost:7100/tunnels \
+  -d '{"name":"db","local_port":5432,"protocol":"tcp"}'
+
+# 从运行中的 client 删除一条隧道
+wormhole tunnels delete db --ctrl-port 7100
+# 或直接：
+curl -X DELETE http://localhost:7100/tunnels/db
 ```
 
 ### 认证
@@ -486,7 +537,7 @@ wormhole/
 ├── pkg/
 │   ├── client/       # 客户端核心（配置、连接、持久化）
 │   ├── server/       # 服务端核心（配置、路由、处理器、TLS、管理 API）
-│   ├── tunnel/       # 核心隧道（多路复用器、帧编解码、流、连接池）
+│   ├── tunnel/       # 核心隧道（多路复用器、帧编解码、流）
 │   ├── inspector/    # 流量检查（捕获、存储、WebSocket）
 │   ├── p2p/          # P2P 直连（STUN、打洞、端口预测）
 │   ├── proto/        # 控制协议（JSON 消息）
@@ -616,6 +667,7 @@ Admin API 默认绑定 `127.0.0.1`。如需远程访问，使用 `--admin-host 0
 - [x] Phase 14（v0.6.2）：P2P 数据面接入与传输优化——新增 `wormhole connect <子域名>` 命令，两个 `wormhole client` 打洞后流量全程 P2P 直连（server 只做信令，不转发一个字节）；`UDPStream` 从固定 200ms 重传升级为 RFC 6298 风格自适应 RTO + 按段指数退避；发送/接收路径降拷贝（加密直写目标 buffer、消除冗余拷贝）；删除已被 `UDPMux`/`UDPStream` 取代的 `pkg/p2p/transport.go` 旧 ARQ 实现
 - [x] Phase 15（v0.6.3）：安全加固——RBAC 写权限检查（viewer 不能再注册/关闭隧道）；隧道控制链路 TLS 与 HTTP 数据面 TLS 解耦，`--require-auth` 配合真实域名时默认开启（配置错误时启动失败而非静默明文）；子域名注册改为原子的、集群一致的申请（本地 + Redis `SETNX`），真实冲突拒绝新连接而非悄悄覆盖已有路由；修复 token 过期计算的数据竞争，补齐吊销黑名单的周期清理调度；OIDC 显式拒绝 `alg: none` 并校验 `nbf`（带时钟容差）；Inspector 默认对敏感请求头脱敏，并下调默认正文捕获上限；`/metrics` 现在需要管理员认证；审计日志补齐认证成功/IP 封禁/Token 生成/IP 解封事件，并支持可配置的保留期清理（`--audit-retention-days`），同时在 `/stats` 新增 `audit_store_errors` 计数，使审计持久化失败不再无声无息
 - [x] Phase 16（v0.6.4）：HA 二期——集群心跳每轮同时重新注册（刷新 TTL）该节点持有的每一条路由，修复长连接下路由从 Redis 静默过期的问题；hostname/path 前缀路由现已索引进 Redis，可跨节点访问，不再局限于子域名；`ClusterNodeID` 未设置时默认取 `os.Hostname()`；新增 `--cluster-secret` 校验节点间代理请求；新增 `--persistence redis`（`auth.RedisStore`），团队/Token 吊销状态跨节点共享、即时失效；Redis 后端存储全面把 `KEYS` 替换为 `SCAN`；`/health` 新增 Redis 连接状态（`cluster.state_store_healthy`，不可达时整体状态降级）；客户端重连时立即回收陈旧持有者的子域名/hostname/path，不再遇到虚假冲突；文档明确 TCP 隧道在 HA 下仅节点本地可达（不支持跨节点 TCP 代理）
+- [ ] Phase 17（v0.6.5，待发布）：架构重构批次 A（正确性收尾 + 死代码清理）——HTTP/管理监听改为带超时的 `Shutdown(ctx)` 优雅关闭，而非进程直接退出；双向代理（WebSocket/TCP）任一方向出错即触发双侧收尾，不再需要等对端超时才释放连接；新增 `--max-concurrent-streams`/`--max-streams-per-client`，超出上限直接拒绝新流而非无限排队；`DecodeControlMessage` 拒绝畸形的 `UNKNOWN` 类型空控制帧，同时继续放行携带 payload 的、面向未来兼容的未知类型；新增 `--min-client-version` 语义化版本门禁，以及服务端真实能力集广播（`p2p`/`multi-tunnel`/`cluster`/`audit`），client 不再盲目假设可选特性一定存在；删除从未接线的 `tunnel.Pool` 死代码；`--protocol` 可选值中移除 udp（服务端从未实现 UDP 数据面），现在会显式报错而非静默降级；新增 `wormhole tunnels create/delete`，支持给运行中的 client 命令式增删隧道；新增 `wormhole server -c server.yml`，服务端配置文件支持与客户端保持一致
 
 ## 贡献
 

@@ -104,6 +104,62 @@ func TestFull_ContainsAllFields(t *testing.T) {
 	assert.Contains(t, s, runtime.GOOS+"/"+runtime.GOARCH)
 }
 
+// --- ParseSemver / Compare (DP-30) ---
+
+func TestParseSemver_Valid(t *testing.T) {
+	cases := []struct {
+		in                  string
+		major, minor, patch int
+	}{
+		{"1.2.3", 1, 2, 3},
+		{"v1.2.3", 1, 2, 3},
+		{"0.6.4", 0, 6, 4},
+		{"2.0.0-rc1", 2, 0, 0},
+		{"1.2.3+build.5", 1, 2, 3},
+	}
+	for _, tc := range cases {
+		major, minor, patch, err := ParseSemver(tc.in)
+		require.NoError(t, err, tc.in)
+		assert.Equal(t, tc.major, major, tc.in)
+		assert.Equal(t, tc.minor, minor, tc.in)
+		assert.Equal(t, tc.patch, patch, tc.in)
+	}
+}
+
+func TestParseSemver_Invalid(t *testing.T) {
+	for _, in := range []string{"dev", "", "1.2", "1.2.3.4", "a.b.c", "-1.2.3"} {
+		_, _, _, err := ParseSemver(in)
+		assert.ErrorIs(t, err, ErrNotSemver, in)
+	}
+}
+
+func TestCompare(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"1.0.0", "1.0.0", 0},
+		{"1.0.1", "1.0.0", 1},
+		{"1.0.0", "1.0.1", -1},
+		{"1.1.0", "1.0.9", 1},
+		{"2.0.0", "1.9.9", 1},
+		{"0.6.3", "0.6.4", -1},
+	}
+	for _, tc := range cases {
+		got, err := Compare(tc.a, tc.b)
+		require.NoError(t, err, "%s vs %s", tc.a, tc.b)
+		assert.Equal(t, tc.want, got, "%s vs %s", tc.a, tc.b)
+	}
+}
+
+func TestCompare_UnparseableReturnsError(t *testing.T) {
+	_, err := Compare("dev", "1.0.0")
+	assert.ErrorIs(t, err, ErrNotSemver)
+
+	_, err = Compare("1.0.0", "dev")
+	assert.ErrorIs(t, err, ErrNotSemver)
+}
+
 func TestGet_DefaultValues(t *testing.T) {
 	// When not set via ldflags, defaults should be present.
 	info := Get()

@@ -267,17 +267,30 @@ func (m *ControlMessage) EncodeJSON() ([]byte, error) {
 	return json.Marshal(m)
 }
 
+// errUnknownEmptyMessage is returned by DecodeControlMessage when the
+// protobuf wire format "successfully" parses bytes into an all-zero
+// message (DP-17): the permissive protobuf decoder silently skips
+// unrecognized/malformed field tags instead of erroring, so arbitrary
+// garbage bytes can unmarshal into a message with Type == UNKNOWN and no
+// payload set, without proto.Unmarshal ever returning an error. Treating
+// that as "successfully decoded" would hand callers a message that looks
+// superficially valid but carries no real information.
+var errUnknownEmptyMessage = fmt.Errorf("proto: decoded message has unknown type and no payload (likely malformed input)")
+
 // DecodeControlMessage deserializes a control message from bytes.
 // It first tries protobuf decoding; if that fails, it falls back to JSON.
 func DecodeControlMessage(data []byte) (*ControlMessage, error) {
 	// Try protobuf first.
 	pbMsg := &pb.ControlMessage{}
 	if err := proto.Unmarshal(data, pbMsg); err == nil {
-		// Validate: a successfully parsed protobuf message should have a known
-		// type or at least not be empty. We accept type == 0 (UNKNOWN) because
-		// protobuf zero-values are valid; the real check is that Unmarshal
-		// didn't return an error.
-		return fromProtobuf(pbMsg), nil
+		// DP-17: a genuinely unrecognized-but-deliberate message (e.g. a
+		// newer peer using a MessageType this build doesn't know about
+		// yet) still carries *some* payload or a non-zero type — reject
+		// only the specific "fully empty" shape that malformed/garbage
+		// bytes collapse into.
+		if pbMsg.Type != pb.MessageType_MESSAGE_TYPE_UNKNOWN || pbMsg.Payload != nil {
+			return fromProtobuf(pbMsg), nil
+		}
 	}
 
 	// Fallback to JSON for backward compatibility with v1 peers.
@@ -285,7 +298,36 @@ func DecodeControlMessage(data []byte) (*ControlMessage, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, err
 	}
+	if m.Type == MessageTypeUnknown && !m.hasAnyPayload() {
+		return nil, errUnknownEmptyMessage
+	}
 	return &m, nil
+}
+
+// hasAnyPayload reports whether any of the hand-written oneof-style
+// payload fields is set, used by DecodeControlMessage's JSON fallback to
+// apply the same DP-17 "reject fully empty UNKNOWN message" rule that the
+// protobuf path applies via pbMsg.Payload == nil.
+func (m *ControlMessage) hasAnyPayload() bool {
+	return m.hasSessionPayload() || m.hasP2PPayload()
+}
+
+// hasSessionPayload checks the session/tunnel-related half of the
+// payload fields (mirrors setSessionPayload's grouping).
+func (m *ControlMessage) hasSessionPayload() bool {
+	return m.AuthRequest != nil || m.AuthResponse != nil ||
+		m.RegisterRequest != nil || m.RegisterResponse != nil ||
+		m.PingRequest != nil || m.PingResponse != nil ||
+		m.StreamRequest != nil || m.StreamResponse != nil ||
+		m.StatsRequest != nil || m.StatsResponse != nil ||
+		m.CloseRequest != nil || m.CloseResponse != nil
+}
+
+// hasP2PPayload checks the P2P-related half of the payload fields
+// (mirrors setP2PPayload's grouping).
+func (m *ControlMessage) hasP2PPayload() bool {
+	return m.P2POfferRequest != nil || m.P2POfferResponse != nil ||
+		m.P2PCandidates != nil || m.P2PResult != nil
 }
 
 // DecodeControlMessageJSON deserializes a control message from JSON bytes only.

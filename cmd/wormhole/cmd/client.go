@@ -71,7 +71,7 @@ func init() {
 	clientCmd.Flags().BoolVar(&clientTLS, "tls", false, "Enable TLS for server connection")
 	clientCmd.Flags().BoolVar(&clientTLSInsecure, "tls-insecure", false, "Skip TLS certificate verification (dev only)")
 	clientCmd.Flags().StringVar(&clientTLSCA, "tls-ca", "", "Path to custom CA certificate for TLS verification")
-	clientCmd.Flags().StringVarP(&clientProtocol, "protocol", "P", "http", "Tunnel protocol: http, https, tcp, udp, ws, grpc")
+	clientCmd.Flags().StringVarP(&clientProtocol, "protocol", "P", "http", "Tunnel protocol: http, https, tcp, ws, grpc")
 	clientCmd.Flags().StringVar(&clientHostname, "hostname", "", "Custom hostname for routing")
 	clientCmd.Flags().StringVar(&clientPathPrefix, "path-prefix", "", "Path-based routing prefix")
 	clientCmd.Flags().StringVarP(&clientConfigFile, "config", "c", "", "Path to YAML config file (enables multi-tunnel mode)")
@@ -99,6 +99,9 @@ func runClient(cmd *cobra.Command, _ []string) {
 	// --local is required when not using --config and no default config file exists.
 	if !cmd.Flags().Changed("local") {
 		log.Fatal().Msg("required flag(s) \"local\" not set (or use --config for multi-tunnel mode, or create ~/.wormhole/wormhole.yml)")
+	}
+	if err := client.ValidateProtocolString(clientProtocol); err != nil {
+		log.Fatal().Err(err).Msg("Invalid --protocol")
 	}
 	startClient(clientLocalPort, clientServer, clientLocalHost, clientSubdomain,
 		clientToken, cmd.Flags().Changed("token"), clientInspectorPort, clientInspectorHost, clientP2PEnabled, clientTLS, clientTLSInsecure, clientTLSCA,

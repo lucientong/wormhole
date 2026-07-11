@@ -27,7 +27,7 @@ Wormhole folds network space like a wormhole, allowing developers to expose loca
 - 🔑 **Auth & RBAC** — HMAC-SHA256 team tokens with role-based access control
 - 🪪 **SSO / OIDC** — OAuth2 Device Code Flow + OIDC JWT validation; `wormhole login` for CLI-based SSO
 - 📋 **Audit Logs** — Structured audit event log with SQLite persistence and CSV/JSON export API
-- 📁 **Declarative Config** — YAML config file, multi-tunnel, SIGHUP hot-reload, `wormhole tunnels list`
+- 📁 **Declarative Config** — YAML config file (client and server), multi-tunnel, SIGHUP hot-reload, `wormhole tunnels list/create/delete`
 - 🏗️ **HA / Multi-Node** — Pluggable `StateStore` with Redis backend; cross-node HTTP/hostname/path routing, TTL-refreshed heartbeat, shared cluster secret, and cross-node token revocation
 - 🐳 **Docker Ready** — Easy deployment with Docker and systemd
 
@@ -141,8 +141,9 @@ That's it! Your local service is now accessible from the internet.
 - **Auth**: HMAC-SHA256 token signing with role-based access control (admin/member/viewer), pre-shared token mode for quick setup
 - **OIDC/SSO**: OIDC Discovery + JWKS JWT validation; OAuth2 Device Code Flow for CLI-based login; credentials persisted to `~/.wormhole/credentials.json`
 - **Audit Log**: Structured events (auth, tunnel, P2P) stored in memory (ring buffer) or SQLite; queryable via Admin API with CSV/JSON export
-- **Multi-Tunnel Config**: YAML config file with multiple tunnel definitions; SIGHUP triggers diff-based hot-reload; local control API (`--ctrl-port`) for `wormhole tunnels list`
+- **Multi-Tunnel Config**: YAML config file with multiple tunnel definitions (client and server, via `--config`/`-c`); SIGHUP triggers diff-based hot-reload; local control API (`--ctrl-port`) for `wormhole tunnels list/create/delete` — add or remove tunnels on a running client without a restart
 - **HA / Multi-Node**: Pluggable `StateStore` interface; in-memory (single-node) or Redis backend; cluster heartbeat re-registers (TTL-refreshes) every active route so long-lived tunnels never expire out of Redis; subdomain/hostname/path routes all indexed cluster-wide; `--cluster-secret` authenticates inter-node proxy traffic; `--persistence redis` shares team/token-revocation state across nodes for instant cross-node logout; `/health` reports live Redis connectivity; TCP tunnels remain node-local under HA (see [architecture doc](docs/architecture.md#ha--multi-node-control-plane))
+- **Resource Limits & Version Negotiation**: `--max-concurrent-streams`/`--max-streams-per-client` cap in-flight data-plane streams (global + per-client) to bound resource usage under load; `--min-client-version` rejects clients below a configured semantic version; the server advertises its real feature set (`p2p`/`multi-tunnel`/`cluster`/`audit`, etc.) during auth and the client gates optional behavior (like sending a P2P offer) on what the server actually supports, rather than assuming
 
 ### Components
 
@@ -193,6 +194,41 @@ wormhole server \
   --tls
 ```
 
+### Server Config File
+
+Instead of a long flag invocation, the server can load its config from a YAML file (`--config` / `-c`), mirroring the client's `--config` file:
+
+```yaml
+# server.yml
+listen_addr: :7000
+http_addr: :80
+admin_addr: 127.0.0.1:7001
+domain: tunnel.example.com
+
+tls:
+  enabled: true
+
+require_auth: true
+auth_secret: my-secret-key-at-least-16-chars
+min_client_version: 0.6.0
+
+max_concurrent_streams: 10000
+max_streams_per_client: 500
+
+persistence:
+  type: sqlite
+
+audit:
+  enabled: true
+  retention_days: 90
+```
+
+```bash
+wormhole server -c server.yml
+```
+
+Only fields present in the file override the defaults — anything omitted keeps its normal flag-equivalent default, so a minimal file (e.g. just `domain:`) is valid.
+
 ## Configuration
 
 ### Client Options
@@ -210,7 +246,7 @@ wormhole server \
 | `--tls` | Enable TLS for server connection | false |
 | `--tls-insecure` | Skip TLS certificate verification (dev only) | false |
 | `--tls-ca` | Path to custom CA certificate for TLS verification | None |
-| `--protocol` / `-P` | Tunnel protocol: http, https, tcp, udp, ws, grpc | `http` |
+| `--protocol` / `-P` | Tunnel protocol: http, https, tcp, ws, grpc (udp is rejected — the server has no UDP dataplane yet) | `http` |
 | `--hostname` | Custom hostname for routing | None |
 | `--path-prefix` | Path-based routing prefix | None |
 | `--config` | Path to YAML tunnel config file (multi-tunnel mode) | None |
@@ -234,12 +270,16 @@ wormhole server \
 
 | Flag | Description | Default |
 |------|-------------|---------|
+| `--config` / `-c` | Path to a YAML server config file; explicitly-set fields override the flag defaults below (see [example](#server-config-file)) | None |
 | `--port` | Tunnel listen port | `7000` |
 | `--host` | Host to bind to | `0.0.0.0` |
 | `--http-port` | HTTP traffic port | `80` |
 | `--admin-port` | Admin API port | `7001` |
 | `--admin-host` | Host for admin API (security: loopback only by default) | `127.0.0.1` |
 | `--domain` | Domain for tunnel URLs (env: `WORMHOLE_DOMAIN`) | `localhost` |
+| `--max-concurrent-streams` | Max concurrent data-plane streams across all clients; saturating rejects new streams instead of queuing (0 = unlimited) | `10000` |
+| `--max-streams-per-client` | Max concurrent data-plane streams for a single client, independent of the global limit above (0 = unlimited) | `500` |
+| `--min-client-version` | Reject clients reporting an older semantic version, e.g. `0.6.0`; clients with a non-semver version (e.g. dev builds) are never rejected | (disabled) |
 | `--tls` | Enable TLS (auto-cert if domain is set) | false |
 | `--tunnel-tls` | Enable TLS for tunnel control listener (defaults to `--tls`, and also defaults to `true` when `--require-auth` is set with a real `--domain` — see [Security](#security)) | see description |
 | `--cert` | Path to TLS certificate file | None |
@@ -308,6 +348,17 @@ wormhole client --config ~/.wormhole/tunnels.yaml --ctrl-port 7100
 wormhole tunnels list --ctrl-port 7100
 # or directly:
 curl http://localhost:7100/tunnels
+
+# Dynamically add a tunnel to the running client (no restart needed)
+wormhole tunnels create db --local 5432 --protocol tcp --ctrl-port 7100
+# or directly:
+curl -X POST http://localhost:7100/tunnels \
+  -d '{"name":"db","local_port":5432,"protocol":"tcp"}'
+
+# Remove a tunnel from the running client
+wormhole tunnels delete db --ctrl-port 7100
+# or directly:
+curl -X DELETE http://localhost:7100/tunnels/db
 ```
 
 ### Authentication
@@ -517,7 +568,7 @@ wormhole/
 │   │   ├── state_memory.go # In-memory StateStore (single-node)
 │   │   ├── state_redis.go  # Redis StateStore (multi-node)
 │   │   └── cluster.go      # Heartbeat, dead-node eviction, cross-node proxy
-│   ├── tunnel/           # Core tunneling (mux, frame, stream, pool)
+│   ├── tunnel/           # Core tunneling (mux, frame, stream)
 │   ├── inspector/        # Traffic inspection (capture, storage, websocket)
 │   ├── p2p/              # P2P direct connection (STUN, hole punch, predictor, UDPMux, UDPStream)
 │   ├── proto/            # Control protocol (Protobuf + JSON fallback)
@@ -651,6 +702,7 @@ Auto-generated subdomains use 64-bit cryptographic randomness (`crypto/rand`), p
 - [x] Phase 14 (v0.6.2): P2P data plane access + transport optimization — new `wormhole connect <subdomain>` command lets two `wormhole` clients hole-punch and exchange real traffic entirely peer-to-peer (server only signals, never relays a byte); `UDPStream` upgraded from a fixed 200ms retransmit timer to RFC 6298-style adaptive RTO with per-segment exponential backoff; send/receive path copies reduced (direct in-place encryption, no redundant buffer copies); removed the superseded `pkg/p2p/transport.go` ARQ implementation
 - [x] Phase 15 (v0.6.3): Security hardening — RBAC write-permission checks (viewers can no longer register/close tunnels); tunnel control-channel TLS decoupled from the HTTP listener's TLS setting and defaulted on whenever `--require-auth` is combined with a real domain (fails closed instead of silently falling back to plaintext); subdomain registration is now an atomic, cluster-wide reservation (local + Redis `SETNX`-based) that rejects connections on genuine conflicts instead of silently overwriting the previous owner; fixed a token-expiry data race and scheduled periodic revoked-token cleanup; OIDC now explicitly rejects `alg: none` and validates `nbf` with clock-skew leeway; Inspector redacts sensitive headers (`Authorization`/`Cookie`/`Set-Cookie`/etc.) and lowered its default body-capture limit; `/metrics` now requires admin auth; audit logging gained successful-auth/IP-blocked/token-generated/IP-unblocked events plus a configurable retention sweep (`--audit-retention-days`) and a `audit_store_errors` counter on `/stats` so persistence failures are no longer silent
 - [x] Phase 16 (v0.6.4): HA phase 2 — cluster heartbeat now re-registers (TTL-refreshes) every route a node owns each cycle, fixing routes silently expiring out of Redis on long-lived connections; hostname/path-prefix routes are indexed into Redis and resolvable cross-node, not just subdomains; `ClusterNodeID` defaults to `os.Hostname()` when unset; new `--cluster-secret` authenticates inter-node proxy requests; new `--persistence redis` (`auth.RedisStore`) shares team/token-revocation state across nodes with instant cross-node invalidation; `KEYS` replaced with `SCAN` throughout the Redis-backed stores; `/health` now reports Redis connectivity (`cluster.state_store_healthy`, degrading overall status when unreachable); reconnecting clients reclaim a stale-owner subdomain/hostname/path immediately instead of hitting a spurious conflict; TCP tunnels documented as node-local under HA (no cross-node TCP proxying)
+- [ ] Phase 17 (v0.6.5, pending release): Architecture refactor batch A (correctness closure + dead code) — graceful `Shutdown(ctx)` for the HTTP/admin listeners instead of an abrupt process exit; bidirectional proxying (WebSocket/TCP) now unblocks and closes both sides as soon as either direction errors, instead of waiting for the peer to time out; new `--max-concurrent-streams`/`--max-streams-per-client` caps reject excess data-plane streams instead of unbounded queuing; `DecodeControlMessage` rejects malformed `UNKNOWN`-typed empty control frames while still accepting forward-compatible unknown types that carry a payload; new `--min-client-version` semantic-version gate plus real server-capability advertisement (`p2p`/`multi-tunnel`/`cluster`/`audit`) so clients no longer blindly assume optional features are present; removed the dead, never-wired `tunnel.Pool`; UDP dropped from `--protocol`'s accepted values (the server never had a UDP dataplane) with an explicit rejection error instead of silent fallback; new `wormhole tunnels create/delete` for imperative tunnel management on a running client; new `wormhole server -c server.yml` config-file support mirroring the client's
 
 ## Contributing
 
