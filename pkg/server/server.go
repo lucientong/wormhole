@@ -1948,7 +1948,9 @@ func (s *Server) handleTCPConnection(conn net.Conn, client *ClientSession, tunne
 
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 32*1024)
+		bufPtr := copyBufPool.Get().(*[]byte)
+		defer copyBufPool.Put(bufPtr)
+		buf := *bufPtr
 		for {
 			n, readErr := conn.Read(buf)
 			if readErr != nil {
@@ -1963,7 +1965,9 @@ func (s *Server) handleTCPConnection(conn net.Conn, client *ClientSession, tunne
 
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 32*1024)
+		bufPtr := copyBufPool.Get().(*[]byte)
+		defer copyBufPool.Put(bufPtr)
+		buf := *bufPtr
 		for {
 			n, readErr := stream.Read(buf)
 			if readErr != nil {

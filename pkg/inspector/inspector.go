@@ -157,6 +157,14 @@ func (i *Inspector) SetEnabled(enabled bool) {
 	i.config.EnableCapture = enabled
 }
 
+// MaxBodySize returns the configured per-request/response body capture
+// limit, so callers reading a body ahead of Capture (e.g. to also forward
+// it) can bound their own read with an equivalent io.LimitReader instead
+// of buffering an unbounded body in memory (DP-12).
+func (i *Inspector) MaxBodySize() int64 {
+	return i.config.MaxBodySize
+}
+
 // IsEnabled returns whether traffic capture is enabled.
 func (i *Inspector) IsEnabled() bool {
 	i.mu.RLock()

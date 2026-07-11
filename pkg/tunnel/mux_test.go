@@ -688,6 +688,41 @@ func BenchmarkMux_Throughput(b *testing.B) {
 	}
 }
 
+// BenchmarkMux_SendData isolates the sendData hot path (DP-09: dataBufPool
+// reuse instead of a fresh make+copy per call) from the Stream.Read/Write
+// and frame-decoding overhead the other Mux benchmarks also incur, so the
+// alloc/byte delta shown by `go test -bench BenchmarkMux_SendData -benchmem`
+// is attributable to this change alone. The peer just drains raw bytes
+// (no frame decoding) so it never becomes the bottleneck.
+func BenchmarkMux_SendData(b *testing.B) {
+	clientConn, serverConn := testConn()
+	defer clientConn.Close()
+
+	config := DefaultMuxConfig()
+	config.KeepAliveInterval = 0
+	clientMux, err := Client(clientConn, config)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer clientMux.Close()
+
+	go func() {
+		_, _ = io.Copy(io.Discard, serverConn)
+	}()
+
+	data := make([]byte, DefaultFramePayloadSize)
+
+	b.SetBytes(int64(len(data)))
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		if err := clientMux.sendData(1, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // TestMux_HandleError verifies that error frames set the stream's error state.
 func TestMux_HandleError(t *testing.T) {
 	clientConn, serverConn := testConn()

@@ -74,6 +74,14 @@ type Mux struct {
 	pingLock sync.Mutex
 	pongCh   chan uint32
 
+	// dataBufPool recycles the payload buffers sendData copies outgoing
+	// writes into (DP-09), replacing a fresh make+copy per Stream.Write
+	// call with pool reuse on the hot data path. Buffers are always
+	// DefaultFramePayloadSize (the cap that stream.go's Write ever
+	// requests); sendData falls back to a plain make for anything larger,
+	// which should not happen in practice.
+	dataBufPool sync.Pool
+
 	// Shutdown
 	shutdownOnce sync.Once
 }
@@ -104,6 +112,10 @@ func newMux(conn net.Conn, config MuxConfig, isClient bool) (*Mux, error) {
 		closeCh:  make(chan struct{}),
 		sendCh:   make(chan *Frame, 64),
 		pongCh:   make(chan uint32, 4),
+	}
+	m.dataBufPool.New = func() any {
+		buf := make([]byte, DefaultFramePayloadSize)
+		return &buf
 	}
 
 	// Stream IDs: client uses odd, server uses even
@@ -436,11 +448,35 @@ func (m *Mux) sendLoop() {
 	}
 }
 
-// writeFrame writes a frame to the connection.
+// writeFrame writes a frame to the connection. If the frame's payload was
+// borrowed from dataBufPool (DP-09), it is returned to the pool once the
+// write completes (success or failure) — the wire encoder never retains a
+// reference to Payload past Encode returning, so reuse is always safe here.
 func (m *Mux) writeFrame(f *Frame) error {
 	m.sendLock.Lock()
-	defer m.sendLock.Unlock()
-	return m.codec.Encode(m.conn, f)
+	err := m.codec.Encode(m.conn, f)
+	m.sendLock.Unlock()
+
+	if f.pooledPayload {
+		m.putDataBuf(f.Payload)
+	}
+	return err
+}
+
+// getDataBuf returns a pooled buffer able to hold n bytes, or false if n
+// exceeds what the pool provides (the caller should make() its own).
+func (m *Mux) getDataBuf(n int) ([]byte, bool) {
+	if n > DefaultFramePayloadSize {
+		return nil, false
+	}
+	bufPtr := m.dataBufPool.Get().(*[]byte)
+	return (*bufPtr)[:n], true
+}
+
+// putDataBuf returns a buffer obtained from getDataBuf back to the pool.
+func (m *Mux) putDataBuf(buf []byte) {
+	full := buf[:cap(buf)]
+	m.dataBufPool.Put(&full)
 }
 
 // keepAliveLoop sends periodic keep-alive pings and checks for pong responses.
@@ -506,14 +542,24 @@ func (m *Mux) sendData(streamID uint32, data []byte) error {
 
 	// Copy the payload because the caller (e.g., io.CopyBuffer) may
 	// reuse the underlying buffer before the sendLoop writes the frame.
-	payload := make([]byte, len(data))
+	// The copy target comes from dataBufPool when possible (DP-09),
+	// turning what was a make+copy on every Stream.Write call into a
+	// pool-reuse + copy; writeFrame returns the buffer once sent.
+	payload, pooled := m.getDataBuf(len(data))
+	if !pooled {
+		payload = make([]byte, len(data))
+	}
 	copy(payload, data)
 
 	frame := NewDataFrame(streamID, payload)
+	frame.pooledPayload = pooled
 	select {
 	case m.sendCh <- frame:
 		return nil
 	case <-m.closeCh:
+		if pooled {
+			m.putDataBuf(payload)
+		}
 		return m.getCloseErr()
 	}
 }

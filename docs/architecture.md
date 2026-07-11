@@ -21,6 +21,7 @@
 - [Multi-Tunnel Configuration & Hot-Reload](#multi-tunnel-configuration--hot-reload)
 - [HA / Multi-Node Control Plane](#ha--multi-node-control-plane)
 - [Robustness & Protocol Hardening (P3-6 Batch A)](#robustness--protocol-hardening-p3-6-batch-a)
+- [Hot-Path Allocation Pooling (P3-6 Batch B)](#hot-path-allocation-pooling-p3-6-batch-b)
 - [Data Flow Summary](#data-flow-summary)
 
 ---
@@ -1281,6 +1282,55 @@ The client CLI and config file previously listed `udp` as an accepted `--protoco
 
 - **`wormhole tunnels create/delete` (U1)**: the client's control API (`pkg/client/control.go`, gated behind `--ctrl-port` like the existing `list` endpoint) gained `POST /tunnels` and `DELETE /tunnels/{name}`, backed by new `Client.CreateTunnel`/`Client.DeleteTunnel` methods that register/unregister a tunnel on an already-running client process. This is the imperative counterpart to editing the YAML config and sending `SIGHUP` — useful for scripting or ad hoc tunnels without touching the client's persisted config at all. Tunnels added this way are not persisted; they don't survive a client restart unless also added to the config file.
 - **`wormhole server -c server.yml` (U4)**: `pkg/server/config_file.go` mirrors the client's existing `FileConfig`/`LoadClientFileConfig` pattern — a `FileConfig` struct maps the YAML schema to server settings (including custom `time.Duration` string parsing), `validate()` catches malformed values (bad durations, unknown persistence/backend enum values) at load time rather than failing confusingly deep inside `Config` consumers, and `ToServerConfig(base)` merges only explicitly-set fields onto a base config (typically `DefaultConfig()`), leaving everything else untouched. Boolean fields that need a real tri-state (unset / explicitly false / explicitly true) — like `EnableMetrics` — use `*bool` rather than `bool`, since a plain `bool` can't distinguish "not mentioned in the file" from "set to false".
+
+---
+
+## Hot-Path Allocation Pooling (P3-6 Batch B)
+
+The second P3-6 sub-batch targeted the highest-impact hot-path allocations identified in `review-v0.6.md` (DP-09/DP-11/DP-12), all on the data-forwarding path rather than the control path — this is where per-byte/per-connection cost actually compounds under load. Batch C (context threading) and batch D (god-object decomposition) are separate, later sub-batches; this one deliberately stayed scoped to allocation reduction plus one correctness fix that surfaced while auditing the same code paths.
+
+### Mux Data-Send Buffer Pool (DP-09)
+
+`Stream.Write` chunks outgoing data into ≤32KB (`DefaultFramePayloadSize`) pieces and hands each to `Mux.sendData`, which previously did `payload := make([]byte, len(data)); copy(payload, data)` on every call — a fresh heap allocation per write, needed because the frame travels across `sendCh` to `sendLoop` asynchronously and the caller (often `io.CopyBuffer`) may reuse its buffer before that write happens.
+
+`Mux` now owns a `dataBufPool` (`sync.Pool` of `*[]byte`, each sized `DefaultFramePayloadSize`). `sendData` borrows a buffer sized to the current write instead of allocating one; `writeFrame` (running in `sendLoop`) returns it to the pool immediately after `FrameCodec.Encode` finishes writing it to the connection — safe because `Encode` never retains a reference to the payload past that call. A frame not sourced from the pool (nothing currently produces one, since the only caller — `Stream.Write` — always requests ≤32KB) falls back to a plain `make`, so nothing depends on this being the *only* path into `sendData`.
+
+Measured with `BenchmarkMux_SendData` (isolates `sendData` itself, bypassing `Stream`'s Read/Write and frame-decode overhead by draining the peer's raw bytes without parsing them):
+
+| Metric | Before | After | Δ |
+|--------|--------|-------|---|
+| B/op | 32817 | 85 | **-99.7%** |
+| allocs/op | 2 | 2 | unchanged |
+| ns/op | 7333 | 4274 | **-42%** |
+| MB/s | 4468 | 7667 | **+72%** |
+
+End-to-end (`BenchmarkMux_Throughput`, 32KB writes through the full send+receive stack): B/op 65733 → 34308 (**-47.8%**), ns/op 14525 → 10026 (**-31%**), MB/s 2256 → 3268 (**+45%**). A `go tool pprof -diff_base` comparison of heap profiles from that same benchmark (100000 iterations) attributes a **-3.01GB** flat reduction to `(*Mux).sendData` — net **-2.88GB** after accounting for the small amount the pool itself now costs (`sync.Pool.Get`/`newMux`'s pool initializer, +0.13GB).
+
+### Pooled Forwarding Buffers (DP-11)
+
+Every bidirectional proxy loop previously called plain `io.Copy`, which allocates its own internal 32KB scratch buffer on each call unless the source/destination implement `io.WriterTo`/`io.ReaderFrom` (the real `net.Conn`/`tunnel.Stream` types involved here don't). For short-lived proxied connections — the common case, and exactly what `MaxConcurrentStreams`/`MaxStreamsPerClient` (DP-03/27) bound the count of — that's a full 32KB paid per connection just to set up the copy loop.
+
+`copyWithPooledBuffer(dst, src)` is a drop-in `io.Copy` replacement that borrows its scratch buffer from a package-level `copyBufPool` (one in `pkg/server`, one in `pkg/client` — different packages, so separate pools) and returns it afterward via `io.CopyBuffer`. It replaced every forwarding `io.Copy` call:
+
+- **Server** (`pkg/server/handler.go`): the HTTP response body copy in `forwardHTTP`, and both directions of the WebSocket proxy in `handleWebSocket`.
+- **Server** (`pkg/server/server.go`): `handleTCPConnection`'s manual Read/Write loops now pull their per-goroutine buffer from the same `copyBufPool` instead of a local `make([]byte, 32*1024)` — this one already reused a single buffer for the connection's lifetime rather than allocating per-iteration, but pooling it still bounds total memory under many concurrent TCP tunnels instead of `2 × 32KB × MaxConcurrentStreams` all being live simultaneously.
+- **Client** (`pkg/client/client.go`): both directions of `dialAndProxy` (relay-mode HTTP/TCP forwarding) and `proxyConnectConn` (`wormhole connect`'s direct P2P data path).
+
+Errors from these copies were previously discarded outright (`_, _ = io.Copy(...)`); they're now logged at `Debug` level (not `Error`, since a client mid-copy disconnect is an expected, non-actionable event, not a fault).
+
+Measured with a benchmark pair (`BenchmarkIOCopy_Baseline` vs `BenchmarkCopyWithPooledBuffer`) using reader/writer wrapper types that deliberately hide `WriterTo`/`ReaderFrom` so `io.Copy` is forced down its generic buffered path, matching what happens with real connections:
+
+| Metric | Before | After | Δ |
+|--------|--------|-------|---|
+| B/op | 36992 | 4244 | **-88.5%** |
+| allocs/op | 6 | 5 | -1 |
+| ns/op | 3938 | 821.8 | **-79%** |
+
+### Inspector Body-Read OOM Fix (DP-12)
+
+Not a performance change, but found while auditing the same forwarding code: `forwardHTTPWithInspect`'s comment claimed request/response bodies were "limited by MaxBodySize," but the actual reads (`io.ReadAll(httpReq.Body)`, `io.ReadAll(resp.Body)`) had no such limit — enabling `--inspector` and receiving one sufficiently large upload/download would buffer it entirely in memory regardless of the configured cap. Both reads are now wrapped in `io.LimitReader(body, MaxBodySize+1)` (the `+1` lets the truncation-detection logic downstream distinguish "exactly at the limit" from "over it," same convention `Inspector.Wrap` already uses). `Inspector` gained a `MaxBodySize()` accessor so callers outside the `inspector` package can size their own reads consistently with what `Capture` will store.
+
+This does mean a body larger than `MaxBodySize` is truncated *before* being forwarded to the local service, not just before being recorded — the same trade-off `Inspector.Wrap` already makes, and one specific to the inspector code path: relay/P2P forwarding without inspection (`forwardRawTCP`, `dialAndProxy`, DP-11 above) is untouched and remains fully unbounded, since the inspector is documented as a debugging aid, not something you'd enable for large-payload production traffic.
 
 ---
 

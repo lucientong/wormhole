@@ -24,6 +24,35 @@ type HTTPHandler struct {
 	server *Server
 }
 
+// copyBufSize matches the buffer size io.Copy would allocate internally by
+// default when neither side of a copy implements WriterTo/ReaderFrom, so
+// pooling it (DP-11) preserves the existing throughput characteristics
+// while avoiding a fresh 32KB allocation on every proxied HTTP response,
+// WebSocket connection, and TCP tunnel connection.
+const copyBufSize = 32 * 1024
+
+// copyBufPool recycles the buffers copyWithPooledBuffer and
+// handleTCPConnection use for proxying (DP-11): forwarding paths are the
+// hottest allocation site under concurrent connections (bounded by
+// MaxConcurrentStreams, see DP-03/27), so reusing buffers instead of
+// allocating fresh ones per connection meaningfully reduces steady-state
+// memory footprint and GC pressure.
+var copyBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, copyBufSize)
+		return &buf
+	},
+}
+
+// copyWithPooledBuffer is a drop-in replacement for io.Copy that borrows its
+// scratch buffer from copyBufPool instead of letting io.Copy allocate its
+// own default 32KB buffer on every call.
+func copyWithPooledBuffer(dst io.Writer, src io.Reader) (int64, error) {
+	bufPtr := copyBufPool.Get().(*[]byte)
+	defer copyBufPool.Put(bufPtr)
+	return io.CopyBuffer(dst, src, *bufPtr)
+}
+
 // NewHTTPHandler creates a new HTTP handler.
 func NewHTTPHandler(router *Router, server *Server) *HTTPHandler {
 	return &HTTPHandler{
@@ -146,7 +175,13 @@ func (h *HTTPHandler) forwardHTTP(client *ClientSession, w http.ResponseWriter, 
 
 	// Write status code and body.
 	w.WriteHeader(resp.StatusCode)
-	written, _ := io.Copy(w, resp.Body)
+	written, copyErr := copyWithPooledBuffer(w, resp.Body)
+	if copyErr != nil {
+		// Most commonly a client that disconnected mid-response; not
+		// actionable, but worth a debug trace rather than silently
+		// discarding it (DP-11).
+		log.Debug().Err(copyErr).Str("host", r.Host).Msg("Copy response body to client failed")
+	}
 
 	// Update stats.
 	atomic.AddUint64(&client.BytesOut, uint64(written)) // #nosec G115 -- written from io.Copy is always non-negative
@@ -213,13 +248,17 @@ func (h *HTTPHandler) handleWebSocket(client *ClientSession, w http.ResponseWrit
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(clientConn, stream) // reads stream, writes clientConn
+		if _, copyErr := copyWithPooledBuffer(clientConn, stream); copyErr != nil {
+			log.Debug().Err(copyErr).Msg("WebSocket copy stream->client failed")
+		}
 		_ = clientConn.Close()
 	}()
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(stream, clientConn) // reads clientConn, writes stream
+		if _, copyErr := copyWithPooledBuffer(stream, clientConn); copyErr != nil {
+			log.Debug().Err(copyErr).Msg("WebSocket copy client->stream failed")
+		}
 		_ = stream.Close()
 	}()
 

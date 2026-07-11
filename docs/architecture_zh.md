@@ -21,6 +21,7 @@
 - [多隧道配置与热重载](#多隧道配置与热重载)
 - [HA / 多节点控制面](#ha--多节点控制面)
 - [健壮性与协议加固 (P3-6 批次 A)](#健壮性与协议加固-p3-6-批次-a)
+- [热路径分配池化 (P3-6 批次 B)](#热路径分配池化-p3-6-批次-b)
 - [数据流总结](#数据流总结)
 
 ---
@@ -1260,6 +1261,55 @@ WebSocket 和 TCP 隧道代理路径都用 `io.Copy` 并发泵送两个方向（
 
 - **`wormhole tunnels create/delete`（U1）**：客户端控制 API（`pkg/client/control.go`，与现有的 `list` 接口一样需要 `--ctrl-port`）新增了 `POST /tunnels` 和 `DELETE /tunnels/{name}`，背后由新增的 `Client.CreateTunnel`/`Client.DeleteTunnel` 方法支撑，可以在一个已经运行的 client 进程上注册/注销隧道。这是"编辑 YAML 配置再发 `SIGHUP`"的命令式替代方案——适合脚本化操作或临时隧道，完全不需要触碰 client 的持久化配置。以这种方式新增的隧道不会被持久化，除非同时也写进配置文件，否则不会在 client 重启后保留。
 - **`wormhole server -c server.yml`（U4）**：`pkg/server/config_file.go` 沿用了客户端现有的 `FileConfig`/`LoadClientFileConfig` 模式——用一个 `FileConfig` 结构体把 YAML schema 映射到服务端配置（包括自定义的 `time.Duration` 字符串解析），`validate()` 在加载时就捕获畸形取值（错误的时长字符串、未知的持久化/后端枚举值），而不是让错误在深入到 `Config` 消费者内部时才以令人困惑的方式暴露；`ToServerConfig(base)` 只把文件里明确设置的字段合并到一个 base 配置（通常是 `DefaultConfig()`）上，其余字段保持不变。需要真三态（未设置 / 明确 false / 明确 true）的布尔字段——例如 `EnableMetrics`——用 `*bool` 而不是 `bool`，因为普通 `bool` 无法区分"文件里没提到"和"文件里写了 false"。
+
+---
+
+## 热路径分配池化 (P3-6 批次 B)
+
+P3-6 第二个子批次针对 `review-v0.6.md` 中标出的、影响面最大的热路径分配问题（DP-09/DP-11/DP-12），全部集中在数据转发路径而非控制路径——这正是负载上升时按字节/按连接的成本会真正累积起来的地方。context 贯通（批次 C）和上帝对象拆分（批次 D）是独立的、更靠后的子批次；这一批刻意只聚焦在分配削减，外加一个在审查同一批代码时顺带发现的正确性问题。
+
+### Mux 数据发送缓冲池 (DP-09)
+
+`Stream.Write` 把待发出的数据切成不超过 32KB（`DefaultFramePayloadSize`）的分片，逐个交给 `Mux.sendData`——此前每次调用都会执行 `payload := make([]byte, len(data)); copy(payload, data)`，即每次写入都有一次全新的堆分配，之所以需要拷贝是因为帧要经 `sendCh` 异步传给 `sendLoop`，调用方（往往是 `io.CopyBuffer`）可能在这次写入真正发生之前就复用了自己的缓冲区。
+
+`Mux` 现在持有一个 `dataBufPool`（`sync.Pool`，元素是指向 `DefaultFramePayloadSize` 大小切片的 `*[]byte`）。`sendData` 从池里借一个够大的缓冲区而不是重新分配；`writeFrame`（运行在 `sendLoop` 里）在 `FrameCodec.Encode` 把它写进连接之后立刻归还——这是安全的，因为 `Encode` 调用返回后从不再持有该 payload 的引用。不是从池里来的帧（目前不会出现，因为唯一的调用方 `Stream.Write` 每次请求都不超过 32KB）会退回普通的 `make`，所以这个实现并不依赖"`sendData` 只有这一条调用路径"这个假设。
+
+用 `BenchmarkMux_SendData` 测得（该基准隔离了 `sendData` 本身，绕开 `Stream` 的 Read/Write 和帧解码开销，对端只是排水式读取原始字节而不解析）：
+
+| 指标 | 优化前 | 优化后 | 变化 |
+|------|--------|--------|------|
+| B/op | 32817 | 85 | **-99.7%** |
+| allocs/op | 2 | 2 | 不变 |
+| ns/op | 7333 | 4274 | **-42%** |
+| MB/s | 4468 | 7667 | **+72%** |
+
+端到端测试（`BenchmarkMux_Throughput`，32KB 写入，经过完整的收发栈）：B/op 65733 → 34308（**-47.8%**），ns/op 14525 → 10026（**-31%**），MB/s 2256 → 3268（**+45%**）。用 `go tool pprof -diff_base` 对比同一基准两次运行的 heap profile，`(*Mux).sendData` 的 flat 分配减少了 **3.01GB**（100000 次迭代样本），扣除池本身新增的少量开销（`sync.Pool.Get`/`newMux` 的池初始化，+0.13GB）后净减少 **2.88GB**。
+
+### 池化转发缓冲区 (DP-11)
+
+此前每条双向代理循环都直接调用裸 `io.Copy`，只要源/目标没有实现 `io.WriterTo`/`io.ReaderFrom`（这里涉及的真实 `net.Conn`/`tunnel.Stream` 类型都没有），它就会在每次调用时分配自己的 32KB 内部临时缓冲区。对于短生命周期的代理连接——这是最常见的场景，也正是 `MaxConcurrentStreams`/`MaxStreamsPerClient`（DP-03/27）所限制的连接规模——这意味着每条连接仅仅为了搭建拷贝循环就要付出整整 32KB 的分配代价。
+
+`copyWithPooledBuffer(dst, src)` 是 `io.Copy` 的直接替代品，它从一个包级 `copyBufPool`（`pkg/server` 和 `pkg/client` 各有一个——不同包所以是各自独立的池）借一个临时缓冲区，通过 `io.CopyBuffer` 完成拷贝后再归还。它替换了所有转发用途的 `io.Copy` 调用：
+
+- **服务端**（`pkg/server/handler.go`）：`forwardHTTP` 里的 HTTP 响应体拷贝，以及 `handleWebSocket` 里 WebSocket 代理的两个方向。
+- **服务端**（`pkg/server/server.go`）：`handleTCPConnection` 手写的 Read/Write 循环现在从同一个 `copyBufPool` 取每个 goroutine 用的缓冲区，而不是本地 `make([]byte, 32*1024)`——这里此前就已经是整条连接生命周期内复用同一个缓冲区（不是每次迭代都分配），但池化之后可以把总内存限制住，而不是 `2 × 32KB × MaxConcurrentStreams` 同时全部存活。
+- **客户端**（`pkg/client/client.go`）：`dialAndProxy`（中继模式 HTTP/TCP 转发）和 `proxyConnectConn`（`wormhole connect` 的直连 P2P 数据路径）的两个方向。
+
+这些拷贝产生的错误此前直接丢弃（`_, _ = io.Copy(...)`），现在会以 `Debug` 级别记录下来（不用 `Error`，因为客户端在拷贝中途断开是预期内、不需要处理的事件，不是故障）。
+
+用一对基准测试（`BenchmarkIOCopy_Baseline` 对 `BenchmarkCopyWithPooledBuffer`）测得，测试中故意用包装类型隐藏了 `WriterTo`/`ReaderFrom`，强制 `io.Copy` 走它的通用缓冲路径，以匹配真实连接的行为：
+
+| 指标 | 优化前 | 优化后 | 变化 |
+|------|--------|--------|------|
+| B/op | 36992 | 4244 | **-88.5%** |
+| allocs/op | 6 | 5 | -1 |
+| ns/op | 3938 | 821.8 | **-79%** |
+
+### Inspector 读取 OOM 修复 (DP-12)
+
+这不是性能改动，而是在审查同一批转发代码时顺带发现的问题：`forwardHTTPWithInspect` 的注释声称请求/响应正文"受 MaxBodySize 限制"，但实际的读取（`io.ReadAll(httpReq.Body)`、`io.ReadAll(resp.Body)`）根本没有任何限制——只要开启 `--inspector` 并收到一次足够大的上传/下载，就会无视配置的上限把它整个缓冲进内存。现在两处读取都包了一层 `io.LimitReader(body, MaxBodySize+1)`（这个 `+1` 让下游的截断检测逻辑能区分"刚好等于上限"和"超过上限"，与 `Inspector.Wrap` 已经在用的约定一致）。`Inspector` 新增了 `MaxBodySize()` 访问器，方便 `inspector` 包外的调用方按 `Capture` 实际会存储的口径来限定自己的读取。
+
+这也意味着超过 `MaxBodySize` 的正文会在转发给本地服务**之前**就被截断，而不只是在记录之前——这和 `Inspector.Wrap` 早就在做的取舍一样，而且只影响开启了检查器的这条代码路径：不带检查的中继/P2P 转发（`forwardRawTCP`、`dialAndProxy`，见上面的 DP-11）未受影响，仍然完全不设上限，因为 Inspector 本身的定位是调试辅助工具，而不是给生产环境大流量场景开启的东西。
 
 ---
 

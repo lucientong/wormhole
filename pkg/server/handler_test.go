@@ -935,3 +935,42 @@ func TestHTTPHandler_ForwardHTTP_MultiTunnel_RoutesToCorrectTunnelID(t *testing.
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "api-tunnel", rec.Header().Get("X-Matched-Tunnel"))
 }
+
+// benchCopyPayload is sized well under copyBufSize so both io.Copy and
+// copyWithPooledBuffer take their "allocate/borrow one scratch buffer,
+// single Read+Write" fast path — isolating the benchmark to exactly the
+// difference DP-11 makes (pooled vs fresh scratch buffer) rather than
+// multi-chunk copy overhead.
+var benchCopyPayload = bytes.Repeat([]byte("x"), 4096)
+
+// opaqueReader/opaqueWriter hide bytes.Reader's WriterTo and bytes.Buffer's
+// ReaderFrom (io.Copy's fast paths for those concrete types) so io.Copy is
+// forced down its generic allocate-a-scratch-buffer-and-loop path, matching
+// what actually happens with the real net.Conn/tunnel.Stream types DP-11's
+// call sites copy between (neither implements WriterTo/ReaderFrom).
+type opaqueReader struct{ io.Reader }
+type opaqueWriter struct{ io.Writer }
+
+func newBenchCopySrc() io.Reader { return opaqueReader{bytes.NewReader(benchCopyPayload)} }
+
+// BenchmarkIOCopy_Baseline is the pre-DP-11 behavior: plain io.Copy
+// allocates its own fresh 32KB scratch buffer on every call.
+func BenchmarkIOCopy_Baseline(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var dst bytes.Buffer
+		_, _ = io.Copy(opaqueWriter{&dst}, newBenchCopySrc())
+	}
+}
+
+// BenchmarkCopyWithPooledBuffer is the DP-11 behavior: the scratch buffer
+// comes from copyBufPool and is returned after the copy, so short-lived
+// proxied connections (the common case for HTTP/WebSocket/TCP tunnel
+// streams) don't each pay for a fresh 32KB allocation.
+func BenchmarkCopyWithPooledBuffer(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var dst bytes.Buffer
+		_, _ = copyWithPooledBuffer(opaqueWriter{&dst}, newBenchCopySrc())
+	}
+}

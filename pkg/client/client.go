@@ -52,6 +52,30 @@ const (
 // in that list (V1: the server has no UDP dataplane).
 const protocolUDP = "udp"
 
+// copyBufSize matches the buffer size io.Copy allocates internally by
+// default, so pooling it (DP-11) preserves throughput while avoiding a
+// fresh 32KB allocation on every proxied local<->tunnel connection.
+const copyBufSize = 32 * 1024
+
+// copyBufPool recycles the buffers dialAndProxy and proxyConnectConn use
+// for bidirectional proxying (DP-11), reducing steady-state memory
+// footprint under many concurrent tunnel connections.
+var copyBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, copyBufSize)
+		return &buf
+	},
+}
+
+// copyWithPooledBuffer is a drop-in replacement for io.Copy that borrows
+// its scratch buffer from copyBufPool instead of letting io.Copy allocate
+// its own default 32KB buffer on every call.
+func copyWithPooledBuffer(dst io.Writer, src io.Reader) (int64, error) {
+	bufPtr := copyBufPool.Get().(*[]byte)
+	defer copyBufPool.Put(bufPtr)
+	return io.CopyBuffer(dst, src, *bufPtr)
+}
+
 // Client is the wormhole client.
 // ActiveTunnel holds runtime state for a registered tunnel.
 type ActiveTunnel struct {
@@ -1009,9 +1033,12 @@ func (c *Client) dialAndProxy(ctx context.Context, inReader io.Reader, outWriter
 	// leaking both goroutines and localConn past dialAndProxy's return.
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(localConn, inReader)
+		n, copyErr := copyWithPooledBuffer(localConn, inReader)
 		if n > 0 {
 			atomic.AddUint64(&c.stats.BytesIn, uint64(n))
+		}
+		if copyErr != nil {
+			log.Debug().Err(copyErr).Msg("Copy tunnel->local failed")
 		}
 		if cw, ok := localConn.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
@@ -1027,9 +1054,12 @@ func (c *Client) dialAndProxy(ctx context.Context, inReader io.Reader, outWriter
 	// the remote side happens to close on its own.
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(outWriter, localConn)
+		n, copyErr := copyWithPooledBuffer(outWriter, localConn)
 		if n > 0 {
 			atomic.AddUint64(&c.stats.BytesOut, uint64(n)) // #nosec G115
+		}
+		if copyErr != nil {
+			log.Debug().Err(copyErr).Msg("Copy local->tunnel failed")
 		}
 		_ = localConn.Close()
 	}()
@@ -1067,10 +1097,17 @@ func (c *Client) forwardHTTPWithInspect(ctx context.Context, stream streamConn, 
 	}
 	defer httpReq.Body.Close()
 
-	// 2. Read request body for inspection (limited by MaxBodySize).
+	// 2. Read request body for inspection, capped at MaxBodySize+1 (DP-12):
+	// this also becomes the body forwarded to the local service below, so
+	// enabling the inspector trades unbounded body size for a bounded
+	// memory footprint — consistent with Inspector.Wrap's same trade-off
+	// and with the "limited by MaxBodySize" comment this code already
+	// claimed to implement (previously untrue: io.ReadAll had no cap and
+	// could OOM on a large upload).
+	maxBody := c.inspector.MaxBodySize()
 	var reqBody []byte
 	if httpReq.Body != nil {
-		reqBody, _ = io.ReadAll(httpReq.Body)
+		reqBody, _ = io.ReadAll(io.LimitReader(httpReq.Body, maxBody+1))
 	}
 
 	// Track bytes in.
@@ -1122,8 +1159,11 @@ func (c *Client) forwardHTTPWithInspect(ctx context.Context, stream streamConn, 
 	}
 	defer resp.Body.Close()
 
-	// 5. Read response body for inspection.
-	respBody, _ := io.ReadAll(resp.Body)
+	// 5. Read response body for inspection, same MaxBodySize+1 cap as the
+	// request body above (DP-12) — it also becomes the body written back
+	// to the stream in step 6, so this bounds memory for large downloads
+	// too, not just uploads.
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 
 	// Track bytes out.
 	atomic.AddUint64(&c.stats.BytesOut, uint64(len(respBody)))
@@ -1602,17 +1642,23 @@ func (c *Client) proxyConnectConn(_ context.Context, mux *p2p.UDPMux, localConn 
 
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(stream, localConn)
+		n, copyErr := copyWithPooledBuffer(stream, localConn)
 		if n > 0 {
 			atomic.AddUint64(&c.stats.BytesOut, uint64(n)) // #nosec G115
+		}
+		if copyErr != nil {
+			log.Debug().Err(copyErr).Msg("wormhole connect: copy local->peer failed")
 		}
 		_ = stream.Close()
 	}()
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(localConn, stream)
+		n, copyErr := copyWithPooledBuffer(localConn, stream)
 		if n > 0 {
 			atomic.AddUint64(&c.stats.BytesIn, uint64(n))
+		}
+		if copyErr != nil {
+			log.Debug().Err(copyErr).Msg("wormhole connect: copy peer->local failed")
 		}
 		_ = localConn.Close()
 	}()

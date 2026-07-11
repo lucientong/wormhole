@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lucientong/wormhole/pkg/inspector"
 	"github.com/lucientong/wormhole/pkg/p2p"
 	"github.com/lucientong/wormhole/pkg/proto"
 	"github.com/lucientong/wormhole/pkg/tunnel"
@@ -993,6 +994,68 @@ func TestClient_ForwardHTTPWithInspect_Success(t *testing.T) {
 	records := c.inspector.Records(10, 0)
 	require.NotEmpty(t, records, "inspector should capture the request/response")
 	assert.Equal(t, http.StatusOK, records[0].Status)
+}
+
+// TestClient_ForwardHTTPWithInspect_LargeBodyTruncated verifies DP-12: the
+// request body forwardHTTPWithInspect reads is capped at
+// Inspector.MaxBodySize()+1, so a request larger than that limit is
+// truncated on the wire to the local service (and in the captured
+// inspector record) instead of being buffered/forwarded unbounded. This
+// intentionally trades "large bodies fully forwarded" for "bounded memory
+// while the inspector is enabled" — the same trade-off Inspector.Wrap
+// already makes.
+func TestClient_ForwardHTTPWithInspect_LargeBodyTruncated(t *testing.T) {
+	var receivedBodyLen int
+	localServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		receivedBodyLen = len(body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer localServer.Close()
+
+	host, portStr, _ := net.SplitHostPort(localServer.Listener.Addr().String())
+	port := 0
+	fmt.Sscanf(portStr, "%d", &port)
+
+	cfg := DefaultConfig()
+	cfg.LocalHost = host
+	cfg.LocalPort = port
+	c := NewClient(cfg)
+	c.inspector = inspector.New(inspector.Config{MaxBodySize: 16, EnableCapture: true})
+
+	clientMux, serverMux := newClientMuxPair(t)
+	serverStream, err := serverMux.OpenStream()
+	require.NoError(t, err)
+	clientStream, err := clientMux.AcceptStream()
+	require.NoError(t, err)
+
+	sreq := &proto.StreamRequest{RequestID: "fwd-large-body", Protocol: proto.ProtocolHTTP}
+
+	// A body much larger than MaxBodySize (16 bytes).
+	largeBody := bytes.Repeat([]byte("x"), 10*1024)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.forwardHTTPWithInspect(context.Background(), clientStream, sreq)
+	}()
+
+	req, err := http.NewRequest(http.MethodPost, "http://myapp.example.com/upload", bytes.NewReader(largeBody))
+	require.NoError(t, err)
+	req.Header.Set("Host", "myapp.example.com")
+	require.NoError(t, req.Write(serverStream))
+
+	br := bufio.NewReader(serverStream)
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+
+	_ = serverStream.Close()
+	<-done
+
+	assert.LessOrEqual(t, receivedBodyLen, 17, "local service should only receive the MaxBodySize+1-capped body, not the full 10KB upload")
+	assert.Less(t, receivedBodyLen, len(largeBody), "capped body must be strictly smaller than the original oversized upload")
 }
 
 // TestClient_ForwardHTTPWithInspect_LocalDown verifies that when the local

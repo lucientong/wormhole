@@ -130,6 +130,19 @@ func TestInspector_SetEnabled(t *testing.T) {
 	assert.True(t, i.IsEnabled())
 }
 
+// TestInspector_MaxBodySize verifies the DP-12 accessor exposes the
+// effective configured (or defaulted) body-size cap so callers that read a
+// body ahead of Capture can bound their own read accordingly.
+func TestInspector_MaxBodySize(t *testing.T) {
+	i := New(Config{MaxBodySize: 4096, EnableCapture: true})
+	assert.Equal(t, int64(4096), i.MaxBodySize())
+
+	// A non-positive value is defaulted by New (see New's doc), and
+	// MaxBodySize() must reflect that default, not the raw input.
+	fallback := New(Config{MaxBodySize: 0, EnableCapture: true})
+	assert.Equal(t, int64(256*1024), fallback.MaxBodySize())
+}
+
 func TestInspector_Close(t *testing.T) {
 	i := New(DefaultConfig())
 
