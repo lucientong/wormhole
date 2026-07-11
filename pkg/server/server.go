@@ -14,20 +14,10 @@ import (
 	"time"
 
 	"github.com/lucientong/wormhole/pkg/auth"
-	"github.com/lucientong/wormhole/pkg/p2p"
 	"github.com/lucientong/wormhole/pkg/proto"
 	"github.com/lucientong/wormhole/pkg/tunnel"
 	"github.com/lucientong/wormhole/pkg/version"
 	"github.com/rs/zerolog/log"
-)
-
-// NAT type strings as reported by pkg/p2p NAT detection and carried in
-// P2POfferRequest/P2POfferResponse.P2PNATType.
-const (
-	natTypeSymmetric          = "Symmetric"
-	natTypeFullCone           = "Full Cone"
-	natTypeRestrictedCone     = "Restricted Cone"
-	natTypePortRestrictedCone = "Port Restricted Cone"
 )
 
 // defaultShutdownTimeout is used when Config.ShutdownTimeout is unset
@@ -35,7 +25,13 @@ const (
 // to drain in-flight HTTP/admin requests before forcing them closed.
 const defaultShutdownTimeout = 15 * time.Second
 
-// Server is the wormhole server.
+// Server is the wormhole server. It is the composition root for three
+// independently-owned components (P3-6 Batch D): TunnelRegistry (which
+// clients are connected and what routes they own), ProxyService (data
+// forwarding: HTTP/WebSocket/TCP), and P2PBroker (`wormhole connect`
+// signaling). Server itself is left holding only connection lifecycle,
+// auth/rate-limiting, and the shared cross-cutting concerns (metrics,
+// audit, stats) that all three components may need.
 type Server struct {
 	config Config
 
@@ -52,19 +48,21 @@ type Server struct {
 	httpServer  *http.Server
 	adminServer *http.Server
 
-	router        *Router
-	httpHandler   *HTTPHandler
-	tlsManager    *TLSManager
-	adminAPI      *AdminAPI
-	portAllocator *TCPPortAllocator
+	tlsManager *TLSManager
+	adminAPI   *AdminAPI
+
+	// registry/proxy/broker are held as their concrete types (not the
+	// TunnelRegistry/ProxyService/P2PBroker interfaces) since Server is
+	// the composition root that constructs them; other consumers
+	// (HTTPHandler's successor, AdminAPI, tests) depend on the narrower
+	// interfaces where that's useful.
+	registry *tunnelRegistry
+	proxy    *proxyService
+	broker   *p2pBroker
 
 	// Authentication.
 	authenticator *auth.Auth
 	rateLimiter   *auth.RateLimiter
-
-	// Client management.
-	clients    map[string]*ClientSession
-	clientLock sync.RWMutex
 
 	// Stats.
 	stats Stats
@@ -74,19 +72,6 @@ type Server struct {
 
 	// Audit logger (nil when AuditEnabled is false).
 	auditLogger *auth.AuditLogger
-
-	// Cluster state store (nil for single-node mode).
-	stateStore StateStore
-
-	// stateStoreHealthy tracks whether the most recent heartbeat/route
-	// refresh against stateStore succeeded, surfaced via /health (H9).
-	stateStoreHealthy atomic.Bool
-
-	// activeDataStreams counts data-plane streams currently proxying
-	// (HTTP forward, WebSocket, TCP tunnel) across all clients, bounded
-	// by config.MaxConcurrentStreams (DP-03). Manipulated only via
-	// tryAcquireStreamSlot/releaseStreamSlot.
-	activeDataStreams int64
 
 	// listenersReady is closed once Start has bound tunnelListener,
 	// httpListener and adminListener (and built httpServer/adminServer),
@@ -155,7 +140,7 @@ type ClientSession struct {
 
 	// activeDataStreams counts this client's own in-flight data-plane
 	// streams, bounded by config.MaxStreamsPerClient (DP-27) independent
-	// of the global activeDataStreams cap on Server.
+	// of the global activeDataStreams cap on ProxyService.
 	activeDataStreams int32
 
 	mu sync.Mutex
@@ -184,7 +169,7 @@ type TunnelInfo struct {
 
 	// Routing metadata, used to disambiguate which tunnel a given HTTP
 	// request targets when a client has registered multiple tunnels
-	// (see resolveTunnelID in handler.go), and to clean up the
+	// (see ProxyService.resolveTunnelID), and to clean up the
 	// corresponding Router entries when this tunnel is individually closed.
 	Subdomain  string
 	Hostname   string
@@ -208,7 +193,6 @@ func NewServer(config Config) *Server {
 
 	s := &Server{
 		config:         config,
-		clients:        make(map[string]*ClientSession),
 		closeCh:        make(chan struct{}),
 		listenersReady: make(chan struct{}),
 		stats: Stats{
@@ -216,12 +200,9 @@ func NewServer(config Config) *Server {
 		},
 	}
 
-	// Initialize Phase 2 components.
-	s.router = NewRouter(config.Domain)
-	s.httpHandler = NewHTTPHandler(s.router, s)
-	s.tlsManager = NewTLSManager(config)
-	s.adminAPI = NewAdminAPI(s)
-	s.portAllocator = NewTCPPortAllocator(config.TCPPortRangeStart, config.TCPPortRangeEnd)
+	// TunnelRegistry owns the router, client directory, TCP port
+	// allocator and (if configured) the cluster state store.
+	s.registry = newTunnelRegistry(config)
 
 	// Initialize Prometheus metrics.
 	if config.EnableMetrics {
@@ -241,15 +222,14 @@ func NewServer(config Config) *Server {
 			Msg("Audit logging enabled")
 	}
 
-	// Initialize cluster state store.
-	s.stateStore = initStateStore(config)
-	if s.stateStore != nil {
-		// Optimistic default: assume healthy until the first heartbeat
-		// (sent moments after Start()) proves otherwise, so /health
-		// doesn't report "degraded" for the brief startup window before
-		// the cluster heartbeat goroutine gets its first tick in (H9).
-		s.stateStoreHealthy.Store(true)
-	}
+	// ProxyService (data plane) and P2PBroker (`wormhole connect`
+	// signaling) both depend on the registry for route/peer resolution,
+	// plus the metrics/audit logger just initialized above.
+	s.proxy = newProxyService(s.registry.router, s.registry, config, s.metrics, &s.stats, s.serverCtx)
+	s.broker = newP2PBroker(s.registry, s.metrics, s.auditLogger, s.serverCtx)
+
+	s.tlsManager = NewTLSManager(config)
+	s.adminAPI = NewAdminAPI(s)
 
 	// Initialize authentication.
 	if config.RequireAuth {
@@ -411,7 +391,7 @@ func (s *Server) Start(ctx context.Context) error {
 	// Shutdown (DP-26) can safely read s.httpServer/s.adminServer
 	// without racing their assignment.
 	s.httpServer = &http.Server{
-		Handler:        s.httpHandler,
+		Handler:        s.proxy,
 		ReadTimeout:    s.config.ReadTimeout,
 		WriteTimeout:   s.config.WriteTimeout,
 		IdleTimeout:    s.config.IdleTimeout,
@@ -437,7 +417,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	// Start cluster heartbeat (no-op for single-node / nil store).
-	s.startClusterHeartbeat(ctx)
+	s.registry.StartHeartbeat(ctx)
 
 	// S10: periodically purge expired entries from the token revocation
 	// blacklist. CleanupRevokedTokens() existed and was fully implemented,
@@ -508,11 +488,9 @@ func (s *Server) Shutdown() error {
 	s.closeAncillaryResources()
 
 	// Close all clients.
-	s.clientLock.Lock()
-	for _, client := range s.clients {
+	for _, client := range s.registry.Snapshot() {
 		_ = client.Mux.Close()
 	}
-	s.clientLock.Unlock()
 
 	s.closeWg.Wait()
 	log.Info().Msg("Server shutdown complete")
@@ -552,13 +530,11 @@ func (s *Server) drainHTTPServers() {
 }
 
 // closeAncillaryResources closes the server's supporting subsystems
-// (port allocator, rate limiter, authenticator, audit store, cluster
-// state store) as part of Shutdown. Split out to keep Shutdown's
-// cyclomatic complexity in check.
+// (TunnelRegistry — port allocator + cluster state store —, rate limiter,
+// authenticator, audit store) as part of Shutdown. Split out to keep
+// Shutdown's cyclomatic complexity in check.
 func (s *Server) closeAncillaryResources() {
-	if s.portAllocator != nil {
-		s.portAllocator.CloseAll()
-	}
+	s.registry.Close()
 
 	if s.rateLimiter != nil {
 		s.rateLimiter.Close()
@@ -572,10 +548,6 @@ func (s *Server) closeAncillaryResources() {
 		if store := s.auditLogger.Store(); store != nil {
 			_ = store.Close()
 		}
-	}
-
-	if s.stateStore != nil {
-		_ = s.stateStore.Close()
 	}
 }
 
@@ -613,19 +585,14 @@ func (s *Server) handleClient(conn net.Conn) {
 	}
 
 	// Check server capacity.
-	if s.config.MaxClients > 0 {
-		s.clientLock.RLock()
-		count := len(s.clients)
-		s.clientLock.RUnlock()
-		if count >= s.config.MaxClients {
-			log.Warn().
-				Str("ip", clientIP).
-				Int("max_clients", s.config.MaxClients).
-				Int("current", count).
-				Msg("Connection rejected: server at capacity")
-			_ = conn.Close()
-			return
-		}
+	if s.config.MaxClients > 0 && s.registry.Count() >= s.config.MaxClients {
+		log.Warn().
+			Str("ip", clientIP).
+			Int("max_clients", s.config.MaxClients).
+			Int("current", s.registry.Count()).
+			Msg("Connection rejected: server at capacity")
+		_ = conn.Close()
+		return
 	}
 
 	// Create multiplexer.
@@ -670,22 +637,19 @@ func (s *Server) handleClient(conn net.Conn) {
 		LastSeen:  time.Now(),
 	}
 
-	// Register route via Router and (if clustered) the shared state store
-	// *before* exposing the client anywhere else. F6/H6/S3: a subdomain
-	// conflict here previously only got logged, and the connection was
-	// allowed to proceed — but the client had already been told (in the
-	// AuthResponse) that it owns `subdomain`, so it would silently receive
-	// zero traffic for it while believing it was live. Reject the
-	// connection instead so the client's reconnect/retry logic kicks in.
+	// Register route via TunnelRegistry and (if clustered) the shared
+	// state store *before* exposing the client anywhere else. F6/H6/S3: a
+	// subdomain conflict here previously only got logged, and the
+	// connection was allowed to proceed — but the client had already been
+	// told (in the AuthResponse) that it owns `subdomain`, so it would
+	// silently receive zero traffic for it while believing it was live.
+	// Reject the connection instead so the client's reconnect/retry logic
+	// kicks in. On success, registerClientRoute also adds client to the
+	// registry's directory.
 	if !s.registerClientRoute(client, clientIP) {
 		_ = mux.Close()
 		return
 	}
-
-	// Register client.
-	s.clientLock.Lock()
-	s.clients[sessionID] = client
-	s.clientLock.Unlock()
 
 	atomic.AddUint64(&s.stats.ActiveClients, 1)
 	atomic.AddUint64(&s.stats.TotalClients, 1)
@@ -722,174 +686,16 @@ func (s *Server) handleClient(conn net.Conn) {
 		Msg("Client disconnected")
 }
 
-// registerClientRoute reserves client.Subdomain in the local Router and, if
-// clustered, the shared state store. It returns false if the subdomain is
-// already claimed by another client (locally or cluster-wide), in which
-// case the caller must reject the connection rather than let it proceed
-// silently unrouted (F6/H6/S3 — see handleClient's call site for context).
+// registerClientRoute is a thin wrapper around
+// TunnelRegistry.registerClientRoute that additionally records an audit
+// event on rejection — audit logging is a Server-level cross-cutting
+// concern the registry itself doesn't need to know about.
 func (s *Server) registerClientRoute(client *ClientSession, clientIP string) bool {
-	subdomain, sessionID := client.Subdomain, client.ID
-
-	// H10: Router.RegisterSubdomain (below) already reclaims a
-	// subdomain locally when its current owner's mux has died but
-	// hasn't been cleaned up yet — e.g. a client reconnecting faster
-	// than the old session's death was detected. Proactively evict that
-	// stale owner's cluster-side entry too, so the reclaim isn't
-	// immediately undone by RegisterRoute finding the old (still
-	// TTL-live) entry and reporting a conflict against the new
-	// connection's own former self.
-	if existing := s.router.LookupSubdomain(subdomain); existing != nil && isStaleOwner(existing, client) && s.stateStore != nil {
-		if err := s.stateStore.UnregisterRoute(existing.ID); err != nil {
-			log.Warn().Err(err).Str("client", existing.ID).Msg("Cluster: failed to evict stale route before reclaim")
-		}
+	ok, reason := s.registry.registerClientRoute(client)
+	if !ok && s.auditLogger != nil {
+		s.auditLogger.LogAuthFailure(clientIP, reason)
 	}
-
-	if err := s.router.RegisterSubdomain(subdomain, client); err != nil {
-		log.Error().Err(err).Str("subdomain", subdomain).Str("session_id", sessionID).
-			Msg("Subdomain registration conflict — rejecting connection")
-		if s.auditLogger != nil {
-			s.auditLogger.LogAuthFailure(clientIP, fmt.Sprintf("subdomain %q already in use", subdomain))
-		}
-		return false
-	}
-
-	// H6/S3: RegisterRoute atomically reserves the subdomain cluster-wide
-	// (Redis SETNX) instead of last-writer-wins; a genuine conflict with a
-	// live owner on another node must reject the connection too, for the
-	// same reason as the local check above. RouteID defaults to
-	// sessionID/ClientID, matching this connection's primary route.
-	ok, err := s.registerClusterRoute(client, RouteEntry{ClientID: sessionID, Subdomain: subdomain})
-	if ok {
-		return true
-	}
-	log.Error().Err(err).Str("subdomain", subdomain).Str("session_id", sessionID).
-		Msg("Cluster: subdomain already claimed by another node — rejecting connection")
-	s.router.UnregisterSubdomain(subdomain)
-	if s.auditLogger != nil {
-		s.auditLogger.LogAuthFailure(clientIP, fmt.Sprintf("subdomain %q already claimed cluster-wide", subdomain))
-	}
-	return false
-}
-
-// registerClusterRoute reserves entry in the shared state store (a no-op,
-// always-true success when running single-node) and, on success, appends
-// it to client.clusterRoutes so the heartbeat loop keeps refreshing its TTL
-// (H1). NodeID/NodeAddr are filled in from the server's own config. Returns
-// (false, ErrSubdomainConflict-wrapping err) only for a genuine live
-// conflict; a state-store error unrelated to conflict resolution is logged
-// and treated as non-fatal (matches the previous behavior — losing cluster
-// visibility temporarily is preferable to rejecting every connection
-// whenever Redis hiccups).
-func (s *Server) registerClusterRoute(client *ClientSession, entry RouteEntry) (bool, error) {
-	if s.stateStore == nil {
-		return true, nil
-	}
-
-	entry.NodeID = s.config.ClusterNodeID
-	entry.NodeAddr = s.config.ClusterNodeAddr
-
-	err := s.stateStore.RegisterRoute(entry)
-	if err == nil {
-		client.mu.Lock()
-		client.clusterRoutes = append(client.clusterRoutes, entry)
-		client.mu.Unlock()
-		return true, nil
-	}
-	if !errors.Is(err, ErrSubdomainConflict) {
-		log.Warn().Err(err).Str("route", entry.Key()).Msg("Cluster: failed to register route in state store")
-		return true, nil
-	}
-	return false, err
-}
-
-// unregisterClusterRoute removes entry from the state store and from
-// client.clusterRoutes, undoing registerClusterRoute. Used when an
-// individual tunnel (rather than the whole connection) is closed.
-func (s *Server) unregisterClusterRoute(client *ClientSession, routeID string) {
-	if s.stateStore == nil {
-		return
-	}
-	if err := s.stateStore.UnregisterRouteEntry(routeID); err != nil {
-		log.Warn().Err(err).Str("route", routeID).Msg("Cluster: failed to unregister route from state store")
-	}
-	client.mu.Lock()
-	for i, e := range client.clusterRoutes {
-		if e.Key() == routeID {
-			client.clusterRoutes = append(client.clusterRoutes[:i], client.clusterRoutes[i+1:]...)
-			break
-		}
-	}
-	client.mu.Unlock()
-}
-
-// registerTunnelRoutes registers a tunnel's extra routing keys (any of
-// subdomain/hostname/pathPrefix that's non-empty) in both the local Router
-// and, if clustered, the shared state store (H3). Cluster route IDs are
-// scoped to tunnelID (":sub"/":host"/":path" suffixes) so multiple tunnels
-// on the same client don't collide with each other or with the client's
-// primary connect-time subdomain entry (which uses ClientID as its
-// RouteID). On any conflict — local or cluster-wide — everything already
-// registered by this call is rolled back and a human-readable rejection
-// reason is returned; "" means every requested key was registered.
-func (s *Server) registerTunnelRoutes(client *ClientSession, tunnelID, subdomain, hostname, pathPrefix string) string {
-	if subdomain != "" {
-		if err := s.router.RegisterSubdomain(subdomain, client); err != nil {
-			return fmt.Sprintf("subdomain %q already in use", subdomain)
-		}
-		routeID := tunnelID + ":sub"
-		if ok, _ := s.registerClusterRoute(client, RouteEntry{RouteID: routeID, ClientID: client.ID, Subdomain: subdomain}); !ok {
-			s.router.UnregisterSubdomain(subdomain)
-			return fmt.Sprintf("subdomain %q already claimed cluster-wide", subdomain)
-		}
-	}
-
-	if hostname != "" {
-		if err := s.router.RegisterHostname(hostname, client); err != nil {
-			s.unregisterTunnelRoutes(client, tunnelID, subdomain, "", "")
-			return fmt.Sprintf("hostname %q already in use", hostname)
-		}
-		routeID := tunnelID + ":host"
-		if ok, _ := s.registerClusterRoute(client, RouteEntry{RouteID: routeID, ClientID: client.ID, Hostname: hostname}); !ok {
-			s.router.UnregisterHostname(hostname)
-			s.unregisterTunnelRoutes(client, tunnelID, subdomain, "", "")
-			return fmt.Sprintf("hostname %q already claimed cluster-wide", hostname)
-		}
-	}
-
-	if pathPrefix != "" {
-		if err := s.router.RegisterPath(pathPrefix, client); err != nil {
-			s.unregisterTunnelRoutes(client, tunnelID, subdomain, hostname, "")
-			return fmt.Sprintf("path prefix %q already in use", pathPrefix)
-		}
-		routeID := tunnelID + ":path"
-		if ok, _ := s.registerClusterRoute(client, RouteEntry{RouteID: routeID, ClientID: client.ID, PathPrefix: pathPrefix}); !ok {
-			s.router.UnregisterPath(pathPrefix)
-			s.unregisterTunnelRoutes(client, tunnelID, subdomain, hostname, "")
-			return fmt.Sprintf("path prefix %q already claimed cluster-wide", pathPrefix)
-		}
-	}
-
-	return ""
-}
-
-// unregisterTunnelRoutes removes the local Router entries and cluster
-// state-store entries (if any) for a tunnel's extra subdomain/hostname/path
-// routes, undoing registerTunnelRoutes. Used both when TCP port allocation
-// fails right after registration and when the tunnel is later closed
-// individually (see releaseTunnelResources).
-func (s *Server) unregisterTunnelRoutes(client *ClientSession, tunnelID, subdomain, hostname, pathPrefix string) {
-	if subdomain != "" {
-		s.router.UnregisterSubdomain(subdomain)
-		s.unregisterClusterRoute(client, tunnelID+":sub")
-	}
-	if hostname != "" {
-		s.router.UnregisterHostname(hostname)
-		s.unregisterClusterRoute(client, tunnelID+":host")
-	}
-	if pathPrefix != "" {
-		s.router.UnregisterPath(pathPrefix)
-		s.unregisterClusterRoute(client, tunnelID+":path")
-	}
+	return ok
 }
 
 // handleClientAuth performs the authentication handshake for a new client.
@@ -1078,7 +884,7 @@ func (s *Server) checkClientVersion(clientVersion string) string {
 // unconditional server-side; cluster/audit reflect this node's config.
 func (s *Server) capabilities() []string {
 	caps := []string{"p2p", "multi-tunnel"}
-	if s.stateStore != nil {
+	if s.registry.stateStore != nil {
 		caps = append(caps, "cluster")
 	}
 	if s.auditLogger != nil {
@@ -1131,9 +937,9 @@ func (s *Server) handleClientStream(client *ClientSession, stream *tunnel.Stream
 	case proto.MessageTypeCloseRequest:
 		s.handleClose(client, stream, msg.CloseRequest)
 	case proto.MessageTypeP2POfferRequest:
-		s.handleP2POffer(client, stream, msg.P2POfferRequest)
+		s.broker.HandleOffer(client, stream, msg.P2POfferRequest)
 	case proto.MessageTypeP2PResult:
-		s.handleP2PResult(client, msg.P2PResult)
+		s.broker.HandleResult(client, msg.P2PResult)
 	default:
 		log.Warn().
 			Int("type", int(msg.Type)).
@@ -1222,7 +1028,7 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 
 	// Determine public URL: prefer a custom hostname when the tunnel
 	// requested one, otherwise fall back to the subdomain-based URL.
-	scheme := "http"
+	scheme := schemeHTTP
 	if s.config.TLSEnabled {
 		scheme = "https"
 	}
@@ -1242,7 +1048,7 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 	if subdomain != "" && subdomain != client.Subdomain {
 		extraSubdomain = subdomain
 	}
-	if failMsg := s.registerTunnelRoutes(client, tunnelID, extraSubdomain, req.Hostname, req.PathPrefix); failMsg != "" {
+	if failMsg := s.registry.RegisterTunnel(client, tunnelID, extraSubdomain, req.Hostname, req.PathPrefix); failMsg != "" {
 		log.Warn().Str("client", client.ID).Str("tunnel_id", tunnelID).Msg("Tunnel registration rejected: " + failMsg)
 		resp := proto.NewRegisterResponse(false, failMsg, "", "", 0)
 		if data, encErr := resp.Encode(); encErr == nil {
@@ -1259,10 +1065,10 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 	// so the client can surface the failure and retry.
 	var tcpPort uint32
 	if req.Protocol == proto.ProtocolTCP {
-		port, ln, allocErr := s.portAllocator.Allocate(s.serverCtx())
+		port, ln, allocErr := s.registry.AllocatePort(s.serverCtx())
 		if allocErr != nil {
 			log.Error().Err(allocErr).Msg("Failed to allocate TCP port")
-			s.unregisterTunnelRoutes(client, tunnelID, extraSubdomain, req.Hostname, req.PathPrefix)
+			s.registry.UnregisterTunnel(client, tunnelID, extraSubdomain, req.Hostname, req.PathPrefix)
 			resp := proto.NewRegisterResponse(false, fmt.Sprintf("failed to allocate TCP port: %v", allocErr), "", "", 0)
 			data, encErr := resp.Encode()
 			if encErr != nil {
@@ -1273,7 +1079,7 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 		}
 		tcpPort = uint32(port) // #nosec G115 -- port from allocator is always in valid range (1024-65535)
 		// Start TCP listener for this tunnel.
-		go s.serveTCPTunnel(ln, client, tunnelID)
+		go s.proxy.ServeTCPTunnel(ln, client, tunnelID)
 	}
 
 	tunnelInfo := &TunnelInfo{
@@ -1452,328 +1258,18 @@ func removeTunnelFromClient(client *ClientSession, tunnelID string) *TunnelInfo 
 }
 
 // releaseTunnelResources releases the TCP port and unregisters the routes
-// owned by a closed tunnel, and updates tunnel metrics. The connection-level
-// default subdomain is left registered until full disconnect (removeClient),
-// matching legacy single-tunnel behavior.
+// owned by a closed tunnel (via TunnelRegistry), and updates tunnel
+// metrics. The connection-level default subdomain is left registered
+// until full disconnect (removeClient), matching legacy single-tunnel
+// behavior.
 func (s *Server) releaseTunnelResources(client *ClientSession, removed *TunnelInfo) {
-	if removed.TCPPort > 0 {
-		s.portAllocator.Release(int(removed.TCPPort))
-	}
-
-	extraSubdomain := ""
-	if removed.Subdomain != "" && removed.Subdomain != client.Subdomain {
-		extraSubdomain = removed.Subdomain
-	}
-	s.unregisterTunnelRoutes(client, removed.ID, extraSubdomain, removed.Hostname, removed.PathPrefix)
+	s.registry.ReleaseTunnel(client, removed)
 
 	atomic.AddUint64(&s.stats.ActiveTunnels, ^uint64(0))
 	if s.metrics != nil {
 		s.metrics.ActiveTunnels.Dec()
 		s.metrics.TunnelDurationSeconds.Observe(time.Since(removed.CreatedAt).Seconds())
 	}
-}
-
-// P2P offer rejection reasons. errP2PNoTarget is the expected, silent
-// outcome for a client that's only exposing a tunnel and never asked to
-// reach a peer (TargetSubdomain == "") — the client treats it as a no-op
-// rather than a P2P failure worth falling back from (see
-// Client.handleP2POfferResponse).
-const (
-	errP2PNoTarget         = "no target specified"
-	errP2PTargetNotFound   = "target not found: no client with that subdomain is currently connected"
-	errP2PTargetIsSelf     = "cannot connect to your own tunnel via P2P"
-	errP2PNATIncompatible  = "NAT types not compatible"
-	errP2PTargetTunnelMeta = "target tunnel metadata unavailable"
-)
-
-// handleP2POffer handles a P2P connection offer from a client.
-//
-// It always stores the sender's P2P reachability info (public/local
-// address, NAT type, ECDH public key) so it's available if some other
-// client later requests a match against one of this client's subdomains.
-// A match is only searched for when req.TargetSubdomain is set (i.e. this
-// is a `wormhole connect <subdomain>` request) — an empty target is just
-// presence registration and gets a quiet errP2PNoTarget response.
-func (s *Server) handleP2POffer(client *ClientSession, stream *tunnel.Stream, req *proto.P2POfferRequest) {
-	client.mu.Lock()
-	client.P2PPublicAddr = req.PublicAddr
-	client.P2PNATType = req.NATType
-	client.P2PLocalAddr = req.LocalAddr
-	client.P2PPublicKey = req.PublicKey
-	client.P2PTunnelID = req.TunnelID
-	client.mu.Unlock()
-
-	log.Info().
-		Str("client", client.ID).
-		Str("nat_type", req.NATType).
-		Str("public_addr", req.PublicAddr).
-		Str("local_addr", req.LocalAddr).
-		Bool("has_public_key", req.PublicKey != "").
-		Str("target_subdomain", req.TargetSubdomain).
-		Msg("P2P offer received")
-
-	if req.TargetSubdomain == "" {
-		resp := proto.NewP2POfferResponse(false, errP2PNoTarget, "", "", "", "")
-		if err := proto.WriteControlMessage(stream, resp); err != nil {
-			log.Error().Err(err).Msg("Failed to write P2P offer response")
-		}
-		return
-	}
-
-	peer, peerTunnelID, findErr := s.findPeerBySubdomain(req.TargetSubdomain, client)
-	if findErr != "" {
-		log.Info().Str("client", client.ID).Str("target", req.TargetSubdomain).Str("reason", findErr).
-			Msg("P2P connect request could not be matched")
-		resp := proto.NewP2POfferResponse(false, findErr, "", "", "", "")
-		_ = proto.WriteControlMessage(stream, resp)
-		return
-	}
-
-	// Check if both NAT types are traversable.
-	if !s.isP2PCompatible(req.NATType, peer.P2PNATType) {
-		log.Info().
-			Str("client_nat", req.NATType).
-			Str("peer_nat", peer.P2PNATType).
-			Msg("NAT types not compatible for P2P")
-		resp := proto.NewP2POfferResponse(false, errP2PNATIncompatible, "", "", "", "")
-		_ = proto.WriteControlMessage(stream, resp)
-		return
-	}
-
-	// Found the target! Return peer info to initiator.
-	peer.mu.Lock()
-	peerAddr := peer.P2PPublicAddr
-	peerNATType := peer.P2PNATType
-	peerPublicKey := peer.P2PPublicKey
-	peer.mu.Unlock()
-
-	log.Info().
-		Str("client", client.ID).
-		Str("peer", peer.ID).
-		Str("target_subdomain", req.TargetSubdomain).
-		Str("peer_addr", peerAddr).
-		Str("client_nat", req.NATType).
-		Str("peer_nat", peerNATType).
-		Bool("has_peer_key", peerPublicKey != "").
-		Msg("P2P peer matched")
-
-	// For Symmetric+Symmetric NAT, generate port prediction candidates and
-	// send them as a P2PCandidates message before the offer response.
-	// Both messages are length-prefixed (proto.WriteControlMessage) so the
-	// client can reliably distinguish and decode each one in turn — see
-	// Client.sendP2POffer, which now loop-reads framed messages instead of
-	// doing a single raw stream.Read() (DP-24).
-	bothSymmetric := req.NATType == natTypeSymmetric && peerNATType == natTypeSymmetric
-	if bothSymmetric {
-		initiatorCandidates := predictCandidatesForSymmetric(req.PublicAddr, req.NATType, 8)
-		peerCandidates := predictCandidatesForSymmetric(peerAddr, peerNATType, 8)
-
-		// Send peer's predicted candidates to the initiating client.
-		if len(peerCandidates) > 0 {
-			candidatesMsg := proto.NewP2PCandidates(peerTunnelID, peerCandidates)
-			if err := proto.WriteControlMessage(stream, candidatesMsg); err != nil {
-				log.Error().Err(err).Msg("Failed to write P2P candidates")
-			}
-		}
-		// Initiator's predicted candidates will be forwarded to peer in notifyPeerOfP2P.
-		_ = initiatorCandidates
-
-		log.Info().
-			Str("client", client.ID).
-			Str("peer", peer.ID).
-			Int("peer_candidates", len(peerCandidates)).
-			Int("initiator_candidates", len(initiatorCandidates)).
-			Msg("Symmetric+Symmetric NAT: using port prediction for P2P")
-	}
-
-	// Send peer info (including ECDH public key) to initiating client.
-	resp := proto.NewP2POfferResponse(true, "", peerAddr, peerNATType, peerPublicKey, peerTunnelID)
-	if err := proto.WriteControlMessage(stream, resp); err != nil {
-		log.Error().Err(err).Msg("Failed to write P2P offer response")
-		return
-	}
-
-	// Notify the peer about the incoming P2P request (via a new stream).
-	go s.notifyPeerOfP2P(peer, client)
-}
-
-// isP2PCompatible checks if two NAT types can establish a P2P connection.
-// With port prediction, Symmetric-Symmetric is attempted (lower success rate).
-func (s *Server) isP2PCompatible(natType1, natType2 string) bool {
-	// Any combination that includes at least one non-Symmetric NAT is traversable.
-	// Symmetric+Symmetric is also attempted using port prediction heuristics.
-	return natPriority(natType1) > 0 && natPriority(natType2) > 0
-}
-
-// predictCandidatesForSymmetric generates port candidates for the given
-// Symmetric NAT address using the port predictor.
-// Returns nil if the address is not Symmetric NAT or prediction is not possible.
-func predictCandidatesForSymmetric(addr string, natType string, count int) []string {
-	if natType != natTypeSymmetric || addr == "" {
-		return nil
-	}
-
-	host, portStr, err := splitHostPort(addr)
-	if err != nil {
-		return nil
-	}
-
-	port := 0
-	if _, scanErr := fmt.Sscanf(portStr, "%d", &port); scanErr != nil || port <= 0 {
-		return nil
-	}
-
-	pred := p2p.NewPredictor()
-	pred.AddSample(port)
-	ports := pred.Predict(count)
-
-	candidates := make([]string, 0, len(ports))
-	for _, p := range ports {
-		candidates = append(candidates, fmt.Sprintf("%s:%d", host, p))
-	}
-	return candidates
-}
-
-// splitHostPort is a thin wrapper around net.SplitHostPort that returns
-// ("", "", err) on failure so callers can handle it cleanly.
-func splitHostPort(addr string) (host, port string, err error) {
-	return net.SplitHostPort(addr)
-}
-
-// notifyPeerOfP2P sends a P2P offer notification to the peer client.
-// For Symmetric+Symmetric NAT pairs it also sends predicted port candidates
-// for the initiator side so the peer can attempt hole punching.
-func (s *Server) notifyPeerOfP2P(peer *ClientSession, initiator *ClientSession) {
-	initiator.mu.Lock()
-	initiatorAddr := initiator.P2PPublicAddr
-	initiatorNATType := initiator.P2PNATType
-	initiatorPublicKey := initiator.P2PPublicKey
-	initiatorTunnelID := initiator.P2PTunnelID
-	initiator.mu.Unlock()
-
-	peer.mu.Lock()
-	peerNATType := peer.P2PNATType
-	peer.mu.Unlock()
-
-	// Open a stream to the peer to notify them.
-	stream, err := peer.Mux.OpenStreamContext(s.serverCtx())
-	if err != nil {
-		log.Error().Err(err).Str("peer", peer.ID).Msg("Failed to open stream to notify peer of P2P")
-		return
-	}
-	defer stream.Close()
-
-	if deadlineErr := stream.SetDeadline(time.Now().Add(10 * time.Second)); deadlineErr != nil {
-		log.Error().Err(deadlineErr).Msg("Failed to set P2P notification deadline")
-		return
-	}
-
-	// For Symmetric+Symmetric, send initiator's predicted candidates first.
-	// Framed with proto.WriteControlMessage (length-prefixed) to match the
-	// client's Client.handleStream, which loop-reads framed control
-	// messages off this notification stream (DP-24).
-	if initiatorNATType == natTypeSymmetric && peerNATType == natTypeSymmetric {
-		candidates := predictCandidatesForSymmetric(initiatorAddr, initiatorNATType, 8)
-		if len(candidates) > 0 {
-			candidatesMsg := proto.NewP2PCandidates(initiatorTunnelID, candidates)
-			if err := proto.WriteControlMessage(stream, candidatesMsg); err != nil {
-				log.Error().Err(err).Str("peer", peer.ID).Msg("Failed to write P2P candidates to peer")
-			} else {
-				log.Debug().
-					Str("peer", peer.ID).
-					Int("candidates", len(candidates)).
-					Msg("Sent initiator port prediction candidates to peer")
-			}
-		}
-	}
-
-	// Send P2P offer response (as a notification) with the initiator's info and public key.
-	// PeerTunnelID is only meaningful for the initiator (addressing outgoing
-	// streams to a specific tunnel on the target); the notified side accepts
-	// P2P streams generically, so it's left empty here.
-	msg := proto.NewP2POfferResponse(true, "", initiatorAddr, initiatorNATType, initiatorPublicKey, "")
-	if err := proto.WriteControlMessage(stream, msg); err != nil {
-		log.Error().Err(err).Str("peer", peer.ID).Msg("Failed to write P2P notification")
-		return
-	}
-
-	log.Debug().
-		Str("peer", peer.ID).
-		Str("initiator_addr", initiatorAddr).
-		Bool("has_key", initiatorPublicKey != "").
-		Msg("P2P notification sent to peer")
-}
-
-// handleP2PResult handles a P2P result notification from a client.
-func (s *Server) handleP2PResult(client *ClientSession, result *proto.P2PResult) {
-	if result.Success {
-		log.Info().
-			Str("client", client.ID).
-			Str("peer_addr", result.PeerAddr).
-			Msg("P2P connection established")
-		if s.metrics != nil {
-			s.metrics.P2PConnectionsTotal.WithLabelValues("success").Inc()
-		}
-		if s.auditLogger != nil {
-			s.auditLogger.LogP2PEstablished(client.ID, result.PeerAddr)
-		}
-	} else {
-		log.Info().
-			Str("client", client.ID).
-			Str("error", result.Error).
-			Msg("P2P connection failed, using relay")
-		if s.metrics != nil {
-			s.metrics.P2PConnectionsTotal.WithLabelValues("fallback").Inc()
-		}
-		if s.auditLogger != nil {
-			s.auditLogger.LogP2PFallback(client.ID, result.Error)
-		}
-	}
-}
-
-// natPriority returns a priority score for a NAT type.
-// Higher score = more traversal-friendly = preferred peer.
-func natPriority(natType string) int {
-	switch natType {
-	case natTypeFullCone:
-		return 4
-	case natTypeRestrictedCone:
-		return 3
-	case natTypePortRestrictedCone:
-		return 2
-	case natTypeSymmetric:
-		return 1
-	default:
-		return 0
-	}
-}
-
-// findPeerBySubdomain looks up the client session that owns targetSubdomain
-// (via the router, which is kept in sync with tunnel registration/teardown)
-// and the specific TunnelInfo.ID serving it, for a `wormhole connect`
-// request from initiator. Returns a non-empty reason string instead of an
-// error when no match can be made, suitable for direct use as the
-// P2POfferResponse.Error field.
-func (s *Server) findPeerBySubdomain(targetSubdomain string, initiator *ClientSession) (peer *ClientSession, tunnelID string, reason string) {
-	peer = s.router.LookupSubdomain(targetSubdomain)
-	if peer == nil {
-		return nil, "", errP2PTargetNotFound
-	}
-	if peer == initiator {
-		return nil, "", errP2PTargetIsSelf
-	}
-
-	peer.mu.Lock()
-	defer peer.mu.Unlock()
-	if peer.P2PPublicAddr == "" {
-		return nil, "", errP2PTargetNotFound
-	}
-	for _, t := range peer.Tunnels {
-		if t.Subdomain == targetSubdomain {
-			return peer, t.ID, ""
-		}
-	}
-	return nil, "", errP2PTargetTunnelMeta
 }
 
 // serveHTTP serves HTTP requests on the already-constructed s.httpServer
@@ -1879,187 +1375,12 @@ func (s *Server) runAuditRetention() {
 	}
 }
 
-// serveTCPTunnel handles raw TCP connections for a tunnel.
-func (s *Server) serveTCPTunnel(ln net.Listener, client *ClientSession, tunnelID string) {
-	defer ln.Close()
-
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if s.isClosed() || errors.Is(err, net.ErrClosed) {
-				return
-			}
-			log.Error().Err(err).Msg("Accept TCP tunnel connection failed")
-			continue
-		}
-
-		go s.handleTCPConnection(conn, client, tunnelID)
-	}
-}
-
-// errStreamSlotSaturated is returned by tryAcquireStreamSlot when either
-// the global or per-client data-plane stream cap (DP-03/DP-27) is full.
-var errStreamSlotSaturated = errors.New("server: concurrent stream limit reached")
-
-// tryAcquireStreamSlot reserves one concurrent data-plane stream slot for
-// client, enforcing both config.MaxConcurrentStreams (global) and
-// config.MaxStreamsPerClient (per-client). On success it returns a release
-// func that MUST be called exactly once when the stream finishes. On
-// failure it returns errStreamSlotSaturated and a nil release func; the
-// caller should reject the request (503 for HTTP, drop for raw TCP)
-// instead of queuing, so a saturated server fails fast rather than piling
-// up unbounded goroutines/memory behind the limit.
-func (s *Server) tryAcquireStreamSlot(client *ClientSession) (release func(), err error) {
-	if s.config.MaxConcurrentStreams > 0 && !tryIncrementBounded64(&s.activeDataStreams, int64(s.config.MaxConcurrentStreams)) {
-		return nil, errStreamSlotSaturated
-	}
-	if s.config.MaxStreamsPerClient > 0 && !tryIncrementBounded32(&client.activeDataStreams, int32(s.config.MaxStreamsPerClient)) {
-		if s.config.MaxConcurrentStreams > 0 {
-			atomic.AddInt64(&s.activeDataStreams, -1)
-		}
-		return nil, errStreamSlotSaturated
-	}
-
-	var released atomic.Bool
-	return func() {
-		if !released.CompareAndSwap(false, true) {
-			return
-		}
-		if s.config.MaxStreamsPerClient > 0 {
-			atomic.AddInt32(&client.activeDataStreams, -1)
-		}
-		if s.config.MaxConcurrentStreams > 0 {
-			atomic.AddInt64(&s.activeDataStreams, -1)
-		}
-	}, nil
-}
-
-// tryIncrementBounded64 atomically increments *counter and returns true,
-// unless it is already >= limit, in which case it leaves *counter
-// unchanged and returns false.
-func tryIncrementBounded64(counter *int64, limit int64) bool {
-	for {
-		cur := atomic.LoadInt64(counter)
-		if cur >= limit {
-			return false
-		}
-		if atomic.CompareAndSwapInt64(counter, cur, cur+1) {
-			return true
-		}
-	}
-}
-
-// tryIncrementBounded32 is tryIncrementBounded64 for int32 counters.
-func tryIncrementBounded32(counter *int32, limit int32) bool {
-	for {
-		cur := atomic.LoadInt32(counter)
-		if cur >= limit {
-			return false
-		}
-		if atomic.CompareAndSwapInt32(counter, cur, cur+1) {
-			return true
-		}
-	}
-}
-
-// handleTCPConnection handles a single raw TCP connection by proxying it through the tunnel.
-func (s *Server) handleTCPConnection(conn net.Conn, client *ClientSession, tunnelID string) {
-	defer conn.Close()
-
-	// DP-03/DP-27: bound concurrent TCP tunnel streams before opening one.
-	release, slotErr := s.tryAcquireStreamSlot(client)
-	if slotErr != nil {
-		log.Warn().Str("client", client.ID).Msg("TCP tunnel connection rejected: concurrent stream limit reached")
-		return
-	}
-	defer release()
-
-	// Open stream to client.
-	stream, err := client.Mux.OpenStreamContext(s.serverCtx())
-	if err != nil {
-		log.Error().Err(err).Msg("Open stream for TCP tunnel failed")
-		return
-	}
-	defer stream.Close()
-
-	// Send stream request. TunnelID lets the client dispatch to the
-	// correct local port in multi-tunnel mode (see Client.resolveLocalAddr).
-	streamReq := proto.NewStreamRequest(tunnelID, generateID(), conn.RemoteAddr().String(), proto.ProtocolTCP)
-	if err := proto.WriteControlMessage(stream, streamReq); err != nil {
-		return
-	}
-
-	// Bidirectional proxy. tunnel.Stream has no CloseWrite/CloseRead, so
-	// the only way to unblock a still-running direction once its peer
-	// direction has errored out is to close both ends (DP-04): waiting
-	// on just the first-to-finish direction and relying on the deferred
-	// conn.Close()/stream.Close() at function return left the other
-	// direction's io loop running (and its goroutine leaked past this
-	// function's scope) until that deferred close happened to land.
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		bufPtr := copyBufPool.Get().(*[]byte)
-		defer copyBufPool.Put(bufPtr)
-		buf := *bufPtr
-		for {
-			n, readErr := conn.Read(buf)
-			if readErr != nil {
-				break
-			}
-			if _, writeErr := stream.Write(buf[:n]); writeErr != nil {
-				break
-			}
-		}
-		_ = stream.Close()
-	}()
-
-	go func() {
-		defer wg.Done()
-		bufPtr := copyBufPool.Get().(*[]byte)
-		defer copyBufPool.Put(bufPtr)
-		buf := *bufPtr
-		for {
-			n, readErr := stream.Read(buf)
-			if readErr != nil {
-				break
-			}
-			if _, writeErr := conn.Write(buf[:n]); writeErr != nil {
-				break
-			}
-		}
-		_ = conn.Close()
-	}()
-
-	wg.Wait()
-}
-
-// removeClient removes a client from the server.
+// removeClient removes a client from the server: TunnelRegistry.RemoveClient
+// handles route/directory/TCP-port cleanup, and this wrapper adds the
+// Server-level cross-cutting bits (stats, metrics, closing the mux) that
+// the registry itself doesn't need to know about.
 func (s *Server) removeClient(client *ClientSession) {
-	s.clientLock.Lock()
-	delete(s.clients, client.ID)
-	s.clientLock.Unlock()
-
-	// Remove all routes via Router.
-	s.router.Unregister(client)
-
-	// Remove route from cluster state store.
-	if s.stateStore != nil {
-		if err := s.stateStore.UnregisterRoute(client.ID); err != nil {
-			log.Warn().Err(err).Str("client", client.ID).Msg("Cluster: failed to unregister route from state store")
-		}
-	}
-
-	// Release allocated TCP ports.
-	client.mu.Lock()
-	for _, t := range client.Tunnels {
-		if t.TCPPort > 0 {
-			s.portAllocator.Release(int(t.TCPPort))
-		}
-	}
-	client.mu.Unlock()
+	s.registry.RemoveClient(client)
 
 	atomic.AddUint64(&s.stats.ActiveClients, ^uint64(0)) // Decrement.
 	if s.metrics != nil {

@@ -259,7 +259,7 @@ func TestIsHopByHop(t *testing.T) {
 func TestHTTPHandler_NotFound(t *testing.T) {
 	server := newTestServer()
 	router := NewRouter("test.example.com")
-	handler := NewHTTPHandler(router, server)
+	handler := newProxyService(router, server.registry, server.config, server.metrics, &server.stats, server.serverCtx)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Host = "unknown.test.example.com"
@@ -276,7 +276,7 @@ func TestHTTPHandler_NotFound(t *testing.T) {
 func TestHTTPHandler_NotFound_XSS(t *testing.T) {
 	server := newTestServer()
 	router := NewRouter("test.example.com")
-	handler := NewHTTPHandler(router, server)
+	handler := newProxyService(router, server.registry, server.config, server.metrics, &server.stats, server.serverCtx)
 
 	// Attempt XSS via Host header.
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -294,7 +294,7 @@ func TestHTTPHandler_NotFound_XSS(t *testing.T) {
 func TestHTTPHandler_ForwardHTTP(t *testing.T) {
 	server := newTestServer()
 	router := NewRouter("test.example.com")
-	handler := NewHTTPHandler(router, server)
+	handler := newProxyService(router, server.registry, server.config, server.metrics, &server.stats, server.serverCtx)
 
 	// Create a mux pair — server mux represents the tunnel to the client.
 	clientConn, serverConn := net.Pipe()
@@ -381,7 +381,7 @@ func TestHTTPHandler_ForwardHTTP(t *testing.T) {
 func TestHTTPHandler_ForwardHTTP_ClientError(t *testing.T) {
 	server := newTestServer()
 	router := NewRouter("test.example.com")
-	handler := NewHTTPHandler(router, server)
+	handler := newProxyService(router, server.registry, server.config, server.metrics, &server.stats, server.serverCtx)
 
 	// Create a mux pair — immediately close the client side.
 	clientConn, serverConn := net.Pipe()
@@ -433,13 +433,13 @@ func TestHTTPHandler_ServeHTTP_RejectsSaturatedGlobalLimit(t *testing.T) {
 	server.config.MaxConcurrentStreams = 1
 	server.config.MaxStreamsPerClient = 0 // isolate the global limit
 	router := NewRouter("test.example.com")
-	handler := NewHTTPHandler(router, server)
+	handler := newProxyService(router, server.registry, server.config, server.metrics, &server.stats, server.serverCtx)
 
 	session := &ClientSession{ID: "occupier", Subdomain: "busy"}
 	require.NoError(t, router.RegisterSubdomain("busy", session))
 
 	// Occupy the only global slot and never release it.
-	occupierRelease, err := server.tryAcquireStreamSlot(session)
+	occupierRelease, err := handler.tryAcquireStreamSlot(session)
 	require.NoError(t, err)
 	defer occupierRelease()
 
@@ -460,12 +460,12 @@ func TestHTTPHandler_ServeHTTP_RejectsSaturatedPerClientLimit(t *testing.T) {
 	server.config.MaxConcurrentStreams = 0 // isolate the per-client limit
 	server.config.MaxStreamsPerClient = 1
 	router := NewRouter("test.example.com")
-	handler := NewHTTPHandler(router, server)
+	handler := newProxyService(router, server.registry, server.config, server.metrics, &server.stats, server.serverCtx)
 
 	session := &ClientSession{ID: "noisy-client", Subdomain: "noisy"}
 	require.NoError(t, router.RegisterSubdomain("noisy", session))
 
-	occupierRelease, err := server.tryAcquireStreamSlot(session)
+	occupierRelease, err := handler.tryAcquireStreamSlot(session)
 	require.NoError(t, err)
 	defer occupierRelease()
 
@@ -481,7 +481,7 @@ func TestHTTPHandler_ServeHTTP_RejectsSaturatedPerClientLimit(t *testing.T) {
 func TestSendStreamRequest(t *testing.T) {
 	server := newTestServer()
 	router := NewRouter("test.example.com")
-	handler := NewHTTPHandler(router, server)
+	handler := newProxyService(router, server.registry, server.config, server.metrics, &server.stats, server.serverCtx)
 
 	// Create a mux pair.
 	clientConn, serverConn := net.Pipe()
@@ -537,7 +537,7 @@ func TestSendStreamRequest(t *testing.T) {
 func TestHTTPHandler_HandleWebSocket(t *testing.T) {
 	server := newTestServer()
 	router := NewRouter("test.example.com")
-	handler := NewHTTPHandler(router, server)
+	handler := newProxyService(router, server.registry, server.config, server.metrics, &server.stats, server.serverCtx)
 
 	// Create mux pair.
 	clientConn, serverConn := net.Pipe()
@@ -659,7 +659,7 @@ func TestHTTPHandler_HandleWebSocket(t *testing.T) {
 func TestHTTPHandler_ServeHTTP_WebSocketRoute(t *testing.T) {
 	server := newTestServer()
 	router := NewRouter("test.example.com")
-	handler := NewHTTPHandler(router, server)
+	handler := newProxyService(router, server.registry, server.config, server.metrics, &server.stats, server.serverCtx)
 
 	// No matching client — should return 404.
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -677,7 +677,7 @@ func TestHTTPHandler_ServeHTTP_WebSocketRoute(t *testing.T) {
 func TestHTTPHandler_HandleWebSocket_NonHijackable(t *testing.T) {
 	server := newTestServer()
 	router := NewRouter("test.example.com")
-	handler := NewHTTPHandler(router, server)
+	handler := newProxyService(router, server.registry, server.config, server.metrics, &server.stats, server.serverCtx)
 
 	// Create a mux pair and register a session.
 	clientConn, serverConn := net.Pipe()
@@ -720,7 +720,7 @@ func TestHTTPHandler_HandleWebSocket_NonHijackable(t *testing.T) {
 func TestHTTPHandler_ForwardHTTP_LargeBody(t *testing.T) {
 	server := newTestServer()
 	router := NewRouter("test.example.com")
-	handler := NewHTTPHandler(router, server)
+	handler := newProxyService(router, server.registry, server.config, server.metrics, &server.stats, server.serverCtx)
 
 	// Use real TCP connections instead of net.Pipe to avoid a known race
 	// condition in Go's net.Pipe with the race detector on large writes.
@@ -816,7 +816,7 @@ func TestHTTPHandler_ForwardHTTP_LargeBody(t *testing.T) {
 func TestHTTPHandler_ResolveTunnelID_SingleTunnel(t *testing.T) {
 	server := newTestServer()
 	router := NewRouter("test.example.com")
-	handler := NewHTTPHandler(router, server)
+	handler := newProxyService(router, server.registry, server.config, server.metrics, &server.stats, server.serverCtx)
 
 	client := &ClientSession{
 		ID: "single",
@@ -834,7 +834,7 @@ func TestHTTPHandler_ResolveTunnelID_SingleTunnel(t *testing.T) {
 func TestHTTPHandler_ResolveTunnelID_MultiTunnel(t *testing.T) {
 	server := newTestServer()
 	router := NewRouter("test.example.com")
-	handler := NewHTTPHandler(router, server)
+	handler := newProxyService(router, server.registry, server.config, server.metrics, &server.stats, server.serverCtx)
 
 	client := &ClientSession{
 		ID:        "multi",
@@ -864,7 +864,7 @@ func TestHTTPHandler_ResolveTunnelID_MultiTunnel(t *testing.T) {
 func TestHTTPHandler_ResolveTunnelID_NoTunnels(t *testing.T) {
 	server := newTestServer()
 	router := NewRouter("test.example.com")
-	handler := NewHTTPHandler(router, server)
+	handler := newProxyService(router, server.registry, server.config, server.metrics, &server.stats, server.serverCtx)
 
 	client := &ClientSession{ID: "empty"}
 	assert.Equal(t, "", handler.resolveTunnelID(client, "anything.test.example.com", "/"))
@@ -878,7 +878,7 @@ func TestHTTPHandler_ResolveTunnelID_NoTunnels(t *testing.T) {
 func TestHTTPHandler_ForwardHTTP_MultiTunnel_RoutesToCorrectTunnelID(t *testing.T) {
 	server := newTestServer()
 	router := NewRouter("test.example.com")
-	handler := NewHTTPHandler(router, server)
+	handler := newProxyService(router, server.registry, server.config, server.metrics, &server.stats, server.serverCtx)
 
 	clientMux, serverMux := newMuxPair(t)
 	defer clientMux.Close()

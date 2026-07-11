@@ -19,16 +19,8 @@ import (
 func newTestServer() *Server {
 	config := DefaultConfig()
 	config.Domain = "test.example.com"
-	s := &Server{
-		config:  config,
-		clients: make(map[string]*ClientSession),
-		closeCh: make(chan struct{}),
-		stats: Stats{
-			StartTime: time.Now().Add(-1 * time.Hour), // 1 hour ago
-		},
-	}
-	s.router = NewRouter(config.Domain)
-	s.portAllocator = NewTCPPortAllocator(10000, 10100)
+	s := NewServer(config)
+	s.stats.StartTime = time.Now().Add(-1 * time.Hour) // 1 hour ago
 	return s
 }
 
@@ -70,8 +62,8 @@ func TestAdminAPI_Health(t *testing.T) {
 func TestAdminAPI_Health_Cluster(t *testing.T) {
 	server := newTestServer()
 	server.config.ClusterNodeID = "node-a"
-	server.stateStore = NewMemoryStateStore()
-	server.stateStoreHealthy.Store(true)
+	server.registry.stateStore = NewMemoryStateStore()
+	server.registry.stateStoreHealthy.Store(true)
 	api := NewAdminAPI(server)
 	handler := api.Handler()
 
@@ -89,7 +81,7 @@ func TestAdminAPI_Health_Cluster(t *testing.T) {
 
 	// A failed heartbeat should flip both the per-field flag and the
 	// overall status to "degraded".
-	server.stateStoreHealthy.Store(false)
+	server.registry.stateStoreHealthy.Store(false)
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
@@ -222,8 +214,8 @@ func TestAdminAPI_Clients_WithClients(t *testing.T) {
 		Tunnels:   []*TunnelInfo{},
 	}
 
-	server.clients["client-1"] = client1
-	server.clients["client-2"] = client2
+	server.registry.clients["client-1"] = client1
+	server.registry.clients["client-2"] = client2
 
 	api := NewAdminAPI(server)
 	handler := api.Handler()
@@ -304,7 +296,7 @@ func TestAdminAPI_Tunnels_WithTunnels(t *testing.T) {
 			},
 		},
 	}
-	server.clients["client-1"] = client
+	server.registry.clients["client-1"] = client
 
 	api := NewAdminAPI(server)
 	handler := api.Handler()
@@ -640,23 +632,9 @@ func newTestServerWithAuth(t *testing.T) *Server {
 	config.RequireAuth = true
 	config.AuthSecret = "test-secret-key-0123456789abcdef"
 
-	authenticator, err := auth.New(auth.Config{
-		Secret:      []byte(config.AuthSecret),
-		TokenExpiry: 1 * time.Hour,
-	})
-	require.NoError(t, err)
-
-	s := &Server{
-		config:        config,
-		clients:       make(map[string]*ClientSession),
-		closeCh:       make(chan struct{}),
-		authenticator: authenticator,
-		stats: Stats{
-			StartTime: time.Now().Add(-1 * time.Hour),
-		},
-	}
-	s.router = NewRouter(config.Domain)
-	s.portAllocator = NewTCPPortAllocator(10000, 10100)
+	s := NewServer(config)
+	require.NotNil(t, s.authenticator)
+	s.stats.StartTime = time.Now().Add(-1 * time.Hour)
 	return s
 }
 

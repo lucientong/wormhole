@@ -35,12 +35,12 @@ func TestNewServer(t *testing.T) {
 	s := NewServer(cfg)
 	require.NotNil(t, s)
 
-	assert.NotNil(t, s.router)
-	assert.NotNil(t, s.httpHandler)
+	assert.NotNil(t, s.registry.router)
+	assert.NotNil(t, s.proxy)
 	assert.NotNil(t, s.tlsManager)
 	assert.NotNil(t, s.adminAPI)
-	assert.NotNil(t, s.portAllocator)
-	assert.NotNil(t, s.clients)
+	assert.NotNil(t, s.registry.portAllocator)
+	assert.NotNil(t, s.registry.clients)
 	assert.NotNil(t, s.closeCh)
 	assert.Nil(t, s.authenticator) // RequireAuth is false by default.
 	assert.Nil(t, s.rateLimiter)   // Rate limiter needs RequireAuth.
@@ -237,7 +237,7 @@ func TestServer_IsP2PCompatible(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := s.isP2PCompatible(tt.nat1, tt.nat2)
+			result := s.broker.isP2PCompatible(tt.nat1, tt.nat2)
 			assert.Equal(t, tt.expected, result)
 		})
 	}
@@ -248,7 +248,7 @@ func TestServer_FindPeerBySubdomain_NotFound(t *testing.T) {
 	s := NewServer(cfg)
 	initiator := &ClientSession{ID: "client-1"}
 
-	peer, tunnelID, reason := s.findPeerBySubdomain("myapp", initiator)
+	peer, tunnelID, reason := s.registry.FindPeerBySubdomain("myapp", initiator)
 	assert.Nil(t, peer)
 	assert.Empty(t, tunnelID)
 	assert.Equal(t, errP2PTargetNotFound, reason)
@@ -263,10 +263,10 @@ func TestServer_FindPeerBySubdomain_Success(t *testing.T) {
 		P2PPublicAddr: "1.2.3.4:5000",
 		Tunnels:       []*TunnelInfo{{ID: "tunnel-2", Subdomain: "myapp"}},
 	}
-	require.NoError(t, s.router.RegisterSubdomain("myapp", target))
+	require.NoError(t, s.registry.router.RegisterSubdomain("myapp", target))
 
 	initiator := &ClientSession{ID: "client-1"}
-	peer, tunnelID, reason := s.findPeerBySubdomain("myapp", initiator)
+	peer, tunnelID, reason := s.registry.FindPeerBySubdomain("myapp", initiator)
 	require.NotNil(t, peer)
 	assert.Equal(t, "client-2", peer.ID)
 	assert.Equal(t, "tunnel-2", tunnelID)
@@ -282,9 +282,9 @@ func TestServer_FindPeerBySubdomain_RejectsSelf(t *testing.T) {
 		P2PPublicAddr: "1.2.3.4:5000",
 		Tunnels:       []*TunnelInfo{{ID: "tunnel-1", Subdomain: "myapp"}},
 	}
-	require.NoError(t, s.router.RegisterSubdomain("myapp", initiator))
+	require.NoError(t, s.registry.router.RegisterSubdomain("myapp", initiator))
 
-	peer, tunnelID, reason := s.findPeerBySubdomain("myapp", initiator)
+	peer, tunnelID, reason := s.registry.FindPeerBySubdomain("myapp", initiator)
 	assert.Nil(t, peer)
 	assert.Empty(t, tunnelID)
 	assert.Equal(t, errP2PTargetIsSelf, reason)
@@ -299,10 +299,10 @@ func TestServer_FindPeerBySubdomain_NoP2PInfo(t *testing.T) {
 		ID:      "client-2",
 		Tunnels: []*TunnelInfo{{ID: "tunnel-2", Subdomain: "myapp"}},
 	}
-	require.NoError(t, s.router.RegisterSubdomain("myapp", target))
+	require.NoError(t, s.registry.router.RegisterSubdomain("myapp", target))
 
 	initiator := &ClientSession{ID: "client-1"}
-	peer, _, reason := s.findPeerBySubdomain("myapp", initiator)
+	peer, _, reason := s.registry.FindPeerBySubdomain("myapp", initiator)
 	assert.Nil(t, peer)
 	assert.Equal(t, errP2PTargetNotFound, reason)
 }
@@ -318,10 +318,10 @@ func TestServer_FindPeerBySubdomain_MissingTunnelMetadata(t *testing.T) {
 		ID:            "client-2",
 		P2PPublicAddr: "1.2.3.4:5000",
 	}
-	require.NoError(t, s.router.RegisterSubdomain("myapp", target))
+	require.NoError(t, s.registry.router.RegisterSubdomain("myapp", target))
 
 	initiator := &ClientSession{ID: "client-1"}
-	peer, tunnelID, reason := s.findPeerBySubdomain("myapp", initiator)
+	peer, tunnelID, reason := s.registry.FindPeerBySubdomain("myapp", initiator)
 	assert.Nil(t, peer)
 	assert.Empty(t, tunnelID)
 	assert.Equal(t, errP2PTargetTunnelMeta, reason)
@@ -451,25 +451,25 @@ func TestServer_ClientManagement(t *testing.T) {
 	client1 := &ClientSession{ID: "c1", Subdomain: "app1"}
 	client2 := &ClientSession{ID: "c2", Subdomain: "app2"}
 
-	s.clientLock.Lock()
-	s.clients["c1"] = client1
-	s.clients["c2"] = client2
-	s.clientLock.Unlock()
+	s.registry.clientLock.Lock()
+	s.registry.clients["c1"] = client1
+	s.registry.clients["c2"] = client2
+	s.registry.clientLock.Unlock()
 
-	s.clientLock.RLock()
-	assert.Len(t, s.clients, 2)
-	s.clientLock.RUnlock()
+	s.registry.clientLock.RLock()
+	assert.Len(t, s.registry.clients, 2)
+	s.registry.clientLock.RUnlock()
 
 	// Remove one client manually from map.
-	s.clientLock.Lock()
-	delete(s.clients, "c1")
-	s.clientLock.Unlock()
+	s.registry.clientLock.Lock()
+	delete(s.registry.clients, "c1")
+	s.registry.clientLock.Unlock()
 
-	s.clientLock.RLock()
-	assert.Len(t, s.clients, 1)
-	_, exists := s.clients["c2"]
+	s.registry.clientLock.RLock()
+	assert.Len(t, s.registry.clients, 1)
+	_, exists := s.registry.clients["c2"]
 	assert.True(t, exists)
-	s.clientLock.RUnlock()
+	s.registry.clientLock.RUnlock()
 }
 
 func TestServer_PortAllocator(t *testing.T) {
@@ -477,8 +477,8 @@ func TestServer_PortAllocator(t *testing.T) {
 	s := NewServer(cfg)
 
 	// Port allocator should be initialized.
-	assert.NotNil(t, s.portAllocator)
-	assert.Equal(t, 0, s.portAllocator.AllocatedPorts())
+	assert.NotNil(t, s.registry.portAllocator)
+	assert.Equal(t, 0, s.registry.portAllocator.AllocatedPorts())
 }
 
 func TestStats_StartTime(t *testing.T) {
@@ -837,12 +837,12 @@ func TestServer_HandleRegister_HTTP(t *testing.T) {
 		CreatedAt: time.Now(),
 		LastSeen:  time.Now(),
 	}
-	s.clientLock.Lock()
-	s.clients[client.ID] = client
-	s.clientLock.Unlock()
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
 
 	// Register subdomain in router so handleRegister can work.
-	_ = s.router.RegisterSubdomain("myapp", client)
+	_ = s.registry.router.RegisterSubdomain("myapp", client)
 
 	// Client goroutine: open stream, send RegisterRequest, read response.
 	errCh := make(chan error, 1)
@@ -942,9 +942,9 @@ func TestServer_HandleRegister_RBAC_ViewerRejected(t *testing.T) {
 		CreatedAt: time.Now(),
 		LastSeen:  time.Now(),
 	}
-	s.clientLock.Lock()
-	s.clients[client.ID] = client
-	s.clientLock.Unlock()
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -1028,10 +1028,10 @@ func TestServer_HandleRegister_RBAC_MemberAllowed(t *testing.T) {
 		CreatedAt: time.Now(),
 		LastSeen:  time.Now(),
 	}
-	s.clientLock.Lock()
-	s.clients[client.ID] = client
-	s.clientLock.Unlock()
-	_ = s.router.RegisterSubdomain("myapp2", client)
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
+	_ = s.registry.router.RegisterSubdomain("myapp2", client)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -1183,7 +1183,7 @@ func TestServer_HandleP2PResult_Success(_ *testing.T) {
 	}
 
 	// Should not panic.
-	s.handleP2PResult(client, result)
+	s.broker.HandleResult(client, result)
 }
 
 func TestServer_HandleP2PResult_Failure(_ *testing.T) {
@@ -1198,7 +1198,7 @@ func TestServer_HandleP2PResult_Failure(_ *testing.T) {
 	}
 
 	// Should not panic.
-	s.handleP2PResult(client, result)
+	s.broker.HandleResult(client, result)
 }
 
 func TestServer_HandleClientStream_Register(t *testing.T) {
@@ -1213,10 +1213,10 @@ func TestServer_HandleClientStream_Register(t *testing.T) {
 		CreatedAt: time.Now(),
 		LastSeen:  time.Now(),
 	}
-	s.clientLock.Lock()
-	s.clients[client.ID] = client
-	s.clientLock.Unlock()
-	_ = s.router.RegisterSubdomain("testapp", client)
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
+	_ = s.registry.router.RegisterSubdomain("testapp", client)
 
 	// Client sends a register request on a new stream.
 	done := make(chan struct{})
@@ -1298,9 +1298,9 @@ func TestServer_HandleP2POffer_NoTarget(t *testing.T) {
 		ID:  "initiator",
 		Mux: serverMux,
 	}
-	s.clientLock.Lock()
-	s.clients[client.ID] = client
-	s.clientLock.Unlock()
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
 
 	// Client sends a P2P offer with no TargetSubdomain — this is the
 	// normal case for a client that's only exposing a tunnel: the server
@@ -1340,7 +1340,7 @@ func TestServer_HandleP2POffer_NoTarget(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, msg.P2POfferRequest)
 
-	s.handleP2POffer(client, stream, msg.P2POfferRequest)
+	s.broker.HandleOffer(client, stream, msg.P2POfferRequest)
 	<-done
 
 	// The offer still registered the client's reachability info even
@@ -1359,9 +1359,9 @@ func TestServer_HandleP2POffer_TargetNotFound(t *testing.T) {
 		ID:  "initiator",
 		Mux: serverMux,
 	}
-	s.clientLock.Lock()
-	s.clients[client.ID] = client
-	s.clientLock.Unlock()
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
 
 	// Client requests a target subdomain that isn't currently connected.
 	done := make(chan struct{})
@@ -1399,7 +1399,7 @@ func TestServer_HandleP2POffer_TargetNotFound(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, msg.P2POfferRequest)
 
-	s.handleP2POffer(client, stream, msg.P2POfferRequest)
+	s.broker.HandleOffer(client, stream, msg.P2POfferRequest)
 	<-done
 }
 
@@ -1421,19 +1421,19 @@ func TestServer_RemoveClient(t *testing.T) {
 	}
 
 	// Register client.
-	s.clientLock.Lock()
-	s.clients[client.ID] = client
-	s.clientLock.Unlock()
-	_ = s.router.RegisterSubdomain("removeapp", client)
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
+	_ = s.registry.router.RegisterSubdomain("removeapp", client)
 	atomic.AddUint64(&s.stats.ActiveClients, 1)
 
 	// Remove client.
 	s.removeClient(client)
 
 	// Verify client is removed.
-	s.clientLock.RLock()
-	_, exists := s.clients["remove-me"]
-	s.clientLock.RUnlock()
+	s.registry.clientLock.RLock()
+	_, exists := s.registry.clients["remove-me"]
+	s.registry.clientLock.RUnlock()
 	assert.False(t, exists)
 
 	// ActiveClients should be decremented.
@@ -1621,12 +1621,12 @@ func TestServer_Shutdown_WithClients(t *testing.T) {
 	serverMux, err := tunnel.Server(serverConn, muxCfg)
 	require.NoError(t, err)
 
-	s.clientLock.Lock()
-	s.clients["shutdown-client"] = &ClientSession{
+	s.registry.clientLock.Lock()
+	s.registry.clients["shutdown-client"] = &ClientSession{
 		ID:  "shutdown-client",
 		Mux: serverMux,
 	}
-	s.clientLock.Unlock()
+	s.registry.clientLock.Unlock()
 
 	cancel()
 	<-errCh
@@ -1658,9 +1658,9 @@ func TestServer_HandleClient_NoAuth(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Verify client was registered.
-	s.clientLock.RLock()
-	clientCount := len(s.clients)
-	s.clientLock.RUnlock()
+	s.registry.clientLock.RLock()
+	clientCount := len(s.registry.clients)
+	s.registry.clientLock.RUnlock()
 	assert.Equal(t, 1, clientCount)
 
 	// Close client mux to trigger disconnect.
@@ -1668,9 +1668,9 @@ func TestServer_HandleClient_NoAuth(t *testing.T) {
 	<-done
 
 	// Verify client was removed.
-	s.clientLock.RLock()
-	clientCount = len(s.clients)
-	s.clientLock.RUnlock()
+	s.registry.clientLock.RLock()
+	clientCount = len(s.registry.clients)
+	s.registry.clientLock.RUnlock()
 	assert.Equal(t, 0, clientCount)
 }
 
@@ -1718,9 +1718,9 @@ func TestServer_HandleClient_WithAuth_Success(t *testing.T) {
 	// Give server time to register client.
 	time.Sleep(100 * time.Millisecond)
 
-	s.clientLock.RLock()
-	clientCount := len(s.clients)
-	s.clientLock.RUnlock()
+	s.registry.clientLock.RLock()
+	clientCount := len(s.registry.clients)
+	s.registry.clientLock.RUnlock()
 	assert.Equal(t, 1, clientCount)
 
 	_ = clientMux.Close()
@@ -1842,7 +1842,7 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 	handlerDone := make(chan struct{})
 	go func() {
 		defer close(handlerDone)
-		s.handleTCPConnection(proxyConn, client, "test-tunnel")
+		s.proxy.handleTCPConnection(proxyConn, client, "test-tunnel")
 	}()
 
 	// External TCP client sends data.
@@ -1874,23 +1874,23 @@ func TestServer_TryAcquireStreamSlot_GlobalLimit(t *testing.T) {
 	clientA := &ClientSession{ID: "a"}
 	clientB := &ClientSession{ID: "b"}
 
-	release1, err := s.tryAcquireStreamSlot(clientA)
+	release1, err := s.proxy.tryAcquireStreamSlot(clientA)
 	require.NoError(t, err)
-	release2, err := s.tryAcquireStreamSlot(clientB)
+	release2, err := s.proxy.tryAcquireStreamSlot(clientB)
 	require.NoError(t, err)
 
 	// Third acquisition (any client) must fail: global budget is exhausted.
-	_, err = s.tryAcquireStreamSlot(clientA)
+	_, err = s.proxy.tryAcquireStreamSlot(clientA)
 	assert.ErrorIs(t, err, errStreamSlotSaturated)
 
 	// Releasing one slot frees capacity back up.
 	release1()
-	release3, err := s.tryAcquireStreamSlot(clientB)
+	release3, err := s.proxy.tryAcquireStreamSlot(clientB)
 	require.NoError(t, err)
 
 	release2()
 	release3()
-	assert.Equal(t, int64(0), s.activeDataStreams)
+	assert.Equal(t, int64(0), s.proxy.activeDataStreams)
 }
 
 // TestServer_TryAcquireStreamSlot_PerClientLimit verifies DP-27: a single
@@ -1905,15 +1905,15 @@ func TestServer_TryAcquireStreamSlot_PerClientLimit(t *testing.T) {
 	noisy := &ClientSession{ID: "noisy"}
 	quiet := &ClientSession{ID: "quiet"}
 
-	release, err := s.tryAcquireStreamSlot(noisy)
+	release, err := s.proxy.tryAcquireStreamSlot(noisy)
 	require.NoError(t, err)
 
 	// Same client, second stream: rejected by its own per-client cap.
-	_, err = s.tryAcquireStreamSlot(noisy)
+	_, err = s.proxy.tryAcquireStreamSlot(noisy)
 	assert.ErrorIs(t, err, errStreamSlotSaturated)
 
 	// A different client still has its own independent budget.
-	quietRelease, err := s.tryAcquireStreamSlot(quiet)
+	quietRelease, err := s.proxy.tryAcquireStreamSlot(quiet)
 	require.NoError(t, err)
 
 	release()
@@ -1932,13 +1932,13 @@ func TestServer_TryAcquireStreamSlot_ReleaseIsIdempotent(t *testing.T) {
 	s := NewServer(cfg)
 
 	client := &ClientSession{ID: "c"}
-	release, err := s.tryAcquireStreamSlot(client)
+	release, err := s.proxy.tryAcquireStreamSlot(client)
 	require.NoError(t, err)
 
 	release()
 	release() // second call must be a no-op.
 
-	assert.Equal(t, int64(0), s.activeDataStreams)
+	assert.Equal(t, int64(0), s.proxy.activeDataStreams)
 	assert.Equal(t, int32(0), client.activeDataStreams)
 }
 
@@ -1958,7 +1958,7 @@ func TestServer_HandleTCPConnection_RejectsWhenSaturated(t *testing.T) {
 	client := &ClientSession{ID: "tcp-saturated-client", Mux: serverMux}
 
 	// Occupy the only slot.
-	occupierRelease, err := s.tryAcquireStreamSlot(client)
+	occupierRelease, err := s.proxy.tryAcquireStreamSlot(client)
 	require.NoError(t, err)
 
 	// The tunnel client must never see a stream open attempt.
@@ -1975,7 +1975,7 @@ func TestServer_HandleTCPConnection_RejectsWhenSaturated(t *testing.T) {
 	handlerDone := make(chan struct{})
 	go func() {
 		defer close(handlerDone)
-		s.handleTCPConnection(proxyConn, client, "test-tunnel")
+		s.proxy.handleTCPConnection(proxyConn, client, "test-tunnel")
 	}()
 
 	select {
@@ -2017,7 +2017,7 @@ func TestServer_HandleTCPConnection_ClientMuxClosed(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.handleTCPConnection(proxyConn, client, "test-tunnel")
+		s.proxy.handleTCPConnection(proxyConn, client, "test-tunnel")
 	}()
 
 	// Should return quickly since mux is closed.
@@ -2075,7 +2075,7 @@ func TestServer_ServeTCPTunnel(t *testing.T) {
 	}()
 
 	// Start serveTCPTunnel in background (it will close ln on return).
-	go s.serveTCPTunnel(ln, client, "test-tunnel")
+	go s.proxy.ServeTCPTunnel(ln, client, "test-tunnel")
 
 	// Connect to the TCP tunnel port.
 	conn, err := net.Dial("tcp", ln.Addr().String())
@@ -2123,11 +2123,11 @@ func TestServer_HandleP2POffer_WithPeer(t *testing.T) {
 		Tunnels:       []*TunnelInfo{{ID: "peer-tunnel-1", Subdomain: "peerapp"}},
 	}
 
-	s.clientLock.Lock()
-	s.clients[initiator.ID] = initiator
-	s.clients[peer.ID] = peer
-	s.clientLock.Unlock()
-	require.NoError(t, s.router.RegisterSubdomain("peerapp", peer))
+	s.registry.clientLock.Lock()
+	s.registry.clients[initiator.ID] = initiator
+	s.registry.clients[peer.ID] = peer
+	s.registry.clientLock.Unlock()
+	require.NoError(t, s.registry.router.RegisterSubdomain("peerapp", peer))
 
 	// Peer goroutine: accept the notification stream from server.
 	peerNotified := make(chan bool, 1)
@@ -2190,7 +2190,7 @@ func TestServer_HandleP2POffer_WithPeer(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, msg.P2POfferRequest)
 
-	s.handleP2POffer(initiator, stream, msg.P2POfferRequest)
+	s.broker.HandleOffer(initiator, stream, msg.P2POfferRequest)
 	<-done
 
 	// Verify peer was notified.
@@ -2294,10 +2294,10 @@ func TestServer_HandleRegister_TCP(t *testing.T) {
 		CreatedAt: time.Now(),
 		LastSeen:  time.Now(),
 	}
-	s.clientLock.Lock()
-	s.clients[client.ID] = client
-	s.clientLock.Unlock()
-	_ = s.router.RegisterSubdomain("tcpreg", client)
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
+	_ = s.registry.router.RegisterSubdomain("tcpreg", client)
 
 	// Client sends a TCP register request.
 	errCh := make(chan error, 1)
@@ -2371,7 +2371,7 @@ func TestServer_HandleRegister_TCP(t *testing.T) {
 	client.mu.Unlock()
 
 	// Release the allocated TCP port to clean up.
-	s.portAllocator.Release(int(tcpPort))
+	s.registry.portAllocator.Release(int(tcpPort))
 }
 
 // TestServer_HandleRegister_TCP_PortAllocationFailure verifies the DP-18
@@ -2381,7 +2381,7 @@ func TestServer_HandleRegister_TCP(t *testing.T) {
 func TestServer_HandleRegister_TCP_PortAllocationFailure(t *testing.T) {
 	s := newTestServerForIntegration()
 	// Exhausted range: Allocate() always fails.
-	s.portAllocator = NewTCPPortAllocator(20000, 20000)
+	s.registry.portAllocator = NewTCPPortAllocator(20000, 20000)
 
 	clientMux, serverMux := newMuxPair(t)
 
@@ -2392,10 +2392,10 @@ func TestServer_HandleRegister_TCP_PortAllocationFailure(t *testing.T) {
 		CreatedAt: time.Now(),
 		LastSeen:  time.Now(),
 	}
-	s.clientLock.Lock()
-	s.clients[client.ID] = client
-	s.clientLock.Unlock()
-	_ = s.router.RegisterSubdomain("tcpfail", client)
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
+	_ = s.registry.router.RegisterSubdomain("tcpfail", client)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -2478,11 +2478,11 @@ func TestServer_HandleP2POffer_SymmetricSymmetric(t *testing.T) {
 		Tunnels:       []*TunnelInfo{{ID: "peer-tunnel-1", Subdomain: "symapp"}},
 	}
 
-	s.clientLock.Lock()
-	s.clients[initiator.ID] = initiator
-	s.clients[peer.ID] = peer
-	s.clientLock.Unlock()
-	require.NoError(t, s.router.RegisterSubdomain("symapp", peer))
+	s.registry.clientLock.Lock()
+	s.registry.clients[initiator.ID] = initiator
+	s.registry.clients[peer.ID] = peer
+	s.registry.clientLock.Unlock()
+	require.NoError(t, s.registry.router.RegisterSubdomain("symapp", peer))
 
 	// Goroutine simulating the peer client — reads the notification stream
 	// opened by notifyPeerOfP2P and asserts that BOTH the P2PCandidates
@@ -2559,7 +2559,7 @@ func TestServer_HandleP2POffer_SymmetricSymmetric(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, msg.P2POfferRequest)
 
-	s.handleP2POffer(initiator, stream, msg.P2POfferRequest)
+	s.broker.HandleOffer(initiator, stream, msg.P2POfferRequest)
 	<-done
 	<-peerDone
 
@@ -2589,11 +2589,11 @@ func TestServer_HandleP2POffer_IncompatibleNAT(t *testing.T) {
 		Tunnels:       []*TunnelInfo{{ID: "peer-tunnel-1", Subdomain: "unknownapp"}},
 	}
 
-	s.clientLock.Lock()
-	s.clients[initiator.ID] = initiator
-	s.clients[peer.ID] = peer
-	s.clientLock.Unlock()
-	require.NoError(t, s.router.RegisterSubdomain("unknownapp", peer))
+	s.registry.clientLock.Lock()
+	s.registry.clients[initiator.ID] = initiator
+	s.registry.clients[peer.ID] = peer
+	s.registry.clientLock.Unlock()
+	require.NoError(t, s.registry.router.RegisterSubdomain("unknownapp", peer))
 
 	done := make(chan struct{})
 	go func() {
@@ -2630,7 +2630,7 @@ func TestServer_HandleP2POffer_IncompatibleNAT(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, msg.P2POfferRequest)
 
-	s.handleP2POffer(initiator, stream, msg.P2POfferRequest)
+	s.broker.HandleOffer(initiator, stream, msg.P2POfferRequest)
 	<-done
 }
 
@@ -2648,10 +2648,10 @@ func TestServer_HandleRegister_CustomHostname(t *testing.T) {
 		CreatedAt: time.Now(),
 		LastSeen:  time.Now(),
 	}
-	s.clientLock.Lock()
-	s.clients[client.ID] = client
-	s.clientLock.Unlock()
-	_ = s.router.RegisterSubdomain("hostapp", client)
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
+	_ = s.registry.router.RegisterSubdomain("hostapp", client)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -2704,7 +2704,7 @@ func TestServer_HandleRegister_CustomHostname(t *testing.T) {
 	require.NoError(t, <-errCh)
 
 	// Verify the custom hostname was registered in the router.
-	resolved := s.router.Route("custom.example.com", "/")
+	resolved := s.registry.router.Route("custom.example.com", "/")
 	assert.Equal(t, client, resolved)
 }
 
@@ -2783,10 +2783,10 @@ func TestServer_HandleRegister_MultiTunnel_DistinctSubdomains(t *testing.T) {
 		CreatedAt: time.Now(),
 		LastSeen:  time.Now(),
 	}
-	s.clientLock.Lock()
-	s.clients[client.ID] = client
-	s.clientLock.Unlock()
-	_ = s.router.RegisterSubdomain("default", client)
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
+	_ = s.registry.router.RegisterSubdomain("default", client)
 
 	webReq := proto.NewRegisterRequest(3000, proto.ProtocolHTTP, "web", "", "")
 	webResp := doRegisterRequest(t, s, client, webReq)
@@ -2799,9 +2799,9 @@ func TestServer_HandleRegister_MultiTunnel_DistinctSubdomains(t *testing.T) {
 	require.True(t, apiResp.Success)
 
 	// Both subdomains should independently route to the same client.
-	assert.Equal(t, client, s.router.Route("web.localhost", "/"))
-	assert.Equal(t, client, s.router.Route("api.localhost", "/"))
-	assert.Equal(t, client, s.router.Route("default.localhost", "/"))
+	assert.Equal(t, client, s.registry.router.Route("web.localhost", "/"))
+	assert.Equal(t, client, s.registry.router.Route("api.localhost", "/"))
+	assert.Equal(t, client, s.registry.router.Route("default.localhost", "/"))
 
 	client.mu.Lock()
 	require.Len(t, client.Tunnels, 2)
@@ -2817,7 +2817,7 @@ func TestServer_HandleRegister_MultiTunnel_SubdomainConflict(t *testing.T) {
 	s := newTestServerForIntegration()
 
 	other := &ClientSession{ID: "other-client", Subdomain: "taken"}
-	_ = s.router.RegisterSubdomain("taken", other)
+	_ = s.registry.router.RegisterSubdomain("taken", other)
 
 	client := &ClientSession{
 		ID:        "conflicting-client",
@@ -2825,10 +2825,10 @@ func TestServer_HandleRegister_MultiTunnel_SubdomainConflict(t *testing.T) {
 		CreatedAt: time.Now(),
 		LastSeen:  time.Now(),
 	}
-	s.clientLock.Lock()
-	s.clients[client.ID] = client
-	s.clientLock.Unlock()
-	_ = s.router.RegisterSubdomain("default2", client)
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
+	_ = s.registry.router.RegisterSubdomain("default2", client)
 
 	req := proto.NewRegisterRequest(3000, proto.ProtocolHTTP, "taken", "", "")
 	resp := doRegisterRequest(t, s, client, req)
@@ -2837,7 +2837,7 @@ func TestServer_HandleRegister_MultiTunnel_SubdomainConflict(t *testing.T) {
 	assert.Contains(t, resp.Error, "taken")
 
 	// The conflicting subdomain must still resolve to the original owner.
-	assert.Equal(t, other, s.router.Route("taken.localhost", "/"))
+	assert.Equal(t, other, s.registry.router.Route("taken.localhost", "/"))
 }
 
 // TestServer_HandleClose_UnregistersTunnelSpecificRoutes verifies that
@@ -2852,18 +2852,18 @@ func TestServer_HandleClose_UnregistersTunnelSpecificRoutes(t *testing.T) {
 		CreatedAt: time.Now(),
 		LastSeen:  time.Now(),
 	}
-	s.clientLock.Lock()
-	s.clients[client.ID] = client
-	s.clientLock.Unlock()
-	_ = s.router.RegisterSubdomain("default3", client)
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
+	_ = s.registry.router.RegisterSubdomain("default3", client)
 
 	webResp := doRegisterRequest(t, s, client, proto.NewRegisterRequest(3000, proto.ProtocolHTTP, "web2", "", ""))
 	require.True(t, webResp.Success)
 	apiResp := doRegisterRequest(t, s, client, proto.NewRegisterRequest(8080, proto.ProtocolHTTP, "api2", "", ""))
 	require.True(t, apiResp.Success)
 
-	require.NotNil(t, s.router.Route("web2.localhost", "/"))
-	require.NotNil(t, s.router.Route("api2.localhost", "/"))
+	require.NotNil(t, s.registry.router.Route("web2.localhost", "/"))
+	require.NotNil(t, s.registry.router.Route("api2.localhost", "/"))
 
 	// Close the "web2" tunnel only.
 	clientMux, serverMux := newMuxPair(t)
@@ -2897,8 +2897,8 @@ func TestServer_HandleClose_UnregistersTunnelSpecificRoutes(t *testing.T) {
 	s.handleClose(client, stream, msg.CloseRequest)
 
 	// web2 route is gone, api2 route (the other tunnel) is untouched.
-	assert.Nil(t, s.router.Route("web2.localhost", "/"))
-	assert.Equal(t, client, s.router.Route("api2.localhost", "/"))
+	assert.Nil(t, s.registry.router.Route("web2.localhost", "/"))
+	assert.Equal(t, client, s.registry.router.Route("api2.localhost", "/"))
 }
 
 // --- P1-3: Quota Enforcement Tests ---
@@ -2924,9 +2924,9 @@ func TestServer_HandleClient_MaxClientsEnforced(t *testing.T) {
 	// Give server time to register client.
 	time.Sleep(100 * time.Millisecond)
 
-	s.clientLock.RLock()
-	count := len(s.clients)
-	s.clientLock.RUnlock()
+	s.registry.clientLock.RLock()
+	count := len(s.registry.clients)
+	s.registry.clientLock.RUnlock()
 	assert.Equal(t, 1, count)
 
 	// Second client should be rejected — server at capacity.
@@ -2946,18 +2946,18 @@ func TestServer_HandleClient_MaxClientsEnforced(t *testing.T) {
 	<-done2
 
 	// First client still registered.
-	s.clientLock.RLock()
-	count = len(s.clients)
-	s.clientLock.RUnlock()
+	s.registry.clientLock.RLock()
+	count = len(s.registry.clients)
+	s.registry.clientLock.RUnlock()
 	assert.Equal(t, 1, count)
 
 	// Disconnect first client and verify slot freed.
 	_ = clientMux1.Close()
 	<-done1
 
-	s.clientLock.RLock()
-	count = len(s.clients)
-	s.clientLock.RUnlock()
+	s.registry.clientLock.RLock()
+	count = len(s.registry.clients)
+	s.registry.clientLock.RUnlock()
 	assert.Equal(t, 0, count)
 }
 
@@ -2989,9 +2989,9 @@ func TestServer_HandleClient_MaxClientsZeroUnlimited(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	s.clientLock.RLock()
-	count := len(s.clients)
-	s.clientLock.RUnlock()
+	s.registry.clientLock.RLock()
+	count := len(s.registry.clients)
+	s.registry.clientLock.RUnlock()
 	assert.Equal(t, 3, count)
 
 	// Clean up.
@@ -3025,9 +3025,9 @@ func TestServer_HandleClient_DisconnectFreesSlot(t *testing.T) {
 	_ = clientMux1.Close()
 	<-done1
 
-	s.clientLock.RLock()
-	count := len(s.clients)
-	s.clientLock.RUnlock()
+	s.registry.clientLock.RLock()
+	count := len(s.registry.clients)
+	s.registry.clientLock.RUnlock()
 	assert.Equal(t, 0, count)
 
 	// Second client should now connect successfully.
@@ -3043,9 +3043,9 @@ func TestServer_HandleClient_DisconnectFreesSlot(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	s.clientLock.RLock()
-	count = len(s.clients)
-	s.clientLock.RUnlock()
+	s.registry.clientLock.RLock()
+	count = len(s.registry.clients)
+	s.registry.clientLock.RUnlock()
 	assert.Equal(t, 1, count)
 
 	_ = clientMux2.Close()
@@ -3067,10 +3067,10 @@ func TestServer_HandleRegister_MaxTunnelsPerClient(t *testing.T) {
 		CreatedAt: time.Now(),
 		LastSeen:  time.Now(),
 	}
-	s.clientLock.Lock()
-	s.clients[client.ID] = client
-	s.clientLock.Unlock()
-	_ = s.router.RegisterSubdomain("quotaapp", client)
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
+	_ = s.registry.router.RegisterSubdomain("quotaapp", client)
 
 	// Register the first tunnel — should succeed.
 	errCh1 := make(chan error, 1)
@@ -3216,10 +3216,10 @@ func TestServer_HandleRegister_MaxTunnelsZeroUnlimited(t *testing.T) {
 		CreatedAt: time.Now(),
 		LastSeen:  time.Now(),
 	}
-	s.clientLock.Lock()
-	s.clients[client.ID] = client
-	s.clientLock.Unlock()
-	_ = s.router.RegisterSubdomain("unlimitedapp", client)
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
+	_ = s.registry.router.RegisterSubdomain("unlimitedapp", client)
 
 	// Register 3 tunnels — all should succeed.
 	for i := 0; i < 3; i++ {
@@ -3312,9 +3312,9 @@ func TestServer_HandleStats(t *testing.T) {
 			{ID: "t2", LocalPort: 9090, Protocol: proto.ProtocolTCP, CreatedAt: time.Now()},
 		},
 	}
-	s.clientLock.Lock()
-	s.clients[client.ID] = client
-	s.clientLock.Unlock()
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
 
 	// Client sends a StatsRequest.
 	errCh := make(chan error, 1)
@@ -3406,9 +3406,9 @@ func TestServer_HandleClose_Success(t *testing.T) {
 			{ID: "tunnel-to-keep", LocalPort: 9090, Protocol: proto.ProtocolHTTP, PublicURL: "http://closeapp2.example.com", CreatedAt: time.Now()},
 		},
 	}
-	s.clientLock.Lock()
-	s.clients[client.ID] = client
-	s.clientLock.Unlock()
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
 
 	// Set initial tunnel count.
 	atomic.StoreUint64(&s.stats.ActiveTunnels, 2)
@@ -3503,9 +3503,9 @@ func TestServer_HandleClose_RBAC_ViewerRejected(t *testing.T) {
 			{ID: "tunnel-to-close", LocalPort: 8080, Protocol: proto.ProtocolHTTP, PublicURL: "http://closeapp.example.com", CreatedAt: time.Now()},
 		},
 	}
-	s.clientLock.Lock()
-	s.clients[client.ID] = client
-	s.clientLock.Unlock()
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -3588,9 +3588,9 @@ func TestServer_HandleClose_TunnelNotFound(t *testing.T) {
 			{ID: "existing-tunnel", LocalPort: 8080, Protocol: proto.ProtocolHTTP, CreatedAt: time.Now()},
 		},
 	}
-	s.clientLock.Lock()
-	s.clients[client.ID] = client
-	s.clientLock.Unlock()
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
 
 	// Client sends a CloseRequest for a non-existent tunnel.
 	errCh := make(chan error, 1)
@@ -3751,9 +3751,9 @@ func TestServer_HandleClientStream_StatsAndClose(t *testing.T) {
 			{ID: "disp-t1", LocalPort: 8080, Protocol: proto.ProtocolHTTP, CreatedAt: time.Now()},
 		},
 	}
-	s.clientLock.Lock()
-	s.clients[client.ID] = client
-	s.clientLock.Unlock()
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
 
 	atomic.StoreUint64(&s.stats.ActiveTunnels, 1)
 
@@ -3915,7 +3915,7 @@ func TestServer_Shutdown_DrainsInFlightHTTPRequest(t *testing.T) {
 		CreatedAt: time.Now(),
 		LastSeen:  time.Now(),
 	}
-	require.NoError(t, s.router.RegisterSubdomain("slowapp", session))
+	require.NoError(t, s.registry.router.RegisterSubdomain("slowapp", session))
 
 	const backendDelay = 400 * time.Millisecond
 	clientDone := make(chan struct{})

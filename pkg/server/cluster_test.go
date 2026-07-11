@@ -27,15 +27,9 @@ func newClusterTestServer(nodeID, nodeAddr string, store StateStore) *Server {
 	config.ClusterNodeID = nodeID
 	config.ClusterNodeAddr = nodeAddr
 
-	s := &Server{
-		config:  config,
-		clients: make(map[string]*ClientSession),
-		closeCh: make(chan struct{}),
-		stats:   Stats{StartTime: time.Now()},
-	}
-	s.router = NewRouter(config.Domain)
-	s.portAllocator = NewTCPPortAllocator(10000, 10100)
-	s.stateStore = store
+	s := NewServer(config)
+	s.stats.StartTime = time.Now()
+	s.registry.stateStore = store
 	return s
 }
 
@@ -144,23 +138,24 @@ func TestCrossNodeRouting_HTTP(t *testing.T) {
 	storeA, storeB := newSharedRedisStateStores(t)
 
 	serverA := newClusterTestServer("node-a", "", storeA)
-	handlerA := NewHTTPHandler(serverA.router, serverA)
+	handlerA := newProxyService(serverA.registry.router, serverA.registry, serverA.config, serverA.metrics, &serverA.stats, serverA.serverCtx)
 
 	backend := newTunnelBackend(t, "session-1", "myapp", "hello from node A")
-	require.NoError(t, serverA.router.RegisterSubdomain("myapp", backend.session))
+	require.NoError(t, serverA.registry.router.RegisterSubdomain("myapp", backend.session))
 
 	// Node A's real HTTP listener — proxyToNode dials this address.
 	tsA := httptest.NewServer(handlerA)
 	defer tsA.Close()
 	serverA.config.ClusterNodeAddr = strings.TrimPrefix(tsA.URL, "http://")
+	serverA.registry.cfg.ClusterNodeAddr = serverA.config.ClusterNodeAddr
 
-	ok, err := serverA.registerClusterRoute(backend.session, RouteEntry{ClientID: backend.session.ID, Subdomain: "myapp"})
+	ok, err := serverA.registry.registerClusterRoute(backend.session, RouteEntry{ClientID: backend.session.ID, Subdomain: "myapp"})
 	require.NoError(t, err)
 	require.True(t, ok)
 
 	// Node B: no local client for "myapp" at all.
 	serverB := newClusterTestServer("node-b", "", storeB)
-	handlerB := NewHTTPHandler(serverB.router, serverB)
+	handlerB := newProxyService(serverB.registry.router, serverB.registry, serverB.config, serverB.metrics, &serverB.stats, serverB.serverCtx)
 
 	req := httptest.NewRequest(http.MethodGet, "/test-path", nil)
 	req.Host = "myapp.test.example.com"
@@ -182,23 +177,24 @@ func TestCrossNodeRouting_Hostname(t *testing.T) {
 	storeA, storeB := newSharedRedisStateStores(t)
 
 	serverA := newClusterTestServer("node-a", "", storeA)
-	handlerA := NewHTTPHandler(serverA.router, serverA)
+	handlerA := newProxyService(serverA.registry.router, serverA.registry, serverA.config, serverA.metrics, &serverA.stats, serverA.serverCtx)
 
 	backend := newTunnelBackend(t, "session-1", "", "hello via custom hostname")
-	require.NoError(t, serverA.router.RegisterHostname("app.customer.com", backend.session))
+	require.NoError(t, serverA.registry.router.RegisterHostname("app.customer.com", backend.session))
 
 	tsA := httptest.NewServer(handlerA)
 	defer tsA.Close()
 	serverA.config.ClusterNodeAddr = strings.TrimPrefix(tsA.URL, "http://")
+	serverA.registry.cfg.ClusterNodeAddr = serverA.config.ClusterNodeAddr
 
-	ok, err := serverA.registerClusterRoute(backend.session, RouteEntry{
+	ok, err := serverA.registry.registerClusterRoute(backend.session, RouteEntry{
 		RouteID: "tunnel-1:host", ClientID: backend.session.ID, Hostname: "app.customer.com",
 	})
 	require.NoError(t, err)
 	require.True(t, ok)
 
 	serverB := newClusterTestServer("node-b", "", storeB)
-	handlerB := NewHTTPHandler(serverB.router, serverB)
+	handlerB := newProxyService(serverB.registry.router, serverB.registry, serverB.config, serverB.metrics, &serverB.stats, serverB.serverCtx)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Host = "app.customer.com"
@@ -216,7 +212,7 @@ func TestCrossNodeRouting_Hostname(t *testing.T) {
 func TestCrossNodeRouting_ClusterSecretRejectsForgedPeer(t *testing.T) {
 	serverB := newClusterTestServer("node-b", "", nil)
 	serverB.config.ClusterSecret = "correct-secret"
-	handlerB := NewHTTPHandler(serverB.router, serverB)
+	handlerB := newProxyService(serverB.registry.router, serverB.registry, serverB.config, serverB.metrics, &serverB.stats, serverB.serverCtx)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Host = "myapp.test.example.com"
@@ -235,7 +231,7 @@ func TestCrossNodeRouting_ClusterSecretRejectsForgedPeer(t *testing.T) {
 func TestCrossNodeRouting_ClusterSecretAllowsGenuinePeer(t *testing.T) {
 	serverB := newClusterTestServer("node-b", "", nil)
 	serverB.config.ClusterSecret = "correct-secret"
-	handlerB := NewHTTPHandler(serverB.router, serverB)
+	handlerB := newProxyService(serverB.registry.router, serverB.registry, serverB.config, serverB.metrics, &serverB.stats, serverB.serverCtx)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Host = "myapp.test.example.com"
@@ -256,22 +252,22 @@ func TestServer_RefreshClusterRoutes(t *testing.T) {
 	serverA := newClusterTestServer("node-a", "node-a:7000", storeA)
 
 	backend := newTunnelBackend(t, "session-1", "myapp", "irrelevant")
-	require.NoError(t, serverA.router.RegisterSubdomain("myapp", backend.session))
+	require.NoError(t, serverA.registry.router.RegisterSubdomain("myapp", backend.session))
 
-	ok, err := serverA.registerClusterRoute(backend.session, RouteEntry{ClientID: backend.session.ID, Subdomain: "myapp"})
+	ok, err := serverA.registry.registerClusterRoute(backend.session, RouteEntry{ClientID: backend.session.ID, Subdomain: "myapp"})
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	serverA.clientLock.Lock()
-	serverA.clients[backend.session.ID] = backend.session
-	serverA.clientLock.Unlock()
+	serverA.registry.clientLock.Lock()
+	serverA.registry.clients[backend.session.ID] = backend.session
+	serverA.registry.clientLock.Unlock()
 
 	// Simulate the entry being close to expiry, then refresh and verify
 	// it's still resolvable (a real TTL check would require manipulating
 	// miniredis's clock; here we just verify the refresh call itself
 	// doesn't error and the route remains lookupable — the TTL mechanics
 	// are covered directly in state_redis_test.go).
-	serverA.refreshClusterRoutes()
+	serverA.registry.refreshClusterRoutes()
 
 	entry, err := storeA.LookupBySubdomain("myapp")
 	require.NoError(t, err)
@@ -295,7 +291,7 @@ func TestServer_RegisterClientRoute_ReclaimsStaleLocalSession(t *testing.T) {
 	newSession := &ClientSession{ID: "new-session", Subdomain: "myapp", CreatedAt: time.Now(), LastSeen: time.Now()}
 	assert.True(t, s.registerClientRoute(newSession, "127.0.0.1"), "reconnect should reclaim the stale subdomain")
 
-	assert.Same(t, newSession, s.router.LookupSubdomain("myapp"))
+	assert.Same(t, newSession, s.registry.router.LookupSubdomain("myapp"))
 }
 
 // TestServer_RegisterClientRoute_RejectsLiveConflict is
@@ -309,5 +305,5 @@ func TestServer_RegisterClientRoute_RejectsLiveConflict(t *testing.T) {
 
 	newSession := &ClientSession{ID: "new-session", Subdomain: "myapp", CreatedAt: time.Now(), LastSeen: time.Now()}
 	assert.False(t, s.registerClientRoute(newSession, "127.0.0.1"))
-	assert.Same(t, liveBackend.session, s.router.LookupSubdomain("myapp"))
+	assert.Same(t, liveBackend.session, s.registry.router.LookupSubdomain("myapp"))
 }

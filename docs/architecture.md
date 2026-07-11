@@ -23,6 +23,7 @@
 - [Robustness & Protocol Hardening (P3-6 Batch A)](#robustness--protocol-hardening-p3-6-batch-a)
 - [Hot-Path Allocation Pooling (P3-6 Batch B)](#hot-path-allocation-pooling-p3-6-batch-b)
 - [Context Propagation (P3-6 Batch C)](#context-propagation-p3-6-batch-c)
+- [God-Object Decomposition, Server Side (P3-6 Batch D)](#god-object-decomposition-server-side-p3-6-batch-d)
 - [Data Flow Summary](#data-flow-summary)
 
 ---
@@ -93,14 +94,16 @@ Wormhole is a Client-Server architecture tunneling tool. The core idea is:
 
 | Component | Location | Responsibility |
 |-----------|----------|----------------|
-| `Server` | `pkg/server/server.go` | Core controller; manages client sessions, coordinates all components |
-| `HTTPHandler` | `pkg/server/handler.go` | HTTP reverse proxy; forwards requests through tunnel; cross-node proxy fallback |
+| `Server` | `pkg/server/server.go` | Composition root; wires up `TunnelRegistry`/`ProxyService`/`P2PBroker` and owns the listener lifecycle (P3-6 batch D) |
+| `TunnelRegistry` | `pkg/server/tunnel_registry.go` | Client session lifecycle; local + cluster routing (subdomain/hostname/path); TCP port allocation; cluster heartbeat and state-store health |
+| `ProxyService` | `pkg/server/proxy_service.go` | HTTP/WebSocket/TCP data-plane forwarding (`http.Handler`); concurrent-stream budget (global + per-client); cross-node proxy fallback. Replaces the former `HTTPHandler` |
+| `P2PBroker` | `pkg/server/p2p_broker.go` | `wormhole connect` signaling: offer matching, NAT-compatibility checks, port-prediction candidates |
 | `Router` | `pkg/server/router.go` | Host/Path routing table; subdomain, custom domains, path prefixes |
 | `TLSManager` | `pkg/server/tls.go` | TLS termination; Let's Encrypt auto-certs and manual certificates |
 | `AdminAPI` | `pkg/server/admin.go` | RESTful admin API including `/audit` and `/audit/export` |
-| `TCPPortAllocator` | `pkg/server/handler.go` | Allocates ports for TCP tunnels |
+| `TCPPortAllocator` | `pkg/server/tunnel_registry.go` | Allocates ports for TCP tunnels |
 | `StateStore` | `pkg/server/state*.go` | Cluster shared state (subdomain/hostname/path routes + nodes); Memory or Redis backend |
-| Cluster heartbeat | `pkg/server/cluster.go` | Periodic heartbeat + route TTL refresh, dead-node eviction, cross-node HTTP proxying, shared-secret verification |
+| Cluster heartbeat | `pkg/server/tunnel_registry.go` | Periodic heartbeat + route TTL refresh, dead-node eviction, cross-node HTTP proxying, shared-secret verification |
 
 ### Client-Side Components
 
@@ -378,7 +381,7 @@ This is the most critical data flow — how external HTTP requests reach the loc
 
 ### Key Details
 
-1. **Server side** (`handler.go: forwardHTTP`):
+1. **Server side** (`proxy_service.go: forwardHTTP`):
    - Serializes the complete raw HTTP request (headers + body) to the Stream via `r.Write(stream)`
    - Reads the raw HTTP response from the Stream: `http.ReadResponse(bufio.NewReader(stream), r)`
    - Adds `X-Wormhole-Tunnel` and `X-Wormhole-Duration` response headers
@@ -395,7 +398,7 @@ This is the most critical data flow — how external HTTP requests reach the loc
    - HTTP parse fails → falls back to `forwardRawTCP` (with buffer reassembly)
    - Local service unreachable → returns 502 Bad Gateway
 
-4. **Multi-tunnel dispatch** (`handler.go: resolveTunnelID` / `client.go: resolveLocalAddr`):
+4. **Multi-tunnel dispatch** (`proxy_service.go: resolveTunnelID` / `client.go: resolveLocalAddr`):
    - Step 1 (`Route(Host)`) only resolves the request down to a `ClientSession` — a single client connection may have **multiple** registered tunnels (multi-tunnel YAML config), each with its own local backend.
    - The server's `resolveTunnelID(client, host, path)` disambiguates which of the client's tunnels the request is actually for, matching in priority order: custom hostname → per-tunnel subdomain → longest path-prefix. The result populates `StreamRequest.TunnelID`.
    - The client's `resolveLocalAddr(tunnelID)` looks up that `TunnelID` in its `activeTunnels` map to find the tunnel-specific `LocalHost`/`LocalPort`, falling back to the top-level client config only when `TunnelID` is empty or unrecognized (single-tunnel backward compatibility).
@@ -403,7 +406,7 @@ This is the most critical data flow — how external HTTP requests reach the loc
 
 ### WebSocket Proxy
 
-WebSocket upgrade requests are handled specially (`handler.go: handleWebSocket`):
+WebSocket upgrade requests are handled specially (`proxy_service.go: handleWebSocket`):
 
 1. Server hijacks the underlying connection via `http.Hijacker`
 2. The raw upgrade request is written to the Stream
@@ -1184,14 +1187,16 @@ Redis key schema:
 
 ### Route TTL Refresh (H1)
 
-A route registered once and never touched again would silently expire out of Redis after 5 minutes even though the client is still connected — the single most damaging HA gap found in the v0.6 review. `ClientSession.clusterRoutes` tracks every `RouteEntry` a session has registered cluster-wide (its primary subdomain, plus any extra subdomains/hostnames/path prefixes from `registerTunnelRoutes`), and `startClusterHeartbeat`'s 30s tick calls `refreshClusterRoutes` to re-run `RegisterRoute` for all of them — a `pipeline`-friendly batch that's functionally an `EXPIRE`/TTL-refresh rather than a fresh reservation, since the entry already belongs to this client.
+A route registered once and never touched again would silently expire out of Redis after 5 minutes even though the client is still connected — the single most damaging HA gap found in the v0.6 review. `ClientSession.clusterRoutes` tracks every `RouteEntry` a session has registered cluster-wide (its primary subdomain, plus any extra subdomains/hostnames/path prefixes from `RegisterTunnel`), and `TunnelRegistry.StartHeartbeat`'s 30s tick calls `refreshClusterRoutes` to re-run `RegisterRoute` for all of them — a `pipeline`-friendly batch that's functionally an `EXPIRE`/TTL-refresh rather than a fresh reservation, since the entry already belongs to this client.
 
-### Cluster Heartbeat (`pkg/server/cluster.go`)
+### Cluster Heartbeat (`pkg/server/tunnel_registry.go`)
+
+As of P3-6 batch D, cluster bookkeeping (heartbeat, routing, port allocation) lives entirely in `TunnelRegistry`, one of the three components `Server` composes (see [Component Architecture](#component-architecture)); it no longer touches `Server`'s fields directly.
 
 ```
-startClusterHeartbeat(ctx)
+TunnelRegistry.StartHeartbeat(ctx)
   ├── tick every 30s → NodeHeartbeat(NodeInfo{NodeID, NodeAddr})
-  │                     sendHeartbeat tracks StateStore reachability → Server.stateStoreHealthy (H9)
+  │                     sendHeartbeat tracks StateStore reachability → tunnelRegistry.stateStoreHealthy (H9)
   ├── tick every 30s → refreshClusterRoutes(client) for every connected session (H1)
   └── tick every 60s → EvictDeadNodes(90s threshold)
                            └── MemoryStateStore: scan + delete dead nodes + owned routes
@@ -1201,15 +1206,16 @@ startClusterHeartbeat(ctx)
 ### Cross-Node HTTP Routing
 
 ```
-HTTPHandler.ServeHTTP(r)
+ProxyService.ServeHTTP(r)
   ├── verifyClusterSecret(r) → reject if --cluster-secret set and header missing/mismatched (S1)
   ├── router.Route(host, path) → local ClientSession?
   │     └── Yes → forwardHTTP / handleWebSocket (normal path)
-  └── No → server.lookupRemoteRoute(host, path, subdomain)   [hostname → longest path-prefix → subdomain]
+  └── No → registry.ResolveRemote(host, path)   [hostname → longest path-prefix → subdomain]
               └── found remote RouteEntry?
-                    ├── isLocalNode? → continue to 404 (stale entry)
+                    ├── registry.IsLocalNode? → continue to 404 (stale entry)
                     └── No  → proxyToNode(route.NodeAddr, w, r)
                                   └── attach X-Wormhole-Cluster-Secret header (S1)
+                                  └── validateClusterNodeAddr rejects anything but a bare host:port
                                   └── httputil.ReverseProxy → target node
 ```
 
@@ -1217,13 +1223,13 @@ Hostname and path-prefix routes are indexed into Redis exactly like subdomains (
 
 **Node identity (H4)**: `applyClusterNodeIDDefault` defaults `Config.ClusterNodeID` to `os.Hostname()` whenever a cluster backend is configured but no explicit ID was given, so two nodes never accidentally share an empty NodeID.
 
-**Stale ownership reclaim (H10)**: `router.go`'s `RegisterSubdomain`/`RegisterHostname`/`RegisterPath` check `isStaleOwner` (the existing owner's `Mux.IsClosed()`) before returning a conflict; `registerClientRoute` mirrors this on the cluster side, proactively unregistering the dead session's `StateStore` entries. A client that reconnects after a network blip gets its subdomain/hostname/path back immediately instead of a transient conflict error.
+**Stale ownership reclaim (H10)**: `router.go`'s `RegisterSubdomain`/`RegisterHostname`/`RegisterPath` check `isStaleOwner` (the existing owner's `Mux.IsClosed()`) before returning a conflict; `TunnelRegistry.registerClientRoute` mirrors this on the cluster side, proactively unregistering the dead session's `StateStore` entries. A client that reconnects after a network blip gets its subdomain/hostname/path back immediately instead of a transient conflict error.
 
-**Health surfacing (H9)**: `GET /health` includes `cluster: {node_id, state_store_healthy}`; if the state store becomes unreachable, overall `status` flips from `"ok"` to `"degraded"` so monitoring picks it up without needing a separate Redis probe.
+**Health surfacing (H9)**: `GET /health` includes `cluster: {node_id, state_store_healthy}` (sourced from `TunnelRegistry.StateStoreHealth()`); if the state store becomes unreachable, overall `status` flips from `"ok"` to `"degraded"` so monitoring picks it up without needing a separate Redis probe.
 
 ### Inter-Node Authentication (S1)
 
-`--cluster-secret` is a shared secret across all nodes in a cluster. `proxyToNode` attaches it as `X-Wormhole-Cluster-Secret` on every proxied request; `verifyClusterSecret` (called first in `HTTPHandler.ServeHTTP`) rejects requests where the header is missing or doesn't match, and strips the header before continuing so it's never forwarded to the local tunnel client. Without a configured secret, no check is performed (backward-compatible with pre-S1 single-node/unsecured deployments) — operators running a real cluster should always set it, since without it a network peer could forge `X-Wormhole-*` proxy headers.
+`--cluster-secret` is a shared secret across all nodes in a cluster. `proxyToNode` (`pkg/server/proxy_service.go`) attaches it as `X-Wormhole-Cluster-Secret` on every proxied request; `verifyClusterSecret` (called first in `ProxyService.ServeHTTP`) rejects requests where the header is missing or doesn't match, and strips the header before continuing so it's never forwarded to the local tunnel client. Without a configured secret, no check is performed (backward-compatible with pre-S1 single-node/unsecured deployments) — operators running a real cluster should always set it, since without it a network peer could forge `X-Wormhole-*` proxy headers.
 
 ### Shared Auth/Revocation State (H5)
 
@@ -1313,7 +1319,7 @@ Every bidirectional proxy loop previously called plain `io.Copy`, which allocate
 
 `copyWithPooledBuffer(dst, src)` is a drop-in `io.Copy` replacement that borrows its scratch buffer from a package-level `copyBufPool` (one in `pkg/server`, one in `pkg/client` — different packages, so separate pools) and returns it afterward via `io.CopyBuffer`. It replaced every forwarding `io.Copy` call:
 
-- **Server** (`pkg/server/handler.go`): the HTTP response body copy in `forwardHTTP`, and both directions of the WebSocket proxy in `handleWebSocket`.
+- **Server** (`pkg/server/proxy_service.go`): the HTTP response body copy in `forwardHTTP`, and both directions of the WebSocket proxy in `handleWebSocket`.
 - **Server** (`pkg/server/server.go`): `handleTCPConnection`'s manual Read/Write loops now pull their per-goroutine buffer from the same `copyBufPool` instead of a local `make([]byte, 32*1024)` — this one already reused a single buffer for the connection's lifetime rather than allocating per-iteration, but pooling it still bounds total memory under many concurrent TCP tunnels instead of `2 × 32KB × MaxConcurrentStreams` all being live simultaneously.
 - **Client** (`pkg/client/client.go`): both directions of `dialAndProxy` (relay-mode HTTP/TCP forwarding) and `proxyConnectConn` (`wormhole connect`'s direct P2P data path).
 
@@ -1370,6 +1376,52 @@ None of these change behavior during normal operation — `s.serverCtx()` behave
 `authenticateClient`'s read of the incoming `AuthRequest` now calls `stream.ReadContext(ctx, buf)` using the same `ctx` derived from `s.serverCtx()` above, chaining DP-05 and DP-06 together for the one call site the review specifically called out: `TestServer_AuthenticateClient_ServerCtxCancelUnblocks` sets `AuthTimeout` to 30s, cancels the server's root context while the handshake is blocked waiting for the client's `AuthRequest`, and asserts the call returns `context.Canceled` within milliseconds rather than the full 30 seconds.
 
 Once `ReadContext`/`WriteContext` existed, `golangci-lint`'s `contextcheck` analyzer flagged the same pattern in 14 places across `pkg/client/client.go` — every control-plane RPC (`authenticate`, `registerTunnel`, `registerOneTunnel`, `sendPing`, `sendP2POffer`, `sendP2PResult`, `RequestStats`, `CloseTunnel`) already received a `ctx` parameter but still called the plain `Read`/`Write`. These are the client-side mirror of the same DP-06 gap — a canceled `ctx` (e.g. from `Client.Close()` or a caller-supplied deadline) couldn't interrupt an in-flight control RPC any more than it could on the server. All 14 were switched to the `*Context` variants using the `ctx` already in scope.
+
+---
+
+## God-Object Decomposition, Server Side (P3-6 Batch D)
+
+The fourth and riskiest P3-6 sub-batch addresses the data-plane review's finding that `Server` had accreted roughly 15 distinct responsibilities into one ~2,200-line struct (routing, client-session bookkeeping, TCP port allocation, cluster heartbeat, HTTP/WebSocket/TCP forwarding, stream-budget accounting, and P2P signaling all lived on the same receiver). Given the risk, this sub-batch is itself split into two checkpoints verified independently: the server side (this section) and a follow-up client side (`RelayClient`/`P2PSession`, not yet started).
+
+### Three New Components
+
+`Server` is now a composition root: `NewServer` constructs three independent components and wires them together, but no longer owns their state directly.
+
+```
+NewServer(config)
+  ├── registry := newTunnelRegistry(config)                                    // TunnelRegistry
+  ├── metrics, auditLogger, authenticator, rateLimiter, tlsManager, adminAPI    // unchanged
+  ├── proxy  := newProxyService(registry.router, registry, config, metrics,
+  │                             &stats, server.serverCtx)                       // ProxyService
+  └── broker := newP2PBroker(registry, metrics, auditLogger, server.serverCtx)  // P2PBroker
+```
+
+| Component | File | Owns |
+|-----------|------|------|
+| `TunnelRegistry` | `pkg/server/tunnel_registry.go` | `*Router`, the `clients` map + its lock, `TCPPortAllocator`, `StateStore` + its health flag, and the cluster-heartbeat goroutine |
+| `ProxyService` | `pkg/server/proxy_service.go` | HTTP/WebSocket/TCP forwarding (implements `http.Handler`), the global/per-client concurrent-stream budget (DP-03/27), and the pooled-buffer copy helpers (DP-11) |
+| `P2PBroker` | `pkg/server/p2p_broker.go` | `wormhole connect` offer/result handling, NAT-compatibility checks, port-prediction candidate generation |
+
+Each component takes its dependencies as explicit constructor parameters (`Config`, the other components it needs to call into, `*Metrics`, `*Stats`, a `serverCtx func() context.Context`) rather than reaching into a shared `*Server`. `ProxyService` and `P2PBroker` depend on `TunnelRegistry` through its `TunnelRegistry` interface, not the concrete struct — the interface is intentionally small (consumer-side interfaces, one of the review's Go-idioms recommendations) and only exposes what a forwarding/signaling caller actually needs (`ResolveLocal`, `ResolveRemote`, `IsLocalNode`, `FindPeerBySubdomain`, `AllocatePort`, ...), not the registry's full internal surface.
+
+`admin.go`'s `/health`, `/stats`, `/clients`, and `/tunnels` handlers were updated the same way: they now call `registry.StateStoreHealth()`, `registry.AllocatedPorts()`, `registry.ActiveRoutes()`, and `registry.Snapshot()` instead of reaching past `Server` into its former `stateStoreHealthy`/`portAllocator`/`router`/`clients`+`clientLock` fields directly — a concrete illustration of what the decomposition buys: the admin API's read path no longer needs to know `Server`'s internal locking scheme at all.
+
+The former `handler.go` (mostly `HTTPHandler` methods) and `cluster.go` (heartbeat/routing helpers) are deleted; their contents were absorbed into `proxy_service.go` and `tunnel_registry.go` respectively rather than kept as separate files, since nothing outside those two components calls into them anymore.
+
+### Incidental Hardening: `validateClusterNodeAddr`
+
+While moving `proxyToNode` into `proxy_service.go`, consolidating it into the same file as `ServeHTTP` made an existing gosec SSRF finding (G704) newly reachable by the linter's taint analysis (the cross-file split previously happened to keep it from connecting `route.NodeAddr` to `httputil.NewSingleHostReverseProxy` in one pass). Investigating gosec's own source (`analyzers/ssrf.go`) confirmed G704 registers **no sanitizers at all** — no amount of validation code can make the finding disappear on its own, by the tool's own design. Rather than default to a bare `#nosec`, `proxyToNode` first calls `validateClusterNodeAddr`, which rejects anything that isn't a clean `host:port` pair (via `net.SplitHostPort` plus a character-class check on the host) before the proxy target is ever built from validated components (`net.JoinHostPort`), not the raw string. This is genuine defense in depth — it stops a corrupted or tampered `StateStore` entry from smuggling a scheme, userinfo, path, or query component into the outbound request — and the line-scoped `#nosec G704` comment that remains documents *why* the suppression is unavoidable rather than just silencing the tool.
+
+### Test Fallout: Two Real Bugs Found by the Refactor
+
+Updating the test suite's server constructors to go through `NewServer(config)` (for production-parity wiring) instead of hand-built `&Server{...}` literals surfaced two genuine bugs that the previous, more tightly-coupled test setup had been masking:
+
+1. **Stale config snapshot in cross-node routing tests**: `TunnelRegistry` captures `Config` by value at construction time. A cluster test that mutated `serverA.config.ClusterNodeAddr` *after* constructing the server (to point at an `httptest.Server` whose address isn't known until it starts listening) no longer propagated to `registry.cfg.ClusterNodeAddr`, so routes registered afterward carried an empty `NodeAddr` and cross-node requests 404'd. Production code never mutates `ClusterNodeAddr` after startup, so this is a test-only fix (explicitly re-syncing `registry.cfg.ClusterNodeAddr` after the address becomes known), not a product bug — but it's a direct consequence of the decomposition worth documenting for anyone touching cluster tests later.
+2. **Double-counted stream budget in saturation tests**: Two stream-limit tests constructed a *second*, independent `proxyService` (via `newProxyService(...)`) to be the object under test, but then called `tryAcquireStreamSlot` on the original server's `server.proxy` to "occupy" the budget — two different counters, so the occupied slot never showed up to the handler being exercised, and the test's saturation assertion dereferenced a nil release func. Fixed by acquiring the slot on the same `proxyService` instance the test actually calls `ServeHTTP` on.
+
+### Verification
+
+`go build ./...`, `go vet ./...`, `golangci-lint run ./...` (0 issues), `gosec -exclude=G115 -exclude-dir=web -exclude-dir=pkg/proto/pb ./...` (0 issues, matching CI's exact invocation), and `go test -race ./...` all pass; `pkg/server` coverage held at 78.0%, essentially unchanged from before the split.
 
 ---
 

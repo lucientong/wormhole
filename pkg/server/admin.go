@@ -167,7 +167,7 @@ func (a *AdminAPI) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 	// H9: surface cluster state-store connectivity instead of leaving
 	// operators to infer a Redis outage purely from log lines.
-	if configured, healthy := a.server.stateStoreHealth(); configured {
+	if configured, healthy := a.server.registry.StateStoreHealth(); configured {
 		resp.Cluster = &ClusterHealth{
 			NodeID:            a.server.config.ClusterNodeID,
 			StateStoreHealthy: healthy,
@@ -184,15 +184,8 @@ func (a *AdminAPI) handleHealth(w http.ResponseWriter, _ *http.Request) {
 func (a *AdminAPI) handleStats(w http.ResponseWriter, _ *http.Request) {
 	stats := a.server.getStats()
 
-	allocatedPorts := 0
-	if a.server.portAllocator != nil {
-		allocatedPorts = a.server.portAllocator.AllocatedPorts()
-	}
-
-	activeRoutes := 0
-	if a.server.router != nil {
-		activeRoutes = a.server.router.ActiveRoutes()
-	}
+	allocatedPorts := a.server.registry.AllocatedPorts()
+	activeRoutes := a.server.registry.ActiveRoutes()
 
 	resp := StatsResponse{
 		ActiveClients:       stats.ActiveClients,
@@ -217,11 +210,10 @@ func (a *AdminAPI) handleStats(w http.ResponseWriter, _ *http.Request) {
 
 // handleClients returns the list of connected clients.
 func (a *AdminAPI) handleClients(w http.ResponseWriter, _ *http.Request) {
-	a.server.clientLock.RLock()
-	defer a.server.clientLock.RUnlock()
+	sessions := a.server.registry.Snapshot()
 
-	clients := make([]ClientInfo, 0, len(a.server.clients))
-	for _, client := range a.server.clients {
+	clients := make([]ClientInfo, 0, len(sessions))
+	for _, client := range sessions {
 		client.mu.Lock()
 		tunnels := make([]TunnelJSON, 0, len(client.Tunnels))
 		for _, t := range client.Tunnels {
@@ -256,11 +248,8 @@ func (a *AdminAPI) handleClients(w http.ResponseWriter, _ *http.Request) {
 
 // handleTunnels returns all active tunnels across all clients.
 func (a *AdminAPI) handleTunnels(w http.ResponseWriter, _ *http.Request) {
-	a.server.clientLock.RLock()
-	defer a.server.clientLock.RUnlock()
-
 	var tunnels []map[string]interface{}
-	for _, client := range a.server.clients {
+	for _, client := range a.server.registry.Snapshot() {
 		client.mu.Lock()
 		for _, t := range client.Tunnels {
 			tunnels = append(tunnels, map[string]interface{}{

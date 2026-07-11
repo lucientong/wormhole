@@ -185,7 +185,7 @@ func (r *Router) Route(host, path string) *ClientSession {
 
 // SubdomainURL returns the public URL for a subdomain.
 func (r *Router) SubdomainURL(subdomain string, useTLS bool) string {
-	scheme := "http"
+	scheme := schemeHTTP
 	if useTLS {
 		scheme = "https"
 	}
