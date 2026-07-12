@@ -104,7 +104,7 @@ func TestFull_ContainsAllFields(t *testing.T) {
 	assert.Contains(t, s, runtime.GOOS+"/"+runtime.GOARCH)
 }
 
-// --- ParseSemver / Compare (DP-30) ---
+// --- ParseSemver / Compare ---
 
 func TestParseSemver_Valid(t *testing.T) {
 	cases := []struct {

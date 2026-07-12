@@ -46,7 +46,7 @@ func TestMemoryStateStore_LookupMissing(t *testing.T) {
 	}
 }
 
-// TestMemoryStateStore_RegisterRoute_SubdomainConflict verifies S3/H6:
+// TestMemoryStateStore_RegisterRoute_SubdomainConflict verifies that
 // registering the same subdomain from a different clientID is rejected
 // with ErrSubdomainConflict instead of silently overwriting the owner.
 func TestMemoryStateStore_RegisterRoute_SubdomainConflict(t *testing.T) {
@@ -174,7 +174,7 @@ func TestMemoryStateStore_EvictDeadNodes(t *testing.T) {
 	}
 }
 
-// TestMemoryStateStore_MultipleRoutesPerClient verifies H3: a single
+// TestMemoryStateStore_MultipleRoutesPerClient verifies that a single
 // client can own more than one route entry (its connect-time subdomain
 // plus a per-tunnel hostname and path prefix), distinguished by RouteID,
 // and all three are independently lookupable.
@@ -245,8 +245,8 @@ func TestMemoryStateStore_UnregisterRouteEntry(t *testing.T) {
 	}
 }
 
-// TestMemoryStateStore_HostnameAndPathConflict verifies S3/H6's conflict
-// rejection also applies to the new hostname/path routing keys (H3), not
+// TestMemoryStateStore_HostnameAndPathConflict verifies the same conflict
+// rejection also applies to hostname/path routing keys, not
 // just subdomains.
 func TestMemoryStateStore_HostnameAndPathConflict(t *testing.T) {
 	s := NewMemoryStateStore()

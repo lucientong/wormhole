@@ -14,8 +14,8 @@ const (
 	PersistenceMemory PersistenceType = "memory"
 	// PersistenceSQLite uses SQLite for persistent storage.
 	PersistenceSQLite PersistenceType = "sqlite"
-	// PersistenceRedis uses Redis for persistent, cluster-shared storage
-	// (H5): unlike memory or SQLite, a token revoked or a team's version
+	// PersistenceRedis uses Redis for persistent, cluster-shared storage:
+	// unlike memory or SQLite, a token revoked or a team's version
 	// bumped on one node is immediately visible to every other node,
 	// since they all query the same Redis keys instead of a per-node
 	// local store.
@@ -90,7 +90,7 @@ type Config struct {
 
 	// ShutdownTimeout bounds how long Shutdown waits for in-flight HTTP
 	// and admin API requests to finish via http.Server.Shutdown(ctx)
-	// (DP-26) before the process moves on to closing everything else.
+	// before the process moves on to closing everything else.
 	// 0 falls back to defaultShutdownTimeout.
 	ShutdownTimeout time.Duration
 
@@ -104,7 +104,7 @@ type Config struct {
 
 	// MaxConcurrentStreams bounds the total number of data-plane streams
 	// (HTTP forward, WebSocket, TCP tunnel) proxying concurrently across
-	// all clients (DP-03). MaxClients only bounds connection *count*, not
+	// all clients. MaxClients only bounds connection *count*, not
 	// per-connection concurrency, so a handful of clients issuing many
 	// simultaneous requests could otherwise spawn unbounded goroutines.
 	// 0 means unlimited. Saturating this returns 503 (HTTP) or drops the
@@ -113,7 +113,7 @@ type Config struct {
 	MaxConcurrentStreams int
 
 	// MaxStreamsPerClient bounds concurrent data-plane streams for a
-	// single client (DP-27), independent of MaxConcurrentStreams, so one
+	// single client, independent of MaxConcurrentStreams, so one
 	// noisy/malicious client can't exhaust the global budget by itself.
 	// 0 means unlimited.
 	MaxStreamsPerClient int
@@ -191,7 +191,7 @@ type Config struct {
 	AuditBufferSize int
 
 	// AuditRetentionDays is how many days of audit events to retain before
-	// they're purged by a periodic background sweep (A5). 0 disables the
+	// they're purged by a periodic background sweep. 0 disables the
 	// sweep entirely (unbounded retention — the previous, and still the
 	// in-memory ring buffer's, default behavior).
 	AuditRetentionDays int
@@ -222,7 +222,7 @@ type Config struct {
 	ClusterRedisDB int
 
 	// AuthRedisAddr is the Redis address for the auth Store when
-	// Persistence is "redis" (H5). Defaults to ClusterRedisAddr when
+	// Persistence is "redis". Defaults to ClusterRedisAddr when
 	// empty, so a single --cluster-redis-addr is enough for the common
 	// case of sharing one Redis instance for both cluster routing state
 	// and shared auth/revocation state; set explicitly to use a
@@ -238,7 +238,7 @@ type Config struct {
 	AuthRedisDB int
 
 	// ClusterSecret is a shared secret attached to requests forwarded
-	// between nodes by proxyToNode (S1). When set, a receiving node
+	// between nodes by proxyToNode. When set, a receiving node
 	// rejects any request carrying a mismatched cluster-secret header,
 	// distinguishing genuine peer hops from an external caller that
 	// reaches ClusterNodeAddr directly. Requests with no such header at
@@ -246,7 +246,7 @@ type Config struct {
 	ClusterSecret string
 
 	// MinClientVersion, when set, rejects the auth handshake of any
-	// client reporting an older semantic version (DP-30) — useful during
+	// client reporting an older semantic version — useful during
 	// a rolling upgrade to require clients to update before a breaking
 	// wire/behavior change goes live. Must be a "MAJOR.MINOR.PATCH"
 	// string (an optional leading "v" is accepted). Left empty (the
@@ -273,8 +273,8 @@ func DefaultConfig() Config {
 		ShutdownTimeout:        15 * time.Second,
 		MaxClients:             1000,
 		MaxTunnelsPerClient:    0,     // Unlimited by default.
-		MaxConcurrentStreams:   10000, // Global data-plane stream cap (DP-03).
-		MaxStreamsPerClient:    500,   // Per-client data-plane stream cap (DP-27).
+		MaxConcurrentStreams:   10000, // Global data-plane stream cap.
+		MaxStreamsPerClient:    500,   // Per-client data-plane stream cap.
 		RequireAuth:            false,
 		AuthTimeout:            10 * time.Second,
 		RateLimitEnabled:       true,

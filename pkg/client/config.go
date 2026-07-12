@@ -66,7 +66,7 @@ type Config struct {
 	TLSCACert string
 
 	// Protocol is the tunnel protocol type (e.g. "http", "tcp", "ws", "grpc").
-	// Defaults to "http" if empty. "udp" is deliberately not supported (V1):
+	// Defaults to "http" if empty. "udp" is deliberately not supported:
 	// the server has no UDP dataplane, so use ValidateProtocolString to
 	// reject it (and any other invalid value) before it reaches here.
 	Protocol string

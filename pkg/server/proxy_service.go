@@ -23,7 +23,7 @@ import (
 )
 
 // clusterSecretHeader carries the shared cluster secret on requests
-// forwarded between nodes by ServeHTTP's cross-node proxy path (S1), so a
+// forwarded between nodes by ServeHTTP's cross-node proxy path, so a
 // receiving node can tell a genuine peer hop apart from an external
 // caller that happens to reach ClusterNodeAddr directly.
 const clusterSecretHeader = "X-Wormhole-Cluster-Secret" // #nosec G101 -- header name, not a credential
@@ -35,20 +35,20 @@ const clusterSecretHeader = "X-Wormhole-Cluster-Secret" // #nosec G101 -- header
 const schemeHTTP = "http"
 
 // errStreamSlotSaturated is returned by tryAcquireStreamSlot when either
-// the global or per-client data-plane stream cap (DP-03/DP-27) is full.
+// the global or per-client data-plane stream cap is full.
 var errStreamSlotSaturated = errors.New("server: concurrent stream limit reached")
 
 // copyBufSize matches the buffer size io.Copy would allocate internally by
 // default when neither side of a copy implements WriterTo/ReaderFrom, so
-// pooling it (DP-11) preserves the existing throughput characteristics
+// pooling it preserves the existing throughput characteristics
 // while avoiding a fresh 32KB allocation on every proxied HTTP response,
 // WebSocket connection, and TCP tunnel connection.
 const copyBufSize = 32 * 1024
 
 // copyBufPool recycles the buffers copyWithPooledBuffer and
-// handleTCPConnection use for proxying (DP-11): forwarding paths are the
+// handleTCPConnection use for proxying: forwarding paths are the
 // hottest allocation site under concurrent connections (bounded by
-// MaxConcurrentStreams, see DP-03/27), so reusing buffers instead of
+// MaxConcurrentStreams and MaxStreamsPerClient), so reusing buffers instead of
 // allocating fresh ones per connection meaningfully reduces steady-state
 // memory footprint and GC pressure.
 var copyBufPool = sync.Pool{
@@ -69,11 +69,11 @@ func copyWithPooledBuffer(dst io.Writer, src io.Reader) (int64, error) {
 
 // ProxyService owns the data plane: forwarding HTTP requests, WebSocket
 // connections and raw TCP tunnel connections through to the tunnel client
-// that owns the target route, plus the concurrent-stream budget (DP-03/27)
+// that owns the target route, plus the concurrent-stream budget
 // that bounds how many such forwards may be in flight at once.
 //
 // Extracted from the former HTTPHandler and several Server methods
-// (P3-6 Batch D) so the data-forwarding logic — the hottest, most
+// so the data-forwarding logic — the hottest, most
 // performance-sensitive code in the server — has a single owner
 // independent of client/route bookkeeping (TunnelRegistry) and P2P
 // signaling (P2PBroker).
@@ -98,21 +98,21 @@ type proxyService struct {
 	stats    *Stats
 
 	// serverCtx returns the root lifecycle context to use for operations
-	// that should be interrupted by server shutdown (DP-05). Falls back
+	// that should be interrupted by server shutdown. Falls back
 	// to context.Background() if nil (unit tests constructing a
 	// proxyService directly, without a live Server).
 	serverCtx func() context.Context
 
 	// activeDataStreams counts data-plane streams currently proxying
 	// (HTTP forward, WebSocket, TCP tunnel) across all clients, bounded
-	// by cfg.MaxConcurrentStreams (DP-03). Manipulated only via
+	// by cfg.MaxConcurrentStreams. Manipulated only via
 	// tryAcquireStreamSlot/the release func it returns.
 	activeDataStreams int64
 }
 
 // newProxyService constructs a ProxyService. ctxFn may be nil, in which
 // case operations that would otherwise observe shutdown cancellation
-// (DP-05) just use context.Background() instead.
+// just use context.Background() instead.
 func newProxyService(router *Router, registry TunnelRegistry, cfg Config, metrics *Metrics, stats *Stats, ctxFn func() context.Context) *proxyService {
 	return &proxyService{
 		router:    router,
@@ -136,7 +136,7 @@ func (ps *proxyService) ctx() context.Context {
 func (ps *proxyService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
-	// S1: reject requests forged with an invalid cluster-peer secret
+	// Reject requests forged with an invalid cluster-peer secret
 	// before doing anything else with them.
 	if !ps.verifyClusterSecret(w, r) {
 		return
@@ -146,7 +146,7 @@ func (ps *proxyService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	client := ps.router.Route(r.Host, r.URL.Path)
 	if client == nil {
 		// Try cluster-wide lookup: maybe the client is on another node.
-		// H3: checks hostname/subdomain/path routes, not just subdomain.
+		// Checks hostname/subdomain/path routes, not just subdomain.
 		if route := ps.registry.ResolveRemote(r.Host, r.URL.Path); route != nil {
 			if !ps.registry.IsLocalNode(route.NodeID) && route.NodeAddr != "" {
 				log.Debug().
@@ -166,8 +166,8 @@ func (ps *proxyService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// DP-03/DP-27: bound concurrent data-plane streams (global and
-	// per-client) before opening one for this request, so a saturated
+	// Bound concurrent data-plane streams (global and per-client)
+	// before opening one for this request, so a saturated
 	// server/client fails fast with 503 instead of spawning an unbounded
 	// number of proxy goroutines.
 	release, slotErr := ps.tryAcquireStreamSlot(client)
@@ -252,7 +252,7 @@ func (ps *proxyService) forwardHTTP(client *ClientSession, w http.ResponseWriter
 	if copyErr != nil {
 		// Most commonly a client that disconnected mid-response; not
 		// actionable, but worth a debug trace rather than silently
-		// discarding it (DP-11).
+		// discarding it.
 		log.Debug().Err(copyErr).Str("host", r.Host).Msg("Copy response body to client failed")
 	}
 
@@ -309,7 +309,7 @@ func (ps *proxyService) handleWebSocket(client *ClientSession, w http.ResponseWr
 		}
 	}
 
-	// Bidirectional proxy. As in handleTCPConnection (DP-04), close the
+	// Bidirectional proxy. As in handleTCPConnection, close the
 	// *write* side of each direction as soon as its io.Copy finishes, so
 	// the other direction's blocked Read unblocks immediately instead of
 	// leaking a goroutine until the deferred closes above happen to run.
@@ -459,7 +459,7 @@ func (ps *proxyService) notFound(w http.ResponseWriter, r *http.Request) {
 // pair before it's used to build a proxy target. nodeAddr always
 // originates from this cluster's own state store (Config.ClusterNodeAddr,
 // announced by other nodes — the same trust boundary verifyClusterSecret
-// authenticates, S1) rather than from request content, but validating its
+// authenticates) rather than from request content, but validating its
 // shape here is cheap defense in depth: it rules out a corrupted or
 // malicious state-store entry smuggling a scheme, userinfo, path, or query
 // component into the outbound request (e.g. "trusted.internal@evil.com").
@@ -482,7 +482,7 @@ func validateClusterNodeAddr(nodeAddr string) (host, port string, err error) {
 // proxyToNode forwards an HTTP request to the node that owns the route entry.
 // It is used for cross-node routing when the target client is connected to a
 // different cluster member. When Config.ClusterSecret is set, the forwarded
-// request carries it in clusterSecretHeader (S1) so the receiving node can
+// request carries it in clusterSecretHeader so the receiving node can
 // distinguish a genuine peer hop from an external caller that reaches
 // ClusterNodeAddr directly.
 func (ps *proxyService) proxyToNode(nodeAddr string, w http.ResponseWriter, r *http.Request) {
@@ -515,8 +515,8 @@ func (ps *proxyService) proxyToNode(nodeAddr string, w http.ResponseWriter, r *h
 	proxy.ServeHTTP(w, r)
 }
 
-// verifyClusterSecret implements the receiving side of S1: when
-// cfg.ClusterSecret is configured and an inbound request carries
+// verifyClusterSecret implements the receiving side of the cluster-peer
+// trust check: when cfg.ClusterSecret is configured and an inbound request carries
 // clusterSecretHeader, the value must match — a present-but-wrong secret
 // means someone is trying to impersonate a cluster peer and the request is
 // rejected outright. A request with no such header at all is ordinary
@@ -622,7 +622,7 @@ func (ps *proxyService) ServeTCPTunnel(ln net.Listener, client *ClientSession, t
 func (ps *proxyService) handleTCPConnection(conn net.Conn, client *ClientSession, tunnelID string) {
 	defer conn.Close()
 
-	// DP-03/DP-27: bound concurrent TCP tunnel streams before opening one.
+	// Bound concurrent TCP tunnel streams before opening one.
 	release, slotErr := ps.tryAcquireStreamSlot(client)
 	if slotErr != nil {
 		log.Warn().Str("client", client.ID).Msg("TCP tunnel connection rejected: concurrent stream limit reached")
@@ -647,7 +647,7 @@ func (ps *proxyService) handleTCPConnection(conn net.Conn, client *ClientSession
 
 	// Bidirectional proxy. tunnel.Stream has no CloseWrite/CloseRead, so
 	// the only way to unblock a still-running direction once its peer
-	// direction has errored out is to close both ends (DP-04): waiting
+	// direction has errored out is to close both ends: waiting
 	// on just the first-to-finish direction and relying on the deferred
 	// conn.Close()/stream.Close() at function return left the other
 	// direction's io loop running (and its goroutine leaked past this

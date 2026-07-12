@@ -126,12 +126,13 @@ func newTunnelBackend(t *testing.T, sessionID, subdomain, body string) *tunnelBa
 	return tb
 }
 
-// TestCrossNodeRouting_HTTP is H11's integration test: two independent
-// *Server instances share cluster state via Redis (miniredis-backed).
-// Node A owns the real tunnel connection for subdomain "myapp"; node B has
-// no local client at all for it. A request that arrives at node B's HTTP
-// handler must be recognized as cluster-remote (H3's lookupRemoteRoute),
-// reverse-proxied to node A over a real HTTP connection (proxyToNode), and
+// TestCrossNodeRouting_HTTP is an end-to-end integration test: two
+// independent *Server instances share cluster state via Redis
+// (miniredis-backed). Node A owns the real tunnel connection for
+// subdomain "myapp"; node B has no local client at all for it. A request
+// that arrives at node B's HTTP handler must be recognized as
+// cluster-remote (lookupRemoteRoute), reverse-proxied to node A over a
+// real HTTP connection (proxyToNode), and
 // come back with node A's tunneled response — end to end, not just a
 // state-store-level lookup.
 func TestCrossNodeRouting_HTTP(t *testing.T) {
@@ -169,7 +170,7 @@ func TestCrossNodeRouting_HTTP(t *testing.T) {
 }
 
 // TestCrossNodeRouting_Hostname is TestCrossNodeRouting_HTTP's counterpart
-// for custom-hostname routes (H3): previously only subdomains were ever
+// for custom-hostname routes: previously only subdomains were ever
 // pushed to the shared state store, so a hostname-routed tunnel was
 // invisible to every node except the one the client happened to be
 // connected to.
@@ -206,7 +207,7 @@ func TestCrossNodeRouting_Hostname(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), "hello via custom hostname")
 }
 
-// TestCrossNodeRouting_ClusterSecretRejectsForgedPeer verifies S1: when
+// TestCrossNodeRouting_ClusterSecretRejectsForgedPeer verifies that when
 // Config.ClusterSecret is set, a request carrying the wrong secret is
 // rejected outright rather than being treated as a trusted peer hop.
 func TestCrossNodeRouting_ClusterSecretRejectsForgedPeer(t *testing.T) {
@@ -225,7 +226,7 @@ func TestCrossNodeRouting_ClusterSecretRejectsForgedPeer(t *testing.T) {
 }
 
 // TestCrossNodeRouting_ClusterSecretAllowsGenuinePeer verifies the
-// complementary S1 case: a request carrying the correct secret is not
+// complementary case: a request carrying the correct secret is not
 // rejected and proceeds through normal routing (falling through to 404
 // here since no client is registered).
 func TestCrossNodeRouting_ClusterSecretAllowsGenuinePeer(t *testing.T) {
@@ -243,7 +244,7 @@ func TestCrossNodeRouting_ClusterSecretAllowsGenuinePeer(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
-// TestServer_RefreshClusterRoutes verifies H1: a connected client's
+// TestServer_RefreshClusterRoutes verifies a connected client's
 // registered cluster routes are re-registered (TTL-refreshed) by
 // refreshClusterRoutes without needing the client to do anything, and a
 // disconnected/never-registered node is a no-op.
@@ -275,7 +276,7 @@ func TestServer_RefreshClusterRoutes(t *testing.T) {
 	assert.Equal(t, backend.session.ID, entry.ClientID)
 }
 
-// TestServer_RegisterClientRoute_ReclaimsStaleLocalSession verifies H10: a
+// TestServer_RegisterClientRoute_ReclaimsStaleLocalSession verifies a
 // reconnecting client whose previous session's mux has already died (but
 // wasn't cleaned up yet) can immediately reclaim its subdomain instead of
 // being rejected as "already registered" by its own stale former self.

@@ -269,7 +269,7 @@ func (m *ControlMessage) EncodeJSON() ([]byte, error) {
 
 // errUnknownEmptyMessage is returned by DecodeControlMessage when the
 // protobuf wire format "successfully" parses bytes into an all-zero
-// message (DP-17): the permissive protobuf decoder silently skips
+// message: the permissive protobuf decoder silently skips
 // unrecognized/malformed field tags instead of erroring, so arbitrary
 // garbage bytes can unmarshal into a message with Type == UNKNOWN and no
 // payload set, without proto.Unmarshal ever returning an error. Treating
@@ -283,7 +283,7 @@ func DecodeControlMessage(data []byte) (*ControlMessage, error) {
 	// Try protobuf first.
 	pbMsg := &pb.ControlMessage{}
 	if err := proto.Unmarshal(data, pbMsg); err == nil {
-		// DP-17: a genuinely unrecognized-but-deliberate message (e.g. a
+		// A genuinely unrecognized-but-deliberate message (e.g. a
 		// newer peer using a MessageType this build doesn't know about
 		// yet) still carries *some* payload or a non-zero type — reject
 		// only the specific "fully empty" shape that malformed/garbage
@@ -306,7 +306,7 @@ func DecodeControlMessage(data []byte) (*ControlMessage, error) {
 
 // hasAnyPayload reports whether any of the hand-written oneof-style
 // payload fields is set, used by DecodeControlMessage's JSON fallback to
-// apply the same DP-17 "reject fully empty UNKNOWN message" rule that the
+// apply the same "reject fully empty UNKNOWN message" rule that the
 // protobuf path applies via pbMsg.Payload == nil.
 func (m *ControlMessage) hasAnyPayload() bool {
 	return m.hasSessionPayload() || m.hasP2PPayload()

@@ -361,7 +361,7 @@ func TestClient_Authenticate_Success(t *testing.T) {
 	c.relay.mu.Unlock()
 }
 
-// TestClient_Authenticate_SendsRealCapabilities verifies DP-33: the
+// TestClient_Authenticate_SendsRealCapabilities verifies that the
 // AuthRequest carries the client's actual feature set (reflecting
 // Config.P2PEnabled) instead of an empty/placeholder list.
 func TestClient_Authenticate_SendsRealCapabilities(t *testing.T) {
@@ -406,7 +406,7 @@ func TestClient_Authenticate_SendsRealCapabilities(t *testing.T) {
 	assert.Contains(t, req.Capabilities, "p2p")
 }
 
-// TestClient_Authenticate_StoresServerCapabilities verifies DP-33: the
+// TestClient_Authenticate_StoresServerCapabilities verifies that the
 // server's advertised Capabilities from AuthResponse are retained so
 // serverSupports can gate optional client behavior on them.
 func TestClient_Authenticate_StoresServerCapabilities(t *testing.T) {
@@ -618,7 +618,7 @@ func TestClient_RegisterTunnel_InvalidPort(t *testing.T) {
 }
 
 // TestClient_CreateTunnel_Success verifies the full end-to-end handshake
-// for U1's imperative CreateTunnel: registration succeeds and the new
+// for the imperative CreateTunnel: registration succeeds and the new
 // tunnel becomes visible via ListActiveTunnels.
 func TestClient_CreateTunnel_Success(t *testing.T) {
 	cfg := DefaultConfig()
@@ -676,7 +676,7 @@ func TestClient_CreateTunnel_DuplicateName(t *testing.T) {
 }
 
 // TestClient_DeleteTunnel_Success verifies the full end-to-end
-// CloseRequest handshake for U1's imperative DeleteTunnel, and that the
+// CloseRequest handshake for the imperative DeleteTunnel, and that the
 // tunnel is removed from the active set afterward.
 func TestClient_DeleteTunnel_Success(t *testing.T) {
 	cfg := DefaultConfig()
@@ -995,7 +995,7 @@ func TestClient_ForwardHTTPWithInspect_Success(t *testing.T) {
 	assert.Equal(t, http.StatusOK, records[0].Status)
 }
 
-// TestClient_ForwardHTTPWithInspect_LargeBodyTruncated verifies DP-12: the
+// TestClient_ForwardHTTPWithInspect_LargeBodyTruncated verifies that the
 // request body forwardHTTPWithInspect reads is capped at
 // Inspector.MaxBodySize()+1, so a request larger than that limit is
 // truncated on the wire to the local service (and in the captured
@@ -1241,9 +1241,8 @@ func TestClient_HeartbeatLoop_MuxClosed(t *testing.T) {
 
 // TestClient_HeartbeatLoop_ClosesMuxAfterConsecutiveFailures verifies that
 // after maxConsecutiveHeartbeatFailures consecutive ping failures, the
-// heartbeat loop force-closes the mux (DP-28), which is what allows
-// handleConnection's CloseNotify wait to unblock and trigger a reconnect
-// (DP-01).
+// heartbeat loop force-closes the mux, which is what allows
+// handleConnection's CloseNotify wait to unblock and trigger a reconnect.
 func TestClient_HeartbeatLoop_ClosesMuxAfterConsecutiveFailures(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.HeartbeatInterval = 20 * time.Millisecond
@@ -1355,8 +1354,8 @@ func TestClient_ConnectWithRetry_CloseCh(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// TestClient_HandleConnection_UnblocksOnMuxClose verifies the DP-01 fix:
-// handleConnection must return as soon as the mux dies (e.g. due to a
+// TestClient_HandleConnection_UnblocksOnMuxClose verifies that
+// handleConnection returns as soon as the mux dies (e.g. due to a
 // network failure), not only when ctx is canceled. This is what allows
 // connectWithRetry's loop to actually attempt a reconnect after a dropped
 // connection instead of hanging forever.
@@ -1657,7 +1656,7 @@ func TestClient_ForwardToLocal_InspectorDisabled(t *testing.T) {
 	<-done
 }
 
-// --- resolveLocalAddr tests (DP-21: multi-tunnel local dispatch) ---
+// --- resolveLocalAddr tests (multi-tunnel local dispatch) ---
 
 // TestClient_ResolveLocalAddr_KnownTunnelID verifies that a TunnelID
 // matching an active multi-tunnel entry resolves to that tunnel's own
@@ -2054,8 +2053,8 @@ func TestClient_HandleStream_P2POfferResponse(t *testing.T) {
 	_ = serverStream.Close()
 }
 
-// TestClient_HandleStream_P2PCandidatesThenOfferResponse verifies the
-// DP-24 fix: when the server writes a P2PCandidates message followed by
+// TestClient_HandleStream_P2PCandidatesThenOfferResponse verifies that
+// when the server writes a P2PCandidates message followed by
 // the terminal P2POfferResponse on the same notification stream (both
 // length-prefixed via proto.WriteControlMessage), handleStream loop-reads
 // past the candidates message instead of misclassifying/dropping it, and
@@ -2629,7 +2628,7 @@ func TestParseProtocol(t *testing.T) {
 		{"gRPC", proto.ProtocolGRPC},
 		{"unknown", proto.ProtocolHTTP},
 		{"ftp", proto.ProtocolHTTP},
-		// udp is deliberately unrecognized by parseProtocol (V1): the server
+		// udp is deliberately unrecognized by parseProtocol: the server
 		// has no UDP dataplane, so ValidateProtocolString rejects it before
 		// parseProtocol would ever see it in practice; here it just falls
 		// through to the same "unrecognized" default as any other bogus
@@ -2647,14 +2646,14 @@ func TestParseProtocol(t *testing.T) {
 }
 
 // ============================================================================
-// V1: ValidateProtocolString Tests
+// ValidateProtocolString Tests
 // ============================================================================
 
 // TestValidateProtocolString verifies the accepted/rejected protocol
 // strings for --protocol and the YAML config file's protocol field,
-// notably that "udp" gets a specific, actionable rejection message (V1:
-// the server has no UDP dataplane, so silently treating it as HTTP would
-// be misleading).
+// notably that "udp" gets a specific, actionable rejection message: the
+// server has no UDP dataplane, so silently treating it as HTTP would
+// be misleading.
 func TestValidateProtocolString(t *testing.T) {
 	valid := []string{"", "http", "HTTP", "https", "tcp", "TCP", "ws", "websocket", "grpc"}
 	for _, in := range valid {

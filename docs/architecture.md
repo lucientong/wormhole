@@ -15,16 +15,14 @@
 - [HTTP Proxy Flow](#http-proxy-flow)
 - [TCP Tunnel Flow](#tcp-tunnel-flow)
 - [Inspector Traffic Capture](#inspector-traffic-capture)
-- [P2P Direct Connection (Phase 4 & 4.5)](#p2p-direct-connection-phase-4--45)
+- [P2P Direct Connection](#p2p-direct-connection)
 - [Connection Management](#connection-management)
 - [Security Model](#security-model)
 - [Multi-Tunnel Configuration & Hot-Reload](#multi-tunnel-configuration--hot-reload)
 - [HA / Multi-Node Control Plane](#ha--multi-node-control-plane)
-- [Robustness & Protocol Hardening (P3-6 Batch A)](#robustness--protocol-hardening-p3-6-batch-a)
-- [Hot-Path Allocation Pooling (P3-6 Batch B)](#hot-path-allocation-pooling-p3-6-batch-b)
-- [Context Propagation (P3-6 Batch C)](#context-propagation-p3-6-batch-c)
-- [God-Object Decomposition, Server Side (P3-6 Batch D)](#god-object-decomposition-server-side-p3-6-batch-d)
-- [God-Object Decomposition, Client Side (P3-6 Batch D)](#god-object-decomposition-client-side-p3-6-batch-d)
+- [Server & Client Composition](#server--client-composition)
+- [Reliability & Protocol Safeguards](#reliability--protocol-safeguards)
+- [Hot-Path Performance](#hot-path-performance)
 - [Data Flow Summary](#data-flow-summary)
 
 ---
@@ -95,7 +93,7 @@ Wormhole is a Client-Server architecture tunneling tool. The core idea is:
 
 | Component | Location | Responsibility |
 |-----------|----------|----------------|
-| `Server` | `pkg/server/server.go` | Composition root; wires up `TunnelRegistry`/`ProxyService`/`P2PBroker` and owns the listener lifecycle (P3-6 batch D) |
+| `Server` | `pkg/server/server.go` | Composition root; wires up `TunnelRegistry`/`ProxyService`/`P2PBroker` and owns the listener lifecycle (see [Server & Client Composition](#server--client-composition)) |
 | `TunnelRegistry` | `pkg/server/tunnel_registry.go` | Client session lifecycle; local + cluster routing (subdomain/hostname/path); TCP port allocation; cluster heartbeat and state-store health |
 | `ProxyService` | `pkg/server/proxy_service.go` | HTTP/WebSocket/TCP data-plane forwarding (`http.Handler`); concurrent-stream budget (global + per-client); cross-node proxy fallback. Replaces the former `HTTPHandler` |
 | `P2PBroker` | `pkg/server/p2p_broker.go` | `wormhole connect` signaling: offer matching, NAT-compatibility checks, port-prediction candidates |
@@ -110,7 +108,7 @@ Wormhole is a Client-Server architecture tunneling tool. The core idea is:
 
 | Component | Location | Responsibility |
 |-----------|----------|----------------|
-| `Client` | `pkg/client/client.go` | Composition root; wires up `RelayClient`/`P2PSession`, aggregates `Stats`, owns the inspector and local control/inspector HTTP servers, and implements the `localForwarder`/`statsRecorder` callbacks both components use (P3-6 batch D) |
+| `Client` | `pkg/client/client.go` | Composition root; wires up `RelayClient`/`P2PSession`, aggregates `Stats`, owns the inspector and local control/inspector HTTP servers, and implements the `localForwarder`/`statsRecorder` callbacks both components use (see [Server & Client Composition](#server--client-composition)) |
 | `RelayClient` | `pkg/client/relay_client.go` | Control-plane connection lifecycle: dial (+TLS), auth (with token refresh), single-/multi-tunnel registration, heartbeat, accepting inbound streams, and the reconnect loop |
 | `P2PSession` | `pkg/client/p2p_session.go` | `wormhole connect` / P2P hole-punching lifecycle: NAT discovery, ECDH key exchange, hole punching, the multiplexed P2P transport, and the connect-mode local listener |
 | `FileConfig` | `pkg/client/config_file.go` | YAML config file loader + validator |
@@ -487,6 +485,8 @@ The `StreamRequest` for a TCP connection carries the originating `TunnelID` (set
                     └──────────────────────────┘
 ```
 
+`captureHeaders()` redacts a fixed set of sensitive header names (`Authorization`, `Cookie`, `Set-Cookie`, `Proxy-Authorization`, `X-Api-Key`, etc., matched case-insensitively) to a constant placeholder on both request and response capture, so a token or session cookie never lands in a stored record or gets pushed to the inspector UI.
+
 ### Record Structure
 
 Each captured record contains:
@@ -517,7 +517,7 @@ type Record struct {
 
 ---
 
-## P2P Direct Connection (Phase 4 & 4.5)
+## P2P Direct Connection
 
 ### Goal
 
@@ -563,7 +563,7 @@ When two Clients need to communicate (or a single Client exposes a service), att
 
 ### Implementation
 
-Phase 4 provides the foundational P2P primitives, and Phase 4.5 completes end-to-end integration:
+The following components together provide NAT discovery, hole punching, and the reliable transport built on top of it:
 
 | Component | File | Status |
 |-----------|------|--------|
@@ -578,15 +578,15 @@ Phase 4 provides the foundational P2P primitives, and Phase 4.5 completes end-to
 | **Server Signaling** | `pkg/server/server.go` | ✅ Complete — Subdomain-targeted peer matching, NAT compatibility check |
 | **Integration Tests** | `pkg/p2p/integration_test.go` | ✅ Complete — 15+ test cases |
 
-> **Note on scope (P3-3 / DP-23):** P2P only ever carries traffic between two `wormhole` processes that can both run the hole-punch protocol — i.e. `wormhole client` ↔ `wormhole connect`. A public visitor hitting your tunnel's hostname (a browser, curl, mobile app, etc.) is not running Wormhole's P2P protocol and physically cannot be hole-punched, so that traffic always goes through the Server relay; P2P for that path is not a roadmap gap, it's a hard physical constraint. Earlier versions of this document described a "hot switch" from relay to P2P for arbitrary tunnel traffic, which did not correspond to anything actually wired up end-to-end (the mux was established but no code path ever routed real HTTP/TCP tunnel bytes through it). `wormhole connect` (below) is what makes P2P carry real traffic in the one scenario where it's physically possible.
+> **Note on scope:** P2P only ever carries traffic between two `wormhole` processes that can both run the hole-punch protocol — i.e. `wormhole client` ↔ `wormhole connect`. A public visitor hitting your tunnel's hostname (a browser, curl, mobile app, etc.) is not running Wormhole's P2P protocol and physically cannot be hole-punched, so that traffic always goes through the Server relay; P2P for that path is not a gap, it's a hard physical constraint. `wormhole connect` (below) is what makes P2P carry real traffic in the one scenario where it's physically possible.
 
 ### Reliable UDP Transport Layer
 
-Production P2P data transfer is carried by `UDPMux` + `UDPStream` (`pkg/p2p/mux.go`, `pkg/p2p/stream.go`) — a custom ARQ-based reliable, ordered, multiplexed stream layer over a single UDP socket pair. The older single-stream `pkg/p2p/transport.go` implementation it superseded has been removed (P3-3 / DP-16); anything it covered is now exercised against `UDPMux`/`UDPStream` instead.
+Production P2P data transfer is carried by `UDPMux` + `UDPStream` (`pkg/p2p/mux.go`, `pkg/p2p/stream.go`) — a custom ARQ-based reliable, ordered, multiplexed stream layer over a single UDP socket pair.
 
-**Adaptive retransmission (RFC 6298, P3-3 / DP-13):** instead of a fixed 200ms retransmit timeout, `UDPStream` maintains per-stream SRTT/RTTVAR estimates (`updateRTO`, gains α=1/8, β=1/4, `RTO = SRTT + 4×RTTVAR`, clamped to `[100ms, 10s]`) sampled from ACKs of segments that were **not** retransmitted (Karn's algorithm — a retransmitted segment's ACK is ambiguous about which transmission it's acking, so it's excluded from the sample to avoid skewing the estimate). Each in-flight segment additionally backs off its *own* retransmit timer exponentially (doubling per attempt, capped at 32× the base RTO) rather than sharing one global timer, so a single lossy segment doesn't inflate the timeout applied to every other segment on the stream. This lets the stream retransmit aggressively on a clean low-latency link and back off gracefully on a lossy/high-RTT one, instead of picking one fixed value that's wrong for most conditions.
+**Adaptive retransmission (RFC 6298):** instead of a fixed retransmit timeout, `UDPStream` maintains per-stream SRTT/RTTVAR estimates (`updateRTO`, gains α=1/8, β=1/4, `RTO = SRTT + 4×RTTVAR`, clamped to `[100ms, 10s]`) sampled from ACKs of segments that were **not** retransmitted (Karn's algorithm — a retransmitted segment's ACK is ambiguous about which transmission it's acking, so it's excluded from the sample to avoid skewing the estimate). Each in-flight segment additionally backs off its *own* retransmit timer exponentially (doubling per attempt, capped at 32× the base RTO) rather than sharing one global timer, so a single lossy segment doesn't inflate the timeout applied to every other segment on the stream. This lets the stream retransmit aggressively on a clean low-latency link and back off gracefully on a lossy/high-RTT one, instead of picking one fixed value that's wrong for most conditions.
 
-**Reduced copies (P3-3 / DP-14):** the send path's `SessionCipher.EncryptInto` encrypts directly into the pre-sized outbound frame buffer instead of encrypting into a scratch buffer and then copying into the frame; the receive path (`handleData`/`deliverLocked`) no longer re-copies a payload that `decryptPayload` already returned as an independently-owned buffer. Combined, this cuts the encrypted send path from 8 allocations / 5200 B per packet to 6 allocations / 2640 B (`BenchmarkMux_SendPacket`), with no throughput regression under simulated WAN conditions (`BenchmarkUDPMux_Throughput_SimulatedWAN`, 50ms RTT / 1% loss).
+**Reduced copies on the encrypted send path:** `SessionCipher.EncryptInto` encrypts directly into the pre-sized outbound frame buffer instead of encrypting into a scratch buffer and then copying into the frame; the receive path (`handleData`/`deliverLocked`) doesn't re-copy a payload that `decryptPayload` already returned as an independently-owned buffer.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -615,7 +615,7 @@ Each `UDPStream` multiplexed on the mux has an independent receive buffer (`recv
 
 **Reliable stream handshake (SYN/SYN-ACK):** `OpenStream()` registers the outbound SYN under reserved sequence `0` in the same send buffer used for data segments (real data always starts at seq `1`), so `retransmitLoop` retries the SYN exactly like any other segment until it's acknowledged or `MaxRetransmits` is exhausted. The accepting side replies with an ordinary ACK for seq `0` once the stream is admitted, and re-ACKs on a duplicate SYN (covering the case where its first SYN-ACK was itself lost). Without this, a single dropped SYN packet would leave the peer unaware of the stream forever — every subsequent data segment would be silently discarded by `dispatch()` as "unknown stream", and the accepting side would block in `AcceptStream()`/`Read()` indefinitely instead of surfacing a connection failure. When any segment (including the SYN) exhausts `MaxRetransmits`, the sender now also sends an RST before force-closing locally, so the peer learns the stream died instead of hanging.
 
-### `wormhole connect`: Client-to-Client Direct Data Plane (P3-3 / DP-23)
+### `wormhole connect`: Client-to-Client Direct Data Plane
 
 `wormhole connect <target-subdomain> --local <port>` is the scenario where P2P actually carries real application traffic end-to-end. One process runs `wormhole client` and exposes a service as usual (registering a tunnel + subdomain with the Server); a second process runs `wormhole connect <that-subdomain>` instead of `wormhole client` — it does **not** register a tunnel of its own, it only asks the Server to match it against the peer that owns the given subdomain.
 
@@ -631,8 +631,8 @@ Each `UDPStream` multiplexed on the mux has an independent receive buffer (`recv
 │     Server looks up "a" via Router.LookupSubdomain(),      │
 │     returns P2POfferResponse{peer_tunnel_id: <A's tunnel>} │
 │                                                           │
-│  3. Both sides STUN + hole-punch (same primitives as       │
-│     Phase 4/4.5); on success both have a UDPMux over a     │
+│  3. Both sides STUN + hole-punch (the same primitives      │
+│     described above); on success both have a UDPMux over a │
 │     single UDP socket pair                                │
 │                                                           │
 │  4. Peer B listens on 127.0.0.1:9090; for every accepted   │
@@ -953,7 +953,7 @@ p2p_enabled: true
 
 - Server supports TLS termination (Let's Encrypt auto-certs or manual certificates)
 - Client-Server tunnel connection supports TLS encryption (client `--tls` / `--tls-insecure` / `--tls-ca` flags)
-- Server tunnel listener can independently enable TLS via `--tunnel-tls` flag
+- The tunnel *control* listener (where auth tokens travel) has its own independent TLS setting (`--tunnel-tls`, via `TLSManager.TunnelTLSConfig()`/`WrapTunnelListenerStrict()`) rather than inheriting the HTTP data-plane listener's TLS config — it defaults to `--tls`'s value, and additionally defaults to `true` whenever `--require-auth` is combined with a real `--domain`, since requiring authentication while leaving the channel that carries those tokens unencrypted would defeat the purpose. A TLS *config* error (e.g. bad cert paths) fails server startup outright when auth is required, instead of silently falling back to plaintext
 
 ### P2P End-to-End Encryption
 
@@ -1022,7 +1022,7 @@ Auth.ValidateToken(token)
   └── 3. HMAC-SHA256 signed token verification
 ```
 
-The `OIDCValidator` caches JWKS keys with a 1-hour TTL and auto-refreshes on unknown `kid`. Supported algorithms: `RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `ES512`.
+The `OIDCValidator` caches JWKS keys with a 1-hour TTL and auto-refreshes on unknown `kid`. Supported algorithms: `RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `ES512`; `verifyJWTSignature` has a dedicated `case "none", ""` that rejects an unsigned token immediately, closing off the classic signature-bypass attack. Issuer comparison (`normalizeIssuer`) strips trailing slashes before matching, so `https://issuer.example.com` and `https://issuer.example.com/` are treated as equal; `nbf` (not-before) is validated with the same 60s clock-skew leeway already applied to `exp`.
 
 #### OAuth2 Device Code Flow (`wormhole login`)
 
@@ -1056,6 +1056,10 @@ wormhole login --issuer <url> --client-id <id>
 - Events: auth success/failure, IP blocked/unblocked, token generated/revoked, tunnel created/closed, P2P established/fallback, client connect/disconnect
 - Pluggable `AuditStore`: in-memory ring buffer (default) or SQLite (persistent)
 - Admin API: `GET /audit` with filters + `GET /audit/export` for CSV/JSON bulk export
+- `--audit-retention-days` (default 90) bounds log growth on a long-running server via a periodic `AuditStore.DeleteOlderThan(cutoff)` sweep
+- A failed `AuditStore.Store()` call (e.g. a full disk or locked SQLite file) increments an `atomic.Uint64` counter instead of silently dropping the event; `GET /stats` surfaces it as `audit_store_errors` so persistence failures are monitorable rather than invisible
+- `/metrics` requires the same admin authentication as the rest of the Admin API — it's never exposed unauthenticated
+- `Server.Start()` schedules a background sweep of the revoked-token blacklist every 10 minutes so it doesn't grow unbounded
 
 ### Input Validation
 
@@ -1063,27 +1067,9 @@ wormhole login --issuer <url> --client-id <id>
 - Subdomain restricted to single-level labels (no dots)
 - Path prefix normalization (leading/trailing `/`)
 
-### Security Hardening (P3-4)
+### Subdomain Reservation Semantics
 
-A dedicated review pass (`docs/personal/review-v0.6.md`) audited every security-relevant code path in v0.6.0 and closed the gaps below. Each item is independently unit-tested.
-
-| Area | Before | After |
-|------|--------|-------|
-| **RBAC enforcement point** | Only the CLI hid write actions from viewers; the server accepted any authenticated client's `RegisterRequest`/`CloseRequest` | `handleRegister`/`handleClose` call `requireWritePermission(client)` first; a `viewer` token is rejected with an explicit error and an audit event, regardless of what client sent the request |
-| **Tunnel control-channel TLS** | The tunnel listener was wrapped with the *same* `TLSConfig()` used for the HTTP listener, which short-circuits to "no TLS" whenever `Config.TLSEnabled` is false — so `TunnelTLSEnabled=true` alone was a silent no-op | `TLSManager.TunnelTLSConfig()`/`WrapTunnelListenerStrict()` are fully independent of the HTTP TLS config; `--require-auth` + a real domain now defaults `TunnelTLSEnabled` to `true`, and a TLS *config* error (not just "no cert configured") fails server startup outright when auth is required, instead of falling back to plaintext |
-| **Subdomain reservation** | `RegisterRoute` on both the in-memory router and the Redis-backed cluster store was last-writer-wins: two clients (or two nodes) racing for the same subdomain would silently overwrite each other, and the loser would keep believing it owned the route | Atomic reservation with four defined outcomes: free → reserved; same client re-registering → idempotent TTL refresh; a *live* different owner → `ErrSubdomainConflict` (connection rejected); a *stale* owner (its route entry already expired) → reclaimed. The Redis implementation uses `SetArgs{Mode: "NX"}` (the non-deprecated replacement for `SetNX`) |
-| **Token expiry mutation** | `ExtendTokenExpiry` temporarily overwrote the shared `Auth.config.TokenExpiry` field to reuse the token-generation code path, then restored it — a data race under concurrent requests | `generateTeamToken(teamName, role, expiry)` takes the expiry as an explicit parameter; nothing ever mutates shared config |
-| **Revoked-token cleanup** | `Auth.CleanupRevokedTokens()` existed and worked, but nothing ever called it — the revocation blacklist (and its SQLite table, if persistence is enabled) grew without bound | `Server.Start()` schedules `runRevokedTokenCleanup()`, a goroutine that sweeps expired blacklist entries every 10 minutes |
-| **OIDC `alg: none`** | An `alg: none`/empty-`alg` JWT fell through to the generic "unsupported algorithm" branch — functionally rejected, but not by an explicit, tested guard against the classic signature-bypass attack | `verifyJWTSignature` has a dedicated `case "none", ""` that rejects immediately, with a regression test |
-| **OIDC issuer/`nbf`** | Issuer comparison was a raw string match (trailing-slash mismatches between a provider's discovery document and its issued tokens could cause spurious rejections); `nbf` was never checked | `normalizeIssuer()` strips trailing slashes before comparing; `nbf` is validated with the same 60s `clockSkewLeeway` already used for `exp` |
-| **Inspector captures** | `Authorization`/`Cookie`/etc. headers were stored verbatim in captured records (visible via the inspector UI/API); default body-capture cap was 1MB | `captureHeaders()` redacts a fixed set of sensitive header names (case-insensitively) to a constant placeholder on both request and response capture; default `MaxBodySize` lowered to 256KB |
-| **`/metrics`** | Exposed with no authentication, unlike every other Admin API route | Wrapped with the same `requireAdminAuth` middleware as `/stats`, `/audit`, etc. |
-| **Audit gaps** | Only failures were logged (`LogAuthFailure`); successful auth, IP blocks, token generation, and IP unblocks left no audit trail; `RefreshAndRevokeToken` silently swallowed a failed revocation | `LogAuthSuccess`/`LogIPBlocked`/`LogTokenGenerated`/`LogIPUnblocked` added at their respective call sites; `RefreshAndRevokeToken` now returns the new token *and* a wrapped error on partial failure, surfaced to the caller as a `Warning` field instead of silently discarded |
-| **Audit retention** | No way to bound audit log growth over the life of a long-running server | `AuditStore.DeleteOlderThan(cutoff)` (implemented by both the memory and SQLite stores) + `--audit-retention-days` (default 90) + a periodic `runAuditRetention()` sweep |
-| **Audit store write failures** | `AuditLogger.Log()` discarded `l.store.Store(event)` errors (`_ = ...`) — a failing persistence backend (e.g. a full disk or locked SQLite file) dropped events with zero observable signal | An `atomic.Uint64` `storeErrors` counter increments on every failed `Store()` call; `AuditLogger.StoreErrors()` exposes it, and `GET /stats` surfaces it as `audit_store_errors` (omitted when audit logging is disabled) so the failure mode is monitorable/alertable instead of silent |
-| **Subdomain registration failure at connect time** | A local or cluster-wide subdomain conflict was only logged; the connection proceeded and the client was told (via `AuthResponse`) that it owned the subdomain, while traffic actually kept routing to whichever session held the entry | `registerClientRoute()` rejects and closes the connection on either a local or cluster conflict, so the client's own reconnect logic retries instead of running in a silently broken state |
-| **Inter-node proxy trust (S1, P3-5)** | `proxyToNode` forwarded requests between cluster nodes with no authentication — any host that could reach a node's HTTP port could forge `X-Wormhole-*` proxy headers and impersonate a peer node | `--cluster-secret` shared secret; `proxyToNode` attaches it as `X-Wormhole-Cluster-Secret`, `verifyClusterSecret` validates and strips it before the request reaches routing logic, rejecting mismatched/missing secrets when one is configured |
-| **Cross-node token revocation (H5, P3-5)** | With `--persistence sqlite` or the in-memory default, a token revoked on node A stayed valid on node B until that node's own store happened to converge (it never did, for two independent SQLite files) | `--persistence redis` (`auth.RedisStore`) puts teams and revoked-token state in the same shared Redis the cluster already uses for routing; a revocation is visible cluster-wide as soon as the write completes, with TTL-based auto-expiry instead of a cleanup sweep |
+`RegisterRoute` (both the in-memory router and the Redis-backed cluster store) is an atomic reservation with four defined outcomes: free → reserved; same client re-registering → idempotent TTL refresh; a *live* different owner → `ErrSubdomainConflict` (connection rejected); a *stale* owner (its route entry already expired) → reclaimed. The Redis implementation uses `SetArgs{Mode: "NX"}`. A subdomain conflict — local or cluster-wide — rejects and closes the connection outright rather than merely logging it and letting the client believe (via `AuthResponse`) that it owns a subdomain it doesn't actually control; the client's own reconnect logic retries afterward.
 
 ---
 
@@ -1163,9 +1149,9 @@ type StateStore interface {
 }
 ```
 
-`RouteEntry` carries `{RouteID, ClientID, Subdomain, Hostname, PathPrefix, NodeID, NodeAddr, RegisteredAt}` — a single client can hold several `RouteEntry`s at once (one tunnel's subdomain, another's custom hostname, a third's path prefix), each independently addressable by `RouteID` for targeted unregistration (H3). `NodeInfo` carries `{NodeID, NodeAddr, LastHeartbeat}`.
+`RouteEntry` carries `{RouteID, ClientID, Subdomain, Hostname, PathPrefix, NodeID, NodeAddr, RegisteredAt}` — a single client can hold several `RouteEntry`s at once (one tunnel's subdomain, another's custom hostname, a third's path prefix), each independently addressable by `RouteID` for targeted unregistration. `NodeInfo` carries `{NodeID, NodeAddr, LastHeartbeat}`.
 
-`RegisterRoute` must atomically reserve the entry's routing key (subdomain, hostname, or path — whichever is set) (S3/H6): free → reserve; same `ClientID` re-registering → idempotent TTL refresh; held by a different, still-live client → return `ErrSubdomainConflict`; held by a stale (expired) entry → reclaim. `RedisStateStore` implements this with `SetArgs{Mode: "NX"}` on the relevant `wormhole:sub:*`/`wormhole:host:*`/`wormhole:path:*` key, falling back to a liveness check against `wormhole:route:<routeID>` on conflict; `MemoryStateStore` implements the same four-way semantics under its own lock via a shared `conflictsWith` helper.
+`RegisterRoute` must atomically reserve the entry's routing key (subdomain, hostname, or path — whichever is set): free → reserve; same `ClientID` re-registering → idempotent TTL refresh; held by a different, still-live client → return `ErrSubdomainConflict`; held by a stale (expired) entry → reclaim. `RedisStateStore` implements this with `SetArgs{Mode: "NX"}` on the relevant `wormhole:sub:*`/`wormhole:host:*`/`wormhole:path:*` key, falling back to a liveness check against `wormhole:route:<routeID>` on conflict; `MemoryStateStore` implements the same four-way semantics under its own lock via a shared `conflictsWith` helper.
 
 ### Backends
 
@@ -1186,61 +1172,63 @@ Redis key schema:
 | `wormhole:clientroutes:<clientID>` | 5 min | SET of `routeID`s owned by this client, for bulk cleanup on disconnect |
 | `wormhole:node:<nodeID>` | 90 s | `NodeInfo` JSON |
 
-`ListRoutes`/`GetNodes` (and the auth store's `ListTeams`/`CountRevokedTokens`) use `SCAN` cursors rather than `KEYS`, so large key spaces don't block the shared Redis instance (H7).
+`ListRoutes`/`GetNodes` (and the auth store's `ListTeams`/`CountRevokedTokens`) use `SCAN` cursors rather than `KEYS`, so large key spaces don't block the shared Redis instance.
 
-### Route TTL Refresh (H1)
+### Route TTL Refresh
 
-A route registered once and never touched again would silently expire out of Redis after 5 minutes even though the client is still connected — the single most damaging HA gap found in the v0.6 review. `ClientSession.clusterRoutes` tracks every `RouteEntry` a session has registered cluster-wide (its primary subdomain, plus any extra subdomains/hostnames/path prefixes from `RegisterTunnel`), and `TunnelRegistry.StartHeartbeat`'s 30s tick calls `refreshClusterRoutes` to re-run `RegisterRoute` for all of them — a `pipeline`-friendly batch that's functionally an `EXPIRE`/TTL-refresh rather than a fresh reservation, since the entry already belongs to this client.
+A route that were only ever registered once would silently expire out of Redis after 5 minutes even if the client is still connected. To prevent that, `ClientSession.clusterRoutes` tracks every `RouteEntry` a session has registered cluster-wide (its primary subdomain, plus any extra subdomains/hostnames/path prefixes from `RegisterTunnel`), and `TunnelRegistry.StartHeartbeat`'s 30s tick calls `refreshClusterRoutes` to re-run `RegisterRoute` for all of them — a `pipeline`-friendly batch that's functionally an `EXPIRE`/TTL-refresh rather than a fresh reservation, since the entry already belongs to this client.
 
 ### Cluster Heartbeat (`pkg/server/tunnel_registry.go`)
 
-As of P3-6 batch D, cluster bookkeeping (heartbeat, routing, port allocation) lives entirely in `TunnelRegistry`, one of the three components `Server` composes (see [Component Architecture](#component-architecture)); it no longer touches `Server`'s fields directly.
+Cluster bookkeeping (heartbeat, routing, port allocation) lives entirely in `TunnelRegistry`, one of the three components `Server` composes (see [Component Architecture](#component-architecture)); it never touches `Server`'s fields directly.
 
 ```
 TunnelRegistry.StartHeartbeat(ctx)
   ├── tick every 30s → NodeHeartbeat(NodeInfo{NodeID, NodeAddr})
-  │                     sendHeartbeat tracks StateStore reachability → tunnelRegistry.stateStoreHealthy (H9)
-  ├── tick every 30s → refreshClusterRoutes(client) for every connected session (H1)
+  │                     sendHeartbeat tracks StateStore reachability → tunnelRegistry.stateStoreHealthy
+  ├── tick every 30s → refreshClusterRoutes(client) for every connected session
   └── tick every 60s → EvictDeadNodes(90s threshold)
                            └── MemoryStateStore: scan + delete dead nodes + owned routes
-                               RedisStateStore: no-op — Redis TTL is the single source of truth for eviction (H8)
+                               RedisStateStore: no-op — Redis TTL is the single source of truth for eviction
 ```
 
 ### Cross-Node HTTP Routing
 
 ```
 ProxyService.ServeHTTP(r)
-  ├── verifyClusterSecret(r) → reject if --cluster-secret set and header missing/mismatched (S1)
+  ├── verifyClusterSecret(r) → reject if --cluster-secret set and header missing/mismatched
   ├── router.Route(host, path) → local ClientSession?
   │     └── Yes → forwardHTTP / handleWebSocket (normal path)
   └── No → registry.ResolveRemote(host, path)   [hostname → longest path-prefix → subdomain]
               └── found remote RouteEntry?
                     ├── registry.IsLocalNode? → continue to 404 (stale entry)
                     └── No  → proxyToNode(route.NodeAddr, w, r)
-                                  └── attach X-Wormhole-Cluster-Secret header (S1)
+                                  └── attach X-Wormhole-Cluster-Secret header
                                   └── validateClusterNodeAddr rejects anything but a bare host:port
                                   └── httputil.ReverseProxy → target node
 ```
 
-Hostname and path-prefix routes are indexed into Redis exactly like subdomains (H3), so a tunnel registered with `--hostname`/`--path` on node A is reachable through node B, not just its own subdomain.
+Hostname and path-prefix routes are indexed into Redis exactly like subdomains, so a tunnel registered with `--hostname`/`--path` on node A is reachable through node B, not just its own subdomain.
 
-**Node identity (H4)**: `applyClusterNodeIDDefault` defaults `Config.ClusterNodeID` to `os.Hostname()` whenever a cluster backend is configured but no explicit ID was given, so two nodes never accidentally share an empty NodeID.
+**Node identity**: `applyClusterNodeIDDefault` defaults `Config.ClusterNodeID` to `os.Hostname()` whenever a cluster backend is configured but no explicit ID was given, so two nodes never accidentally share an empty NodeID.
 
-**Stale ownership reclaim (H10)**: `router.go`'s `RegisterSubdomain`/`RegisterHostname`/`RegisterPath` check `isStaleOwner` (the existing owner's `Mux.IsClosed()`) before returning a conflict; `TunnelRegistry.registerClientRoute` mirrors this on the cluster side, proactively unregistering the dead session's `StateStore` entries. A client that reconnects after a network blip gets its subdomain/hostname/path back immediately instead of a transient conflict error.
+**Stale ownership reclaim**: `router.go`'s `RegisterSubdomain`/`RegisterHostname`/`RegisterPath` check `isStaleOwner` (the existing owner's `Mux.IsClosed()`) before returning a conflict; `TunnelRegistry.registerClientRoute` mirrors this on the cluster side, proactively unregistering the dead session's `StateStore` entries. A client that reconnects after a network blip gets its subdomain/hostname/path back immediately instead of a transient conflict error.
 
-**Health surfacing (H9)**: `GET /health` includes `cluster: {node_id, state_store_healthy}` (sourced from `TunnelRegistry.StateStoreHealth()`); if the state store becomes unreachable, overall `status` flips from `"ok"` to `"degraded"` so monitoring picks it up without needing a separate Redis probe.
+**Health surfacing**: `GET /health` includes `cluster: {node_id, state_store_healthy}` (sourced from `TunnelRegistry.StateStoreHealth()`); if the state store becomes unreachable, overall `status` flips from `"ok"` to `"degraded"` so monitoring picks it up without needing a separate Redis probe.
 
-### Inter-Node Authentication (S1)
+### Inter-Node Authentication
 
-`--cluster-secret` is a shared secret across all nodes in a cluster. `proxyToNode` (`pkg/server/proxy_service.go`) attaches it as `X-Wormhole-Cluster-Secret` on every proxied request; `verifyClusterSecret` (called first in `ProxyService.ServeHTTP`) rejects requests where the header is missing or doesn't match, and strips the header before continuing so it's never forwarded to the local tunnel client. Without a configured secret, no check is performed (backward-compatible with pre-S1 single-node/unsecured deployments) — operators running a real cluster should always set it, since without it a network peer could forge `X-Wormhole-*` proxy headers.
+`--cluster-secret` is a shared secret across all nodes in a cluster. `proxyToNode` (`pkg/server/proxy_service.go`) attaches it as `X-Wormhole-Cluster-Secret` on every proxied request; `verifyClusterSecret` (called first in `ProxyService.ServeHTTP`) rejects requests where the header is missing or doesn't match, and strips the header before continuing so it's never forwarded to the local tunnel client. Without a configured secret, no check is performed (backward-compatible with single-node/unsecured deployments) — operators running a real cluster should always set it, since without it a network peer could forge `X-Wormhole-*` proxy headers.
 
-### Shared Auth/Revocation State (H5)
+Before building the outbound proxy request, `proxyToNode` also runs the target through `validateClusterNodeAddr`, which rejects anything that isn't a clean `host:port` pair. This is defense in depth against a corrupted or tampered `StateStore` entry smuggling a scheme, userinfo, path, or query component into the proxy target — the request is always rebuilt from validated `host`/`port` components (`net.JoinHostPort`), never from the raw string.
+
+### Shared Auth/Revocation State
 
 `--persistence redis` (`pkg/auth/store_redis.go`, `auth.RedisStore`) stores teams under `wormhole:auth:team:<name>` and revoked tokens under `wormhole:auth:revoked:<tokenID>` with a Redis TTL matching the token's remaining lifetime — a token revoked on node A is invisible on node B the moment the write completes, with no propagation delay and no periodic sweep needed (`CleanupExpiredRevocations` is a no-op on this backend, since TTL already deletes the key). `--auth-redis-addr/-password/-db` fall back to `--cluster-redis-*` when unset, so a single Redis instance can back both cluster routing state and auth/revocation state with one flag.
 
-### TCP Tunnels Under HA (H2)
+### TCP Tunnels Under HA
 
-TCP tunnels are **node-local only**: a TCP tunnel's listener lives on whichever node the client happens to be connected to, and there is no cross-node TCP proxy (unlike the HTTP/WebSocket path, `StateStore` doesn't track TCP port ownership across nodes). Operators who need HA for TCP tunnels must put a TCP-aware load balancer (e.g. HAProxy in `mode tcp`, or an L4 DNS/anycast scheme) in front of the individual node addresses/ports themselves; Wormhole does not attempt to abstract this away. A full edge-port-proxy solution is tracked separately (see roadmap P3-6+) rather than bundled into this phase.
+TCP tunnels are **node-local only**: a TCP tunnel's listener lives on whichever node the client happens to be connected to, and there is no cross-node TCP proxy (unlike the HTTP/WebSocket path, `StateStore` doesn't track TCP port ownership across nodes). Operators who need HA for TCP tunnels must put a TCP-aware load balancer (e.g. HAProxy in `mode tcp`, or an L4 DNS/anycast scheme) in front of the individual node addresses/ports themselves; Wormhole does not attempt to abstract this away.
 
 ### Connection Limits
 
@@ -1250,150 +1238,18 @@ TCP tunnels are **node-local only**: a TCP tunnel's listener lives on whichever 
 
 ---
 
-## Robustness & Protocol Hardening (P3-6 Batch A)
+## Server & Client Composition
 
-The first sub-batch of the P3-6 architecture-refactoring phase closed out a set of correctness gaps found in the `review-v0.6.md` audit and removed dead code, without touching the hot-path allocation/context work reserved for batches B/C or the god-object decomposition reserved for batch D.
+Both `Server` and `Client` are composition roots: each constructs a small set of focused, independently testable components and wires them together, rather than owning every responsibility directly on one struct.
 
-### Graceful Shutdown (DP-26)
+### Server
 
-`Server` now holds the `*http.Server` values it constructs for the HTTP and admin listeners (previously they were only passed to `ListenAndServe`/`ListenAndServeTLS` and discarded). `Server.Shutdown()` calls `http.Server.Shutdown(ctx)` on each with a bounded timeout (`ShutdownTimeout`, default 10s) before closing the tunnel listener, so in-flight HTTP/admin requests get a chance to finish instead of having their connections yanked out from under them on `SIGTERM`.
-
-### Bidirectional Proxy Half-Close (DP-04)
-
-Both the WebSocket and TCP tunnel proxy paths pump two directions concurrently (client→local and local→client) with `io.Copy`. Previously, if one direction hit EOF/error first, the *other* direction only unblocked once its own read timed out or the peer independently closed — for a mostly-one-way conversation (e.g. a long-poll or an idle keep-alive) this could stall a stream's teardown for the full read timeout. Now the first direction to finish explicitly triggers a close/`CloseWrite` on the other side's connection, so both directions unwind immediately regardless of which one errors first.
-
-### Concurrent Stream Limits (DP-03 / DP-27)
-
-Two new server flags cap how many data-plane streams (HTTP/WebSocket/TCP proxy streams, not control-channel streams) can be open at once:
-
-- `--max-concurrent-streams` (default 10000): a global, process-wide counter. When the limit is hit, new stream requests are rejected outright (not queued) so a spike in traffic degrades predictably (fast rejections) instead of unboundedly growing goroutines/memory.
-- `--max-streams-per-client` (default 500): the same idea scoped to a single client connection, so one misbehaving or unusually busy tenant can't starve every other client's share of the global limit.
-
-Both are implemented as `atomic.Int64` counters incremented before a stream is dispatched and decremented when it completes; acquiring is non-blocking (`CompareAndSwap`-style check-then-increment), matching the "reject fast" philosophy rather than adding a blocking semaphore that could itself become a queuing hazard.
-
-### Control-Frame Validation (DP-17)
-
-`DecodeControlMessage` previously accepted any bytes that protobuf could unmarshal without error — including all-zero or garbage input that happens to decode to `MessageType_MESSAGE_TYPE_UNKNOWN` with every oneof field unset. That's now explicitly rejected (`errUnknownEmptyMessage`) since it can only be malformed/corrupted input, never a legitimate message. The check is narrow by design: a message with `Type == UNKNOWN` that *does* carry a recognized payload (session or P2P) is still accepted, preserving forward compatibility for future message types a newer client might send to an older server.
-
-### Protocol Version Gating & Real Capability Advertisement (DP-30 / DP-33)
-
-- **Version gating**: `pkg/version` gained a minimal semver parser/comparator (`ParseSemver`, `Compare`) — deliberately not a full semver library, since Wormhole only needs `MAJOR.MINOR.PATCH` comparison, not pre-release/build-metadata ordering. The server's new `--min-client-version` flag rejects `AuthRequest`s from clients reporting an older version, with a clear auth-failure reason. Clients built from a non-tagged source (e.g. `dev`, empty string) fail semver parsing and are deliberately *never* rejected — version gating is an opt-in operator control, not a hard requirement for running unreleased builds.
-- **Real capabilities**: `AuthResponse.Capabilities` previously didn't exist / was always empty. The server now populates it from `Server.capabilities()`, which derives the list (`p2p`, `multi-tunnel`, `cluster`, `audit`, ...) from the server's actual runtime configuration rather than a hardcoded aspirational list. The client stores the server's advertised capabilities and gates optional behavior on them — e.g. `sendP2POffer` is now skipped entirely if the server didn't advertise `"p2p"`, instead of always attempting an offer and relying on the server to silently ignore it. An absent/empty capability list (e.g. from an older server that predates this field) is treated as "unknown, assume supported" for backward compatibility.
-
-### Dead Code Removal (DP-15)
-
-`pkg/tunnel/pool.go` implemented a connection-pooling abstraction that was never wired into any caller — `Client`/`Server` always create a fresh `Mux` per connection rather than pulling from a pool. It and its tests were removed rather than kept as unreachable code that only adds maintenance burden and coverage noise.
-
-### UDP Protocol Cleanup (V1)
-
-The client CLI and config file previously listed `udp` as an accepted `--protocol` value even though the server has no UDP dataplane implementation (only the P2P subsystem uses UDP, as a *transport* underneath the reliable `UDPMux`/`UDPStream` layer — never exposed as a raw tunnel protocol). `ValidateProtocolString` now explicitly rejects `udp` with an actionable error message at the client/config-file layer, instead of silently falling back to HTTP semantics or letting a confusing failure surface deep in the server. `parseProtocol` (used at lower layers, e.g. persisted state) still defaults unrecognized strings to HTTP rather than erroring, preserving backward compatibility for already-persisted config.
-
-### CLI Parity (U1 / U4)
-
-- **`wormhole tunnels create/delete` (U1)**: the client's control API (`pkg/client/control.go`, gated behind `--ctrl-port` like the existing `list` endpoint) gained `POST /tunnels` and `DELETE /tunnels/{name}`, backed by new `Client.CreateTunnel`/`Client.DeleteTunnel` methods that register/unregister a tunnel on an already-running client process. This is the imperative counterpart to editing the YAML config and sending `SIGHUP` — useful for scripting or ad hoc tunnels without touching the client's persisted config at all. Tunnels added this way are not persisted; they don't survive a client restart unless also added to the config file.
-- **`wormhole server -c server.yml` (U4)**: `pkg/server/config_file.go` mirrors the client's existing `FileConfig`/`LoadClientFileConfig` pattern — a `FileConfig` struct maps the YAML schema to server settings (including custom `time.Duration` string parsing), `validate()` catches malformed values (bad durations, unknown persistence/backend enum values) at load time rather than failing confusingly deep inside `Config` consumers, and `ToServerConfig(base)` merges only explicitly-set fields onto a base config (typically `DefaultConfig()`), leaving everything else untouched. Boolean fields that need a real tri-state (unset / explicitly false / explicitly true) — like `EnableMetrics` — use `*bool` rather than `bool`, since a plain `bool` can't distinguish "not mentioned in the file" from "set to false".
-
----
-
-## Hot-Path Allocation Pooling (P3-6 Batch B)
-
-The second P3-6 sub-batch targeted the highest-impact hot-path allocations identified in `review-v0.6.md` (DP-09/DP-11/DP-12), all on the data-forwarding path rather than the control path — this is where per-byte/per-connection cost actually compounds under load. Batch C (context threading) and batch D (god-object decomposition) are separate, later sub-batches; this one deliberately stayed scoped to allocation reduction plus one correctness fix that surfaced while auditing the same code paths.
-
-### Mux Data-Send Buffer Pool (DP-09)
-
-`Stream.Write` chunks outgoing data into ≤32KB (`DefaultFramePayloadSize`) pieces and hands each to `Mux.sendData`, which previously did `payload := make([]byte, len(data)); copy(payload, data)` on every call — a fresh heap allocation per write, needed because the frame travels across `sendCh` to `sendLoop` asynchronously and the caller (often `io.CopyBuffer`) may reuse its buffer before that write happens.
-
-`Mux` now owns a `dataBufPool` (`sync.Pool` of `*[]byte`, each sized `DefaultFramePayloadSize`). `sendData` borrows a buffer sized to the current write instead of allocating one; `writeFrame` (running in `sendLoop`) returns it to the pool immediately after `FrameCodec.Encode` finishes writing it to the connection — safe because `Encode` never retains a reference to the payload past that call. A frame not sourced from the pool (nothing currently produces one, since the only caller — `Stream.Write` — always requests ≤32KB) falls back to a plain `make`, so nothing depends on this being the *only* path into `sendData`.
-
-Measured with `BenchmarkMux_SendData` (isolates `sendData` itself, bypassing `Stream`'s Read/Write and frame-decode overhead by draining the peer's raw bytes without parsing them):
-
-| Metric | Before | After | Δ |
-|--------|--------|-------|---|
-| B/op | 32817 | 85 | **-99.7%** |
-| allocs/op | 2 | 2 | unchanged |
-| ns/op | 7333 | 4274 | **-42%** |
-| MB/s | 4468 | 7667 | **+72%** |
-
-End-to-end (`BenchmarkMux_Throughput`, 32KB writes through the full send+receive stack): B/op 65733 → 34308 (**-47.8%**), ns/op 14525 → 10026 (**-31%**), MB/s 2256 → 3268 (**+45%**). A `go tool pprof -diff_base` comparison of heap profiles from that same benchmark (100000 iterations) attributes a **-3.01GB** flat reduction to `(*Mux).sendData` — net **-2.88GB** after accounting for the small amount the pool itself now costs (`sync.Pool.Get`/`newMux`'s pool initializer, +0.13GB).
-
-### Pooled Forwarding Buffers (DP-11)
-
-Every bidirectional proxy loop previously called plain `io.Copy`, which allocates its own internal 32KB scratch buffer on each call unless the source/destination implement `io.WriterTo`/`io.ReaderFrom` (the real `net.Conn`/`tunnel.Stream` types involved here don't). For short-lived proxied connections — the common case, and exactly what `MaxConcurrentStreams`/`MaxStreamsPerClient` (DP-03/27) bound the count of — that's a full 32KB paid per connection just to set up the copy loop.
-
-`copyWithPooledBuffer(dst, src)` is a drop-in `io.Copy` replacement that borrows its scratch buffer from a package-level `copyBufPool` (one in `pkg/server`, one in `pkg/client` — different packages, so separate pools) and returns it afterward via `io.CopyBuffer`. It replaced every forwarding `io.Copy` call:
-
-- **Server** (`pkg/server/proxy_service.go`): the HTTP response body copy in `forwardHTTP`, and both directions of the WebSocket proxy in `handleWebSocket`.
-- **Server** (`pkg/server/server.go`): `handleTCPConnection`'s manual Read/Write loops now pull their per-goroutine buffer from the same `copyBufPool` instead of a local `make([]byte, 32*1024)` — this one already reused a single buffer for the connection's lifetime rather than allocating per-iteration, but pooling it still bounds total memory under many concurrent TCP tunnels instead of `2 × 32KB × MaxConcurrentStreams` all being live simultaneously.
-- **Client** (`pkg/client/client.go`): both directions of `dialAndProxy` (relay-mode HTTP/TCP forwarding) and `proxyConnectConn` (`wormhole connect`'s direct P2P data path).
-
-Errors from these copies were previously discarded outright (`_, _ = io.Copy(...)`); they're now logged at `Debug` level (not `Error`, since a client mid-copy disconnect is an expected, non-actionable event, not a fault).
-
-Measured with a benchmark pair (`BenchmarkIOCopy_Baseline` vs `BenchmarkCopyWithPooledBuffer`) using reader/writer wrapper types that deliberately hide `WriterTo`/`ReaderFrom` so `io.Copy` is forced down its generic buffered path, matching what happens with real connections:
-
-| Metric | Before | After | Δ |
-|--------|--------|-------|---|
-| B/op | 36992 | 4244 | **-88.5%** |
-| allocs/op | 6 | 5 | -1 |
-| ns/op | 3938 | 821.8 | **-79%** |
-
-### Inspector Body-Read OOM Fix (DP-12)
-
-Not a performance change, but found while auditing the same forwarding code: `forwardHTTPWithInspect`'s comment claimed request/response bodies were "limited by MaxBodySize," but the actual reads (`io.ReadAll(httpReq.Body)`, `io.ReadAll(resp.Body)`) had no such limit — enabling `--inspector` and receiving one sufficiently large upload/download would buffer it entirely in memory regardless of the configured cap. Both reads are now wrapped in `io.LimitReader(body, MaxBodySize+1)` (the `+1` lets the truncation-detection logic downstream distinguish "exactly at the limit" from "over it," same convention `Inspector.Wrap` already uses). `Inspector` gained a `MaxBodySize()` accessor so callers outside the `inspector` package can size their own reads consistently with what `Capture` will store.
-
-This does mean a body larger than `MaxBodySize` is truncated *before* being forwarded to the local service, not just before being recorded — the same trade-off `Inspector.Wrap` already makes, and one specific to the inspector code path: relay/P2P forwarding without inspection (`forwardRawTCP`, `dialAndProxy`, DP-11 above) is untouched and remains fully unbounded, since the inspector is documented as a debugging aid, not something you'd enable for large-payload production traffic.
-
----
-
-## Context Propagation (P3-6 Batch C)
-
-The third P3-6 sub-batch closed DP-05/DP-06 from `review-v0.6.md`: several operations deep in the server's handler tree used `context.Background()` directly, so a `Shutdown()` in progress had no way to interrupt them — each one would only return once its own fixed timeout (e.g. `AuthTimeout`) elapsed, however long that took. Batch D (god-object decomposition) remains a separate, later sub-batch.
-
-### Server Root Context (DP-05)
-
-`Server.Start(ctx)` now derives `s.rootCtx, s.rootCancel = context.WithCancel(ctx)` as its very first step. `Shutdown()` calls `s.rootCancel()` immediately after `close(s.closeCh)` — before draining the HTTP/admin servers or closing ancillary resources — so every goroutine still selecting on that context sees the cancellation as early as possible.
-
-A new `serverCtx()` accessor returns `s.rootCtx` if set, or `context.Background()` otherwise. The fallback matters in practice: most of `pkg/server`'s test suite calls handler methods (`authenticateClient`, `handleRegister`, `handleTCPConnection`, ...) directly against a `Server` value that never went through `Start`, and `serverCtx()` keeps those working unchanged instead of requiring every test to first fake a root context.
-
-Four call sites that previously hardcoded `context.Background()` now call `s.serverCtx()`:
-
-| Call site | What it gates |
-|-----------|----------------|
-| `authenticateClient` | `AcceptStreamContext` timeout for the initial auth handshake stream |
-| `handleRegister` | `portAllocator.Allocate` when provisioning a TCP tunnel's listener port |
-| `notifyPeerOfP2P` | `OpenStreamContext` when opening the notification stream to a P2P peer |
-| `handleTCPConnection` | `OpenStreamContext` when opening the per-connection stream to the client |
-
-None of these change behavior during normal operation — `s.serverCtx()` behaves exactly like `context.Background()` until `Shutdown` cancels it. The effect is purely on the shutdown path: a client mid-handshake, or a TCP tunnel connection waiting on port allocation, no longer holds up graceful shutdown for the length of its own timeout.
-
-### Context-Aware Stream I/O (DP-06)
-
-`OpenStreamContext(ctx)` itself only ever checked `ctx` once, before sending the stream's handshake frame — it never blocked waiting for a reply, so that part was already correct. The gap DP-06 identified was downstream: once a caller had the resulting `*Stream`, the plain `Read`/`Write` methods had no way to observe a context at all. They could only be interrupted via `SetDeadline`/`SetReadDeadline`/`SetWriteDeadline` or by the stream/mux closing outright — a caller that opened the stream with a cancelable `ctx` lost that cancellation the moment `OpenStreamContext` returned.
-
-`pkg/tunnel/stream.go` now exposes `ReadContext(ctx, p)` and `WriteContext(ctx, p)`; `Read`/`Write` are thin wrappers that delegate to them with `context.Background()`. The key design constraint: the data-plane hot path (`io.CopyBuffer` and friends, which always call the ctx-less `Read`/`Write`) must not pay anything extra for this. That's why the ctx-awareness is opt-in per call rather than baked into the blocking wait itself:
-
-- If `ctx.Done()` is `nil` (true for `context.Background()`), no watcher goroutine is spawned and the method behaves exactly as before — zero added cost on the hot path.
-- If `ctx` is cancelable, a short-lived goroutine watches `ctx.Done()` for the duration of the call and calls `Broadcast()` on the relevant `sync.Cond` (`readCond`/`sendCond`) to wake up a blocked waiter early; the read/write loop then checks `ctx.Err()` on each wakeup (in addition to the existing deadline/close/window checks) and returns it immediately if set.
-
-`waitForSendWindow` was split out of `WriteContext` purely to keep its cyclomatic complexity within the project's `golangci-lint` (`gocyclo`) threshold — it holds no new behavior, just the existing send-window wait loop.
-
-`authenticateClient`'s read of the incoming `AuthRequest` now calls `stream.ReadContext(ctx, buf)` using the same `ctx` derived from `s.serverCtx()` above, chaining DP-05 and DP-06 together for the one call site the review specifically called out: `TestServer_AuthenticateClient_ServerCtxCancelUnblocks` sets `AuthTimeout` to 30s, cancels the server's root context while the handshake is blocked waiting for the client's `AuthRequest`, and asserts the call returns `context.Canceled` within milliseconds rather than the full 30 seconds.
-
-Once `ReadContext`/`WriteContext` existed, `golangci-lint`'s `contextcheck` analyzer flagged the same pattern in 14 places across `pkg/client/client.go` — every control-plane RPC (`authenticate`, `registerTunnel`, `registerOneTunnel`, `sendPing`, `sendP2POffer`, `sendP2PResult`, `RequestStats`, `CloseTunnel`) already received a `ctx` parameter but still called the plain `Read`/`Write`. These are the client-side mirror of the same DP-06 gap — a canceled `ctx` (e.g. from `Client.Close()` or a caller-supplied deadline) couldn't interrupt an in-flight control RPC any more than it could on the server. All 14 were switched to the `*Context` variants using the `ctx` already in scope.
-
----
-
-## God-Object Decomposition, Server Side (P3-6 Batch D)
-
-The fourth and riskiest P3-6 sub-batch addresses the data-plane review's finding that `Server` had accreted roughly 15 distinct responsibilities into one ~2,200-line struct (routing, client-session bookkeeping, TCP port allocation, cluster heartbeat, HTTP/WebSocket/TCP forwarding, stream-budget accounting, and P2P signaling all lived on the same receiver). Given the risk, this sub-batch is itself split into two checkpoints verified independently: the server side (this section) and the client side (`RelayClient`/`P2PSession`, see [below](#god-object-decomposition-client-side-p3-6-batch-d)).
-
-### Three New Components
-
-`Server` is now a composition root: `NewServer` constructs three independent components and wires them together, but no longer owns their state directly.
+`NewServer` constructs three components and hands each only the dependencies it needs:
 
 ```
 NewServer(config)
   ├── registry := newTunnelRegistry(config)                                    // TunnelRegistry
-  ├── metrics, auditLogger, authenticator, rateLimiter, tlsManager, adminAPI    // unchanged
+  ├── metrics, auditLogger, authenticator, rateLimiter, tlsManager, adminAPI
   ├── proxy  := newProxyService(registry.router, registry, config, metrics,
   │                             &stats, server.serverCtx)                       // ProxyService
   └── broker := newP2PBroker(registry, metrics, auditLogger, server.serverCtx)  // P2PBroker
@@ -1402,39 +1258,14 @@ NewServer(config)
 | Component | File | Owns |
 |-----------|------|------|
 | `TunnelRegistry` | `pkg/server/tunnel_registry.go` | `*Router`, the `clients` map + its lock, `TCPPortAllocator`, `StateStore` + its health flag, and the cluster-heartbeat goroutine |
-| `ProxyService` | `pkg/server/proxy_service.go` | HTTP/WebSocket/TCP forwarding (implements `http.Handler`), the global/per-client concurrent-stream budget (DP-03/27), and the pooled-buffer copy helpers (DP-11) |
+| `ProxyService` | `pkg/server/proxy_service.go` | HTTP/WebSocket/TCP forwarding (implements `http.Handler`) and the concurrent-stream budget |
 | `P2PBroker` | `pkg/server/p2p_broker.go` | `wormhole connect` offer/result handling, NAT-compatibility checks, port-prediction candidate generation |
 
-Each component takes its dependencies as explicit constructor parameters (`Config`, the other components it needs to call into, `*Metrics`, `*Stats`, a `serverCtx func() context.Context`) rather than reaching into a shared `*Server`. `ProxyService` and `P2PBroker` depend on `TunnelRegistry` through its `TunnelRegistry` interface, not the concrete struct — the interface is intentionally small (consumer-side interfaces, one of the review's Go-idioms recommendations) and only exposes what a forwarding/signaling caller actually needs (`ResolveLocal`, `ResolveRemote`, `IsLocalNode`, `FindPeerBySubdomain`, `AllocatePort`, ...), not the registry's full internal surface.
+`ProxyService` and `P2PBroker` depend on `TunnelRegistry` through a small `TunnelRegistry` interface, not the concrete struct — it only exposes what a forwarding/signaling caller actually needs (`ResolveLocal`, `ResolveRemote`, `IsLocalNode`, `FindPeerBySubdomain`, `AllocatePort`, ...), not the registry's full internal surface. `admin.go`'s `/health`, `/stats`, `/clients`, and `/tunnels` handlers go through this same interface (`registry.StateStoreHealth()`, `registry.AllocatedPorts()`, `registry.ActiveRoutes()`, `registry.Snapshot()`) rather than reaching into `Server`'s internals — the admin API's read path doesn't need to know anything about the registry's internal locking scheme.
 
-`admin.go`'s `/health`, `/stats`, `/clients`, and `/tunnels` handlers were updated the same way: they now call `registry.StateStoreHealth()`, `registry.AllocatedPorts()`, `registry.ActiveRoutes()`, and `registry.Snapshot()` instead of reaching past `Server` into its former `stateStoreHealthy`/`portAllocator`/`router`/`clients`+`clientLock` fields directly — a concrete illustration of what the decomposition buys: the admin API's read path no longer needs to know `Server`'s internal locking scheme at all.
+### Client
 
-The former `handler.go` (mostly `HTTPHandler` methods) and `cluster.go` (heartbeat/routing helpers) are deleted; their contents were absorbed into `proxy_service.go` and `tunnel_registry.go` respectively rather than kept as separate files, since nothing outside those two components calls into them anymore.
-
-### Incidental Hardening: `validateClusterNodeAddr`
-
-While moving `proxyToNode` into `proxy_service.go`, consolidating it into the same file as `ServeHTTP` made an existing gosec SSRF finding (G704) newly reachable by the linter's taint analysis (the cross-file split previously happened to keep it from connecting `route.NodeAddr` to `httputil.NewSingleHostReverseProxy` in one pass). Investigating gosec's own source (`analyzers/ssrf.go`) confirmed G704 registers **no sanitizers at all** — no amount of validation code can make the finding disappear on its own, by the tool's own design. Rather than default to a bare `#nosec`, `proxyToNode` first calls `validateClusterNodeAddr`, which rejects anything that isn't a clean `host:port` pair (via `net.SplitHostPort` plus a character-class check on the host) before the proxy target is ever built from validated components (`net.JoinHostPort`), not the raw string. This is genuine defense in depth — it stops a corrupted or tampered `StateStore` entry from smuggling a scheme, userinfo, path, or query component into the outbound request — and the line-scoped `#nosec G704` comment that remains documents *why* the suppression is unavoidable rather than just silencing the tool.
-
-### Test Fallout: Two Real Bugs Found by the Refactor
-
-Updating the test suite's server constructors to go through `NewServer(config)` (for production-parity wiring) instead of hand-built `&Server{...}` literals surfaced two genuine bugs that the previous, more tightly-coupled test setup had been masking:
-
-1. **Stale config snapshot in cross-node routing tests**: `TunnelRegistry` captures `Config` by value at construction time. A cluster test that mutated `serverA.config.ClusterNodeAddr` *after* constructing the server (to point at an `httptest.Server` whose address isn't known until it starts listening) no longer propagated to `registry.cfg.ClusterNodeAddr`, so routes registered afterward carried an empty `NodeAddr` and cross-node requests 404'd. Production code never mutates `ClusterNodeAddr` after startup, so this is a test-only fix (explicitly re-syncing `registry.cfg.ClusterNodeAddr` after the address becomes known), not a product bug — but it's a direct consequence of the decomposition worth documenting for anyone touching cluster tests later.
-2. **Double-counted stream budget in saturation tests**: Two stream-limit tests constructed a *second*, independent `proxyService` (via `newProxyService(...)`) to be the object under test, but then called `tryAcquireStreamSlot` on the original server's `server.proxy` to "occupy" the budget — two different counters, so the occupied slot never showed up to the handler being exercised, and the test's saturation assertion dereferenced a nil release func. Fixed by acquiring the slot on the same `proxyService` instance the test actually calls `ServeHTTP` on.
-
-### Verification
-
-`go build ./...`, `go vet ./...`, `golangci-lint run ./...` (0 issues), `gosec -exclude=G115 -exclude-dir=web -exclude-dir=pkg/proto/pb ./...` (0 issues, matching CI's exact invocation), and `go test -race ./...` all pass; `pkg/server` coverage held at 78.0%, essentially unchanged from before the split.
-
----
-
-## God-Object Decomposition, Client Side (P3-6 Batch D)
-
-The second checkpoint of batch D applies the same methodology to the client's mirror-image god object: `Client` (`pkg/client/client.go`) had grown to ~2,100 lines covering control-plane connection/auth/reconnect, multi-tunnel registration, heartbeat, and the entire `wormhole connect` P2P subsystem (NAT discovery, ECDH key exchange, hole punching, the P2P data plane) — all guarded by one `c.mu`.
-
-### Two New Components
-
-`Client` is now a composition root: `NewClient` constructs `RelayClient` and `P2PSession` and wires them together with a handful of callbacks, but no longer owns their connection/session state directly.
+`NewClient` constructs two components and wires them together with a handful of callbacks:
 
 ```
 NewClient(config)
@@ -1447,18 +1278,49 @@ NewClient(config)
 
 | Component | File | Owns |
 |-----------|------|------|
-| `RelayClient` | `pkg/client/relay_client.go` | The control-plane `net.Conn`/`tunnel.Mux`, `connected` flag (atomic), auth + token-refresh, single-/multi-tunnel registration and the `activeTunnels` map, the heartbeat goroutine, and the reconnect loop (`Run`) |
-| `P2PSession` | `pkg/client/p2p_session.go` | The P2P `net.PacketConn`/`*p2p.UDPMux`, ECDH `KeyPair`/`SessionCipher`, `mode` flag (atomic: relay vs. P2P), the hole-punch attempt (`attemptP2P`), and the `wormhole connect` local listener (`startConnectListener`/`proxyConnectConn`) |
+| `RelayClient` | `pkg/client/relay_client.go` | The control-plane `net.Conn`/`tunnel.Mux`, auth + token-refresh, single-/multi-tunnel registration and the `activeTunnels` map, the heartbeat goroutine, and the reconnect loop (`Run`) |
+| `P2PSession` | `pkg/client/p2p_session.go` | The P2P `net.PacketConn`/`*p2p.UDPMux`, ECDH `KeyPair`/`SessionCipher`, the hole-punch attempt (`attemptP2P`), and the `wormhole connect` local listener (`startConnectListener`/`proxyConnectConn`) |
 
-Both components depend on `Client` only through two small consumer-side interfaces it implements — `localForwarder` (hand a stream off to be proxied to the local service) and `statsRecorder` (report bytes/connections into the aggregate `Stats`) — so neither `RelayClient` nor `P2PSession` needs to know `Client` exists as a concrete type. `P2PSession` talks back to `RelayClient` only through the minimal `RelayChannel` interface (send a P2P result over the control connection), not the full `RelayClient` surface. `Client` retains its own `c.mu` only for state it still owns directly (the local control/inspector HTTP servers); connection state lives in `relay.mu`, and P2P session state lives in `p2p.mu`.
+Both components depend on `Client` only through two small consumer-side interfaces it implements — `localForwarder` (hand a stream off to be proxied to the local service) and `statsRecorder` (report bytes/connections into the aggregate `Stats`) — so neither `RelayClient` nor `P2PSession` needs to know `Client` exists as a concrete type. `P2PSession` talks back to `RelayClient` only through the minimal `RelayChannel` interface (send a P2P result over the control connection), not the full `RelayClient` surface. `Client` retains its own mutex only for state it still owns directly (the local control/inspector HTTP servers); connection state lives behind `RelayClient`'s own lock, and P2P session state behind `P2PSession`'s.
 
-### Test Fallout
+---
 
-Unlike the server-side checkpoint, migrating `client_test.go` and `control_test.go` to construct clients via `NewClient(config)` (instead of hand-built `&Client{...}` literals) did not surface any behavioral bugs — the client's original locking was already reasonably self-consistent. The bulk of the work was mechanical: retargeting field/method accesses (e.g. `c.mux` → `c.relay.mux`, `c.p2pManager` → `c.p2p.manager`) and re-pointing each `c.mu.Lock()`/`Unlock()` block at `c.relay.mu` or `c.p2p.mu` depending on which component's state it actually protects.
+## Reliability & Protocol Safeguards
 
-### Verification
+### Graceful Shutdown
 
-`go build ./...`, `go vet ./...`, `golangci-lint run ./...` (0 issues), `gosec -exclude=G115 -exclude-dir=web -exclude-dir=pkg/proto/pb ./...` (0 issues), and `go test -race ./...` all pass; `pkg/client` coverage improved slightly from 70.8% to 71.5%. This closes out P3-6 batch D in full (server + client).
+`Server` holds the `*http.Server` values it constructs for the HTTP and admin listeners. `Server.Shutdown()` calls `http.Server.Shutdown(ctx)` on each with a bounded timeout (`ShutdownTimeout`, default 10s) before closing the tunnel listener, so in-flight HTTP/admin requests get a chance to finish instead of having their connections cut on `SIGTERM`.
+
+`Start(ctx)` also derives a root context (`s.rootCtx`/`s.rootCancel`) that `Shutdown()` cancels as its first step, before draining the HTTP/admin servers. Several operations deep in the handler tree — the auth handshake's stream-accept, TCP port allocation, opening a P2P peer-notification stream, opening a TCP-tunnel stream — take this root context instead of `context.Background()`, so a shutdown in progress unblocks them immediately rather than waiting out their own fixed timeout (e.g. `AuthTimeout`). `tunnel.Stream` exposes `ReadContext`/`WriteContext` variants for the same reason: a caller holding a cancelable context can interrupt an in-progress blocking read/write. The plain `Read`/`Write` methods still delegate to them with `context.Background()`, so the data-plane hot path (`io.CopyBuffer` and friends) pays no extra cost — no watcher goroutine is spawned when the context can never fire. Every control-plane RPC on both server and client (auth, tunnel registration, heartbeat ping, stats, tunnel close, P2P offer/result) uses the context-aware variants, so `Client.Close()` or a caller-supplied deadline can interrupt an in-flight control RPC the same way.
+
+### Bidirectional Proxy Half-Close
+
+The WebSocket and TCP tunnel proxy paths pump two directions concurrently (client→local and local→client). The first direction to hit EOF/error explicitly closes (or `CloseWrite`s) the other side's connection, so both directions unwind together regardless of which one errors first — a mostly one-way conversation (e.g. a long-poll or an idle keep-alive) doesn't stall teardown until the other side's own read timeout elapses.
+
+### Concurrent Stream Limits
+
+Two server flags cap how many data-plane streams (HTTP/WebSocket/TCP proxy streams, not control-channel streams) can be open at once: `--max-concurrent-streams` (default 10000, a global process-wide cap) and `--max-streams-per-client` (default 500, scoped to a single client connection so one busy tenant can't starve everyone else's share). Both are non-blocking `atomic.Int64` counters — a stream request over the limit is rejected outright rather than queued, so a traffic spike degrades as predictable fast rejections instead of unboundedly growing goroutines/memory.
+
+### Control-Frame Validation
+
+`DecodeControlMessage` rejects all-zero/garbage input that happens to decode to `MessageType_MESSAGE_TYPE_UNKNOWN` with every oneof field unset, since that shape can only be malformed or corrupted input, never a legitimate message. The check is narrow by design: a message with `Type == UNKNOWN` that *does* carry a recognized payload (session or P2P) is still accepted, preserving forward compatibility for message types a newer client might send to an older server.
+
+### Version Gating & Capability Advertisement
+
+`pkg/version` implements a minimal semver parser/comparator (`ParseSemver`, `Compare`) — deliberately not a full semver library, since Wormhole only needs `MAJOR.MINOR.PATCH` comparison. The server's `--min-client-version` flag rejects `AuthRequest`s from clients reporting an older version, with a clear auth-failure reason; clients built from a non-tagged source (e.g. `dev`, empty string) fail semver parsing and are deliberately *never* rejected, since version gating is an opt-in operator control rather than a hard requirement for running unreleased builds.
+
+`AuthResponse.Capabilities` is populated from `Server.capabilities()`, which derives the list (`p2p`, `multi-tunnel`, `cluster`, `audit`, ...) from the server's actual runtime configuration. The client stores the server's advertised capabilities and gates optional behavior on them — e.g. it skips sending a P2P offer entirely if the server didn't advertise `"p2p"`, instead of always attempting one and relying on the server to silently ignore it. An absent/empty capability list (e.g. from an older server that predates this field) is treated as "unknown, assume supported" for backward compatibility.
+
+---
+
+## Hot-Path Performance
+
+The tunnel multiplexer's data-send path and every bidirectional proxy loop reuse pooled scratch buffers instead of allocating a fresh one per write/connection, which meaningfully reduces per-operation allocation and GC pressure under load:
+
+- `Mux` owns a `dataBufPool` (`sync.Pool`) that `sendData` borrows from instead of doing `make([]byte, len(data)); copy(...)` on every `Stream.Write`; the buffer is returned once the frame has been written to the connection.
+- `copyWithPooledBuffer(dst, src)` is a drop-in `io.Copy` replacement (via `io.CopyBuffer`) backed by a package-level pool (`pkg/server` and `pkg/client` each keep their own), used by every forwarding loop: the server's HTTP response body copy, WebSocket proxy, and TCP tunnel proxy, and the client's relay-mode `dialAndProxy` and `wormhole connect`'s `proxyConnectConn`.
+
+`forwardHTTPWithInspect` bounds its request/response body reads with `io.LimitReader(body, MaxBodySize+1)` — enabling `--inspector` never buffers an unbounded body in memory regardless of upload/download size. `Inspector.MaxBodySize()` exposes the configured limit so callers outside the `inspector` package can size their own reads consistently with what `Capture` stores. This only applies to the inspector code path; relay/P2P forwarding without inspection remains fully unbounded, since the inspector is a debugging aid rather than something enabled for large-payload production traffic.
 
 ---
 

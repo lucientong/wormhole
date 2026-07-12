@@ -102,7 +102,7 @@ func (s *Stream) Read(p []byte) (int, error) {
 }
 
 // ReadContext reads data from the stream like Read, but additionally
-// unblocks with ctx.Err() as soon as ctx is canceled (DP-06). Without this,
+// unblocks with ctx.Err() as soon as ctx is canceled. Without this,
 // a caller that opened the stream with a cancelable context (e.g.
 // OpenStreamContext) had no way to interrupt a subsequent blocking Read —
 // only SetReadDeadline or closing the stream/mux could do so. Read delegates
@@ -214,7 +214,7 @@ func (s *Stream) waitForSendWindow(ctx context.Context) error {
 }
 
 // WriteContext writes data to the stream like Write, but additionally
-// unblocks with ctx.Err() as soon as ctx is canceled (DP-06), while
+// unblocks with ctx.Err() as soon as ctx is canceled, while
 // waiting for send-window space. See ReadContext for why this costs
 // nothing on the hot data-copy path, which always calls plain Write.
 func (s *Stream) WriteContext(ctx context.Context, p []byte) (int, error) {

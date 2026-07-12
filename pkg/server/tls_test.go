@@ -228,7 +228,7 @@ func TestTLSManager_CertCacheDir(t *testing.T) {
 }
 
 // TestTLSManager_TunnelTLSConfig_Disabled verifies that TunnelTLSConfig is
-// gated on TunnelTLSEnabled independently of TLSEnabled (S4).
+// gated on TunnelTLSEnabled independently of TLSEnabled.
 func TestTLSManager_TunnelTLSConfig_Disabled(t *testing.T) {
 	config := DefaultConfig()
 	config.TLSEnabled = true // HTTP TLS on, tunnel TLS off.
@@ -242,7 +242,7 @@ func TestTLSManager_TunnelTLSConfig_Disabled(t *testing.T) {
 
 // TestTLSManager_TunnelTLSConfig_ManualFiles verifies that TunnelTLSConfig
 // can be satisfied even when the HTTP-facing TLSEnabled is false — i.e. the
-// two listeners' TLS settings are fully decoupled (S4).
+// two listeners' TLS settings are fully decoupled.
 func TestTLSManager_TunnelTLSConfig_ManualFiles(t *testing.T) {
 	tmpDir := t.TempDir()
 	certFile := filepath.Join(tmpDir, "cert.pem")
@@ -267,7 +267,7 @@ func TestTLSManager_TunnelTLSConfig_ManualFiles(t *testing.T) {
 // unlike WrapListener, WrapTunnelListenerStrict surfaces TLS configuration
 // errors to the caller instead of silently falling back to plaintext, so
 // server startup can fail closed when RequireAuth demands an encrypted
-// control channel (S4).
+// control channel.
 func TestTLSManager_WrapTunnelListenerStrict_PropagatesError(t *testing.T) {
 	config := DefaultConfig()
 	config.TunnelTLSEnabled = true

@@ -33,7 +33,7 @@ type RelayChannel interface {
 	// in multi-tunnel/connect mode or before registration).
 	TunnelID() string
 	// ServerSupports reports whether the server advertised the given
-	// capability (DP-33); see relayClient.ServerSupports for the exact
+	// capability; see relayClient.ServerSupports for the exact
 	// "unknown capability list" semantics.
 	ServerSupports(capability string) bool
 }
@@ -126,7 +126,7 @@ func (p *p2pSession) IsP2PMode() bool {
 
 // MaybeSendOffer sends a P2P offer to the server with this client's NAT
 // info, gated on P2P being enabled, NAT discovery having succeeded, and
-// the server advertising support for it (DP-33) — an older server that
+// the server advertising support for it — an older server that
 // sent no Capabilities is treated as "unknown" and still attempted. It
 // also generates an ECDH key pair and includes the public key for E2E
 // encryption.
@@ -194,7 +194,7 @@ func (p *p2pSession) MaybeSendOffer(ctx context.Context, relay RelayChannel) {
 	// handleP2POffer server-side) before the terminal P2POfferResponse.
 	// Both are length-prefixed via proto.WriteControlMessage, so we
 	// loop-read framed messages rather than relying on a single raw
-	// stream.Read() to capture the whole exchange (DP-24).
+	// stream.Read() to capture the whole exchange.
 	resp, candidates, readErr := readP2POfferResponse(stream)
 	if readErr != nil {
 		log.Debug().Err(readErr).Msg("Failed to read P2P offer response")
@@ -206,7 +206,7 @@ func (p *p2pSession) MaybeSendOffer(ctx context.Context, relay RelayChannel) {
 
 // readP2POfferResponse loop-reads framed control messages from stream until
 // the terminal P2POfferResponse arrives, collecting any P2PCandidates sent
-// beforehand (DP-24).
+// beforehand.
 func readP2POfferResponse(stream io.Reader) (*proto.P2POfferResponse, []string, error) {
 	var candidates []string
 	for {
@@ -478,7 +478,7 @@ func (p *p2pSession) proxyConnectConn(mux *p2p.UDPMux, localConn net.Conn, peerT
 	}
 
 	// p2p.UDPStream has no half-close, so — as in Server.handleTCPConnection
-	// and ProxyService.handleWebSocket (DP-04) — close both ends as soon as
+	// and ProxyService.handleWebSocket — close both ends as soon as
 	// either direction finishes to unblock the other immediately rather
 	// than leaving it running until the deferred closes above happen to
 	// fire when this function eventually returns.
@@ -578,8 +578,9 @@ func (p *p2pSession) sendP2PResult(ctx context.Context, relay RelayChannel, succ
 // HandleNotification handles incoming P2P notifications from the server.
 // This is called when another client wants to establish a P2P connection
 // with us. candidates carries any predicted peer ports received alongside
-// the offer response (Symmetric+Symmetric NAT port prediction); consuming
-// them in the hole-punch attempt itself is tracked in P3-3.
+// the offer response (Symmetric+Symmetric NAT port prediction); they are
+// logged for diagnostics but not yet consumed by the hole-punch attempt
+// itself.
 func (p *p2pSession) HandleNotification(ctx context.Context, relay RelayChannel, resp *proto.P2POfferResponse, candidates []string) {
 	if !resp.Success || resp.PeerAddr == "" {
 		return

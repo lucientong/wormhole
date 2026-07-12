@@ -78,7 +78,7 @@ func init() {
 	clientCmd.Flags().IntVar(&clientCtrlPort, "ctrl-port", 0, "Local control server port for 'wormhole tunnels list' (0 = disabled)")
 	// Note: --local/--config requiredness is validated manually in runClient
 	// (not via MarkFlagsOneRequired) so that neither flag being set can fall
-	// through to default tunnel-config-file discovery (U3) before erroring.
+	// through to default tunnel-config-file discovery before erroring.
 }
 
 func runClient(cmd *cobra.Command, _ []string) {
@@ -220,7 +220,7 @@ func startClient(localPort int, serverAddr, localHost, subdomain, token string, 
 // resolveClientCredentials loads saved OIDC credentials for cfg.ServerAddr
 // when no --token was explicitly given (and the YAML config didn't set one
 // either), transparently refreshing an expired access token if a
-// refresh_token is available (S5, O1-O4). It also wires cfg.OnAuthFailure so
+// refresh_token is available. It also wires cfg.OnAuthFailure so
 // a token that expires mid-session or across a reconnect is refreshed
 // automatically without requiring the user to run `wormhole login` again.
 func resolveClientCredentials(cfg *client.Config, tokenExplicitlySet bool) {

@@ -15,13 +15,13 @@ const (
 	redisRoutePrefix     = "wormhole:route:"        // wormhole:route:<routeID> → JSON RouteEntry
 	redisNodePrefix      = "wormhole:node:"         // wormhole:node:<nodeID> → JSON NodeInfo
 	redisSubdomainIdx    = "wormhole:sub:"          // wormhole:sub:<subdomain> → routeID
-	redisHostnameIdx     = "wormhole:host:"         // wormhole:host:<hostname> → routeID (H3)
-	redisPathIdx         = "wormhole:path:"         // wormhole:path:<normalized path> → routeID (H3)
+	redisHostnameIdx     = "wormhole:host:"         // wormhole:host:<hostname> → routeID
+	redisPathIdx         = "wormhole:path:"         // wormhole:path:<normalized path> → routeID
 	redisClientRoutesIdx = "wormhole:clientroutes:" // wormhole:clientroutes:<clientID> → SET of routeIDs
 
 	// defaultRouteTTL is how long a route persists after its last refresh.
 	// The owning node re-registers (refreshes) every live route on each
-	// heartbeat tick (see Server.refreshClusterRoutes, H1), which runs far
+	// heartbeat tick (see Server.refreshClusterRoutes), which runs far
 	// more often than this TTL, so a route only actually expires when its
 	// owning node has stopped heartbeating entirely.
 	defaultRouteTTL = 5 * time.Minute
@@ -41,8 +41,8 @@ const (
 //
 //	wormhole:route:<routeID>        — JSON RouteEntry, TTL = defaultRouteTTL
 //	wormhole:sub:<subdomain>        — routeID string, TTL = defaultRouteTTL
-//	wormhole:host:<hostname>        — routeID string, TTL = defaultRouteTTL (H3)
-//	wormhole:path:<norm path>       — routeID string, TTL = defaultRouteTTL (H3)
+//	wormhole:host:<hostname> — routeID string, TTL = defaultRouteTTL
+//	wormhole:path:<norm path> — routeID string, TTL = defaultRouteTTL
 //	wormhole:clientroutes:<clientID> — SET of routeIDs owned by clientID, TTL = defaultRouteTTL
 //	wormhole:node:<nodeID>          — JSON NodeInfo, TTL = defaultNodeTTL
 type RedisStateStore struct {
@@ -107,13 +107,14 @@ func indexKey(entry RouteEntry) (key, desc string) {
 }
 
 // RegisterRoute atomically reserves entry's routing key (whichever of
-// Subdomain/Hostname/PathPrefix is set) via SetArgs{Mode:"NX"} (S3/H6/H3)
+// Subdomain/Hostname/PathPrefix is set) via SetArgs{Mode:"NX"}
 // instead of a plain SET, which previously let two nodes racing to
 // register the same key silently overwrite each other (last-writer-wins).
 // Semantics:
 //
 //   - Key free                              → reserve it for entry.Key().
-//   - Key already owned by entry.Key()       → idempotent TTL refresh (H1).
+//
+// - Key already owned by entry.Key() → idempotent TTL refresh.
 //   - Key owned by another route entry whose storage record has expired
 //     (crashed without calling UnregisterRoute) → reclaim it.
 //   - Key owned by another *live* route entry  → ErrSubdomainConflict.
@@ -298,14 +299,14 @@ func (r *RedisStateStore) LookupBySubdomain(subdomain string) (*RouteEntry, erro
 	return r.lookupByIndex(redisSubdomainIdx + strings.ToLower(subdomain))
 }
 
-// LookupByHostname implements H3: custom-hostname routes are now indexed
+// LookupByHostname looks up a custom-hostname route: hostnames are indexed
 // in Redis the same way subdomains are, so cross-node fallback can find a
 // client's custom-hostname tunnel regardless of which node it's connected to.
 func (r *RedisStateStore) LookupByHostname(hostname string) (*RouteEntry, error) {
 	return r.lookupByIndex(redisHostnameIdx + strings.ToLower(hostname))
 }
 
-// LookupByPathPrefix implements H3's path-routing half. Path routes need a
+// LookupByPathPrefix handles the path-routing half. Path routes need a
 // longest-prefix match rather than an exact key lookup, so this scans the
 // (typically small) set of registered path keys instead of doing a single
 // GET, mirroring Router.matchPath's local semantics.
@@ -387,8 +388,8 @@ func (r *RedisStateStore) GetNodes() ([]NodeInfo, error) {
 	return out, nil
 }
 
-// scanKeys returns all keys matching keyPattern using SCAN rather than KEYS
-// (H7): KEYS blocks the single-threaded Redis event loop for its entire
+// scanKeys returns all keys matching keyPattern using SCAN rather than KEYS:
+// KEYS blocks the single-threaded Redis event loop for its entire
 // O(N) traversal of the whole keyspace, which is a real availability risk
 // once the keyspace holds more than a trivial number of entries. SCAN
 // iterates in bounded-size cursor batches instead.
@@ -410,7 +411,7 @@ func (r *RedisStateStore) scanKeys(ctx context.Context, keyPattern string) ([]st
 }
 
 // scanJSON fetches all values matching keyPattern from Redis and returns them as
-// a slice of raw JSON byte slices, using SCAN (H7) + a single MGET per batch of
+// a slice of raw JSON byte slices, using SCAN + a single MGET per batch of
 // keys to minimize round-trips without blocking on KEYS.
 func (r *RedisStateStore) scanJSON(ctx context.Context, keyPattern string) ([][]byte, error) {
 	keys, err := r.scanKeys(ctx, keyPattern)
@@ -439,8 +440,8 @@ func (r *RedisStateStore) scanJSON(ctx context.Context, keyPattern string) ([][]
 
 // EvictDeadNodes is a no-op for Redis because Redis TTL handles expiry
 // automatically: a dead node stops refreshing its own routes (see
-// Server.refreshClusterRoutes, H1) and its wormhole:node:<id> heartbeat key
-// and abandoned route/index keys all expire via their own TTLs (H8) without
+// Server.refreshClusterRoutes) and its wormhole:node:<id> heartbeat key
+// and abandoned route/index keys all expire via their own TTLs without
 // needing an explicit sweep.
 func (r *RedisStateStore) EvictDeadNodes(_ time.Duration) error {
 	return nil

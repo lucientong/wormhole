@@ -432,7 +432,7 @@ func TestDecodeControlMessage_BothFormats(t *testing.T) {
 	assert.Equal(t, fromPB.RegisterRequest.PathPrefix, fromJSON.RegisterRequest.PathPrefix)
 }
 
-// --- DP-17: DecodeControlMessage must reject fully-empty UNKNOWN messages ---
+// --- DecodeControlMessage must reject fully-empty UNKNOWN messages ---
 
 // TestDecodeControlMessage_RejectsEmptyProtobuf verifies that bytes which
 // protobuf-unmarshal "successfully" into an all-zero message (Type ==
@@ -448,8 +448,8 @@ func TestDecodeControlMessage_RejectsEmptyProtobuf(t *testing.T) {
 	assert.Error(t, decErr)
 }
 
-// TestDecodeControlMessage_RejectsGarbageBytes covers the original DP-17
-// report more directly: arbitrary bytes that aren't a valid control
+// TestDecodeControlMessage_RejectsGarbageBytes covers this more directly:
+// arbitrary bytes that aren't a valid control
 // message at all must return an error, not an empty-but-"successful"
 // ControlMessage.
 func TestDecodeControlMessage_RejectsGarbageBytes(t *testing.T) {
@@ -467,8 +467,8 @@ func TestDecodeControlMessage_RejectsGarbageBytes(t *testing.T) {
 // TestDecodeControlMessage_AllowsUnrecognizedButNonEmptyType verifies
 // that a deliberate, forward-compatible message using a MessageType this
 // build doesn't recognize (but that isn't the zero UNKNOWN sentinel) is
-// still accepted — DP-17 only targets the fully-empty garbage shape, not
-// legitimate protocol evolution.
+// still accepted — the rejection logic only targets the fully-empty
+// garbage shape, not legitimate protocol evolution.
 func TestDecodeControlMessage_AllowsUnrecognizedButNonEmptyType(t *testing.T) {
 	msg := &ControlMessage{Type: MessageType(255)}
 	data, err := msg.Encode()

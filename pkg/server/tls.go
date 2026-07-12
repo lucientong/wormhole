@@ -45,8 +45,8 @@ func (m *TLSManager) TLSConfig() (*tls.Config, error) {
 
 // autoTLSConfig sets up automatic certificate management via Let's Encrypt.
 // The underlying autocert.Manager is created once and reused across calls
-// (e.g. from both TLSConfig() and TunnelTLSConfig() when S4 enables TLS on
-// both the HTTP and tunnel control listeners) so they share one certificate
+// (e.g. from both TLSConfig() and TunnelTLSConfig() when both the HTTP
+// and tunnel control listeners have TLS enabled) so they share one certificate
 // cache instead of racing to provision it independently.
 func (m *TLSManager) autoTLSConfig() (*tls.Config, error) {
 	if m.config.Domain == "" || m.config.Domain == defaultDomain {
@@ -135,7 +135,7 @@ func (m *TLSManager) WrapListener(ln net.Listener) net.Listener {
 
 // TunnelTLSConfig returns a *tls.Config for the tunnel control listener,
 // gated on Config.TunnelTLSEnabled — independently of Config.TLSEnabled,
-// which only governs the HTTP data-path listener (S4).
+// which only governs the HTTP data-path listener.
 //
 // Before this existed, the tunnel listener was wrapped via the same
 // TLSConfig() used for HTTP, which internally short-circuits to (nil, nil)
@@ -157,7 +157,7 @@ func (m *TLSManager) TunnelTLSConfig() (*tls.Config, error) {
 
 // WrapTunnelListenerStrict wraps ln with TLS per TunnelTLSConfig(). Unlike
 // WrapListener, it returns the TLS-config error instead of swallowing it,
-// so callers that must not silently fall back to plaintext (S4: e.g. when
+// so callers that must not silently fall back to plaintext (e.g. when
 // RequireAuth is set) can fail the listener startup instead.
 func (m *TLSManager) WrapTunnelListenerStrict(ln net.Listener) (net.Listener, error) {
 	tlsConfig, err := m.TunnelTLSConfig()

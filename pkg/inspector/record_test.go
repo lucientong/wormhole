@@ -25,13 +25,13 @@ func TestNewRecord(t *testing.T) {
 	assert.Equal(t, "/api/users", record.Path)
 	assert.NotZero(t, record.Timestamp)
 	assert.Equal(t, "application/json", record.Headers["Content-Type"])
-	// S14: sensitive headers must be redacted, not stored verbatim.
+	// Sensitive headers must be redacted, not stored verbatim.
 	assert.Equal(t, redactedHeaderValue, record.Headers["Authorization"])
 }
 
-// TestNewRecord_RedactsSensitiveHeaders verifies S14 across the full set of
-// sensitive headers, case-insensitively, while leaving ordinary headers
-// untouched.
+// TestNewRecord_RedactsSensitiveHeaders verifies redaction across the full
+// set of sensitive headers, case-insensitively, while leaving ordinary
+// headers untouched.
 func TestNewRecord_RedactsSensitiveHeaders(t *testing.T) {
 	req := httptest.NewRequest("GET", "http://example.com/", nil)
 	req.Header.Set("Authorization", "Bearer secret-token")
@@ -106,7 +106,7 @@ func TestRecord_SetResponse(t *testing.T) {
 	assert.Equal(t, 200, record.Status)
 }
 
-// TestRecord_SetResponse_RedactsSensitiveHeaders verifies S14 for
+// TestRecord_SetResponse_RedactsSensitiveHeaders verifies redaction for
 // response headers — e.g. a Set-Cookie issuing a new session token must
 // not be captured verbatim.
 func TestRecord_SetResponse_RedactsSensitiveHeaders(t *testing.T) {
@@ -200,7 +200,7 @@ func TestGenerateID_Uniqueness(t *testing.T) {
 func TestDefaultConfig_Inspector(t *testing.T) {
 	cfg := DefaultConfig()
 	assert.Equal(t, 1000, cfg.MaxRecords)
-	assert.Equal(t, int64(256*1024), cfg.MaxBodySize) // S14: lowered from 1MB.
+	assert.Equal(t, int64(256*1024), cfg.MaxBodySize)
 	assert.True(t, cfg.EnableCapture)
 }
 

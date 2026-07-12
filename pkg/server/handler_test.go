@@ -425,7 +425,7 @@ func TestHTTPHandler_ForwardHTTP_ClientError(t *testing.T) {
 	assert.Equal(t, http.StatusBadGateway, rec.Code)
 }
 
-// TestHTTPHandler_ServeHTTP_RejectsSaturatedGlobalLimit verifies DP-03:
+// TestHTTPHandler_ServeHTTP_RejectsSaturatedGlobalLimit verifies that
 // once the global concurrent-stream budget is exhausted, ServeHTTP
 // rejects new requests with 503 instead of opening another stream.
 func TestHTTPHandler_ServeHTTP_RejectsSaturatedGlobalLimit(t *testing.T) {
@@ -452,8 +452,8 @@ func TestHTTPHandler_ServeHTTP_RejectsSaturatedGlobalLimit(t *testing.T) {
 	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
 }
 
-// TestHTTPHandler_ServeHTTP_RejectsSaturatedPerClientLimit verifies
-// DP-27: a single client hitting its own per-client stream cap gets 503
+// TestHTTPHandler_ServeHTTP_RejectsSaturatedPerClientLimit verifies that
+// a single client hitting its own per-client stream cap gets 503
 // even though the global budget still has room.
 func TestHTTPHandler_ServeHTTP_RejectsSaturatedPerClientLimit(t *testing.T) {
 	server := newTestServer()
@@ -808,7 +808,7 @@ func TestHTTPHandler_ForwardHTTP_LargeBody(t *testing.T) {
 		"response body should not be truncated")
 }
 
-// --- resolveTunnelID tests (DP-21/DP-22: multi-tunnel routing) ---
+// --- resolveTunnelID tests (multi-tunnel routing) ---
 
 // TestHTTPHandler_ResolveTunnelID_SingleTunnel verifies that a client with
 // exactly one registered tunnel always resolves to it, regardless of the
@@ -871,7 +871,7 @@ func TestHTTPHandler_ResolveTunnelID_NoTunnels(t *testing.T) {
 }
 
 // TestHTTPHandler_ForwardHTTP_MultiTunnel_RoutesToCorrectTunnelID verifies
-// the end-to-end fix for DP-21/DP-22: when a client has multiple tunnels,
+// the end-to-end behavior when a client has multiple tunnels:
 // the server tags the StreamRequest with the TunnelID matching the
 // requested host, so the client (in production) can dispatch to the right
 // local backend instead of always using the first tunnel's port.
@@ -939,21 +939,21 @@ func TestHTTPHandler_ForwardHTTP_MultiTunnel_RoutesToCorrectTunnelID(t *testing.
 // benchCopyPayload is sized well under copyBufSize so both io.Copy and
 // copyWithPooledBuffer take their "allocate/borrow one scratch buffer,
 // single Read+Write" fast path — isolating the benchmark to exactly the
-// difference DP-11 makes (pooled vs fresh scratch buffer) rather than
+// difference pooling makes (pooled vs fresh scratch buffer) rather than
 // multi-chunk copy overhead.
 var benchCopyPayload = bytes.Repeat([]byte("x"), 4096)
 
 // opaqueReader/opaqueWriter hide bytes.Reader's WriterTo and bytes.Buffer's
 // ReaderFrom (io.Copy's fast paths for those concrete types) so io.Copy is
 // forced down its generic allocate-a-scratch-buffer-and-loop path, matching
-// what actually happens with the real net.Conn/tunnel.Stream types DP-11's
-// call sites copy between (neither implements WriterTo/ReaderFrom).
+// what actually happens with the real net.Conn/tunnel.Stream types the
+// pooled-copy call sites copy between (neither implements WriterTo/ReaderFrom).
 type opaqueReader struct{ io.Reader }
 type opaqueWriter struct{ io.Writer }
 
 func newBenchCopySrc() io.Reader { return opaqueReader{bytes.NewReader(benchCopyPayload)} }
 
-// BenchmarkIOCopy_Baseline is the pre-DP-11 behavior: plain io.Copy
+// BenchmarkIOCopy_Baseline is the unpooled behavior: plain io.Copy
 // allocates its own fresh 32KB scratch buffer on every call.
 func BenchmarkIOCopy_Baseline(b *testing.B) {
 	b.ReportAllocs()
@@ -963,7 +963,7 @@ func BenchmarkIOCopy_Baseline(b *testing.B) {
 	}
 }
 
-// BenchmarkCopyWithPooledBuffer is the DP-11 behavior: the scratch buffer
+// BenchmarkCopyWithPooledBuffer is the pooled behavior: the scratch buffer
 // comes from copyBufPool and is returned after the copy, so short-lived
 // proxied connections (the common case for HTTP/WebSocket/TCP tunnel
 // streams) don't each pay for a fresh 32KB allocation.

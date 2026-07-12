@@ -42,7 +42,7 @@ type AuditStore interface {
 	// Query retrieves events matching the given filter.
 	Query(q AuditQuery) ([]AuditEvent, error)
 	// DeleteOlderThan removes all events with Timestamp strictly before
-	// cutoff, returning the number of events removed (A5). Used by the
+	// cutoff, returning the number of events removed. Used by the
 	// server's periodic retention sweep to keep long-running, persistently
 	// backed audit logs from growing without bound.
 	DeleteOlderThan(cutoff time.Time) (int64, error)
@@ -343,7 +343,7 @@ func (s *SQLiteAuditStore) Query(q AuditQuery) ([]AuditEvent, error) {
 }
 
 // DeleteOlderThan removes all rows with a timestamp strictly before
-// cutoff (A5), returning the number of rows deleted.
+// cutoff, returning the number of rows deleted.
 func (s *SQLiteAuditStore) DeleteOlderThan(cutoff time.Time) (int64, error) {
 	res, err := s.db.ExecContext(context.Background(),
 		`DELETE FROM audit_events WHERE timestamp < ?`,

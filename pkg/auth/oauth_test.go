@@ -83,8 +83,8 @@ func TestStartDeviceFlow_NoDeviceAuthSupport(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestPollDeviceFlow_IncludesClientID verifies RFC 8628 §3.4 compliance
-// (S15): the token-poll request must include client_id for public clients.
+// TestPollDeviceFlow_IncludesClientID verifies RFC 8628 §3.4 compliance:
+// the token-poll request must include client_id for public clients.
 // Uses Interval: 1 (the smallest non-zero value — 0 means "use the 5s
 // default" in PollDeviceFlow) so the test only waits ~1s in real time.
 func TestPollDeviceFlow_IncludesClientID(t *testing.T) {

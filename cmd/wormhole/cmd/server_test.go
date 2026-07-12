@@ -47,7 +47,7 @@ func withServerGlobals(t *testing.T, tlsEnabled, requireAuth bool, domain, certF
 	serverTLSKey = keyFile
 }
 
-// TestBuildServerConfig_TunnelTLSDefault_RequireAuthWithDomain verifies S4:
+// TestBuildServerConfig_TunnelTLSDefault_RequireAuthWithDomain verifies that
 // when --require-auth is set and a real domain is configured, the tunnel
 // control channel defaults to TLS even if --tls itself was never passed,
 // since auth tokens travel over that channel.
@@ -63,7 +63,7 @@ func TestBuildServerConfig_TunnelTLSDefault_RequireAuthWithDomain(t *testing.T) 
 }
 
 // TestBuildServerConfig_TunnelTLSDefault_RequireAuthNoDomain verifies that
-// without a usable domain, S4 cannot silently turn on tunnel TLS (there's no
+// without a usable domain, the default cannot silently turn on tunnel TLS (there's no
 // certificate source), and instead the plaintext-control-channel warning
 // path is taken (verified indirectly: TunnelTLSEnabled stays false).
 func TestBuildServerConfig_TunnelTLSDefault_RequireAuthNoDomain(t *testing.T) {
@@ -77,7 +77,7 @@ func TestBuildServerConfig_TunnelTLSDefault_RequireAuthNoDomain(t *testing.T) {
 }
 
 // TestBuildServerConfig_TunnelTLSDefault_FollowsTLSEnabled verifies the
-// pre-existing default (S4 must not regress it): with no --require-auth,
+// pre-existing default still holds: with no --require-auth,
 // --tunnel-tls still mirrors --tls.
 func TestBuildServerConfig_TunnelTLSDefault_FollowsTLSEnabled(t *testing.T) {
 	withServerGlobals(t, true, false, "tunnel.example.com", "", "")
@@ -115,7 +115,7 @@ func TestBuildServerConfig_TunnelTLSDefault_ManualCertsNoDomainNeeded(t *testing
 	assert.False(t, config.AutoTLS, "manual certs provided, no need for auto-TLS")
 }
 
-// TestBuildServerConfig_ClusterFlags verifies P3-5's new cluster/auth-Redis
+// TestBuildServerConfig_ClusterFlags verifies the cluster/auth-Redis
 // CLI flags (--cluster-secret, --auth-redis-*, --persistence redis) are
 // correctly wired into server.Config.
 func TestBuildServerConfig_ClusterFlags(t *testing.T) {
@@ -146,9 +146,9 @@ func TestBuildServerConfig_ClusterFlags(t *testing.T) {
 	assert.Equal(t, server.PersistenceRedis, config.Persistence)
 }
 
-// TestBuildServerConfig_ResourceLimitFlags verifies the P3-6 batch A
-// resource-limit flags (DP-03/DP-27) and the graceful-shutdown timeout
-// (DP-26) are wired from their CLI globals into server.Config.
+// TestBuildServerConfig_ResourceLimitFlags verifies the
+// resource-limit flags and the graceful-shutdown timeout
+// are wired from their CLI globals into server.Config.
 func TestBuildServerConfig_ResourceLimitFlags(t *testing.T) {
 	withServerGlobals(t, false, false, "", "", "")
 	cmd := newTLSTestCmd()
@@ -169,9 +169,9 @@ func TestBuildServerConfig_ResourceLimitFlags(t *testing.T) {
 	assert.Equal(t, 30*time.Second, config.ShutdownTimeout)
 }
 
-// TestApplyTunnelTLSDefaultsExplicit_MatchesFlagBehavior verifies the U4
-// refactor (extracting applyTunnelTLSDefaultsExplicit out of
-// applyTunnelTLSDefaults) preserves the exact same S4 defaulting rule so
+// TestApplyTunnelTLSDefaultsExplicit_MatchesFlagBehavior verifies
+// applyTunnelTLSDefaultsExplicit (factored out of
+// applyTunnelTLSDefaults) preserves the exact same defaulting rule so
 // the YAML config-file path (which has no cobra flags to check
 // Changed() on) gets identical behavior to the --tunnel-tls flag path.
 func TestApplyTunnelTLSDefaultsExplicit_MatchesFlagBehavior(t *testing.T) {
@@ -196,12 +196,12 @@ func TestApplyTunnelTLSDefaultsExplicit_MatchesFlagBehavior(t *testing.T) {
 	assert.True(t, cfg3.TunnelTLSEnabled)
 }
 
-// TestRunServer_ConfigFileTunnelTLSDefault_EndToEnd exercises the U4
+// TestRunServer_ConfigFileTunnelTLSDefault_EndToEnd exercises the
 // config-file loading path (LoadServerFileConfig → ToServerConfig →
 // applyTunnelTLSDefaultsExplicit) the same way runServer wires them
 // together, verifying a config file that enables --require-auth with a
 // real domain but never mentions tls.tunnel_tls_enabled still gets the
-// same S4 auto-default as the equivalent CLI flags would.
+// same auto-default as the equivalent CLI flags would.
 func TestRunServer_ConfigFileTunnelTLSDefault_EndToEnd(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/server.yml"
@@ -218,8 +218,8 @@ func TestRunServer_ConfigFileTunnelTLSDefault_EndToEnd(t *testing.T) {
 	assert.True(t, config.AutoTLS)
 }
 
-// TestBuildServerConfig_MinClientVersion verifies the P3-6 batch A
-// --min-client-version flag (DP-30) is wired into server.Config.
+// TestBuildServerConfig_MinClientVersion verifies the
+// --min-client-version flag is wired into server.Config.
 func TestBuildServerConfig_MinClientVersion(t *testing.T) {
 	withServerGlobals(t, false, false, "", "", "")
 	cmd := newTLSTestCmd()

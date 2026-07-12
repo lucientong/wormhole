@@ -127,7 +127,7 @@ func TestRedisStore_PermanentRevocation(t *testing.T) {
 	assert.True(t, revoked)
 }
 
-// TestRedisStore_TTLBasedExpiry verifies H5's "no explicit sweep needed"
+// TestRedisStore_TTLBasedExpiry verifies the "no explicit sweep needed"
 // design: a revocation with a real expiry disappears on its own once
 // Redis's TTL elapses, without ever calling CleanupExpiredRevocations.
 func TestRedisStore_TTLBasedExpiry(t *testing.T) {
@@ -150,7 +150,7 @@ func TestRedisStore_TTLBasedExpiry(t *testing.T) {
 // TestRedisStore_CleanupExpiredRevocationsIsNoop documents that
 // CleanupExpiredRevocations always reports nothing to clean — Redis's own
 // TTLs already do the work (see TestRedisStore_TTLBasedExpiry) — so
-// callers like the periodic sweep goroutines in pkg/server (S10/A5) can
+// callers like the periodic sweep goroutines in pkg/server can
 // call it uniformly across every Store implementation without needing to
 // special-case Redis.
 func TestRedisStore_CleanupExpiredRevocationsIsNoop(t *testing.T) {

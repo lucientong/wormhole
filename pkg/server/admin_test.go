@@ -55,7 +55,7 @@ func TestAdminAPI_Health(t *testing.T) {
 	assert.Nil(t, resp.Cluster, "no state store configured, cluster field should be omitted")
 }
 
-// TestAdminAPI_Health_Cluster verifies H9: /health surfaces cluster
+// TestAdminAPI_Health_Cluster verifies /health surfaces cluster
 // state-store connectivity (node ID + whether the last heartbeat
 // succeeded) instead of leaving operators to infer a Redis outage purely
 // from log lines.
@@ -123,7 +123,7 @@ func TestAdminAPI_Stats(t *testing.T) {
 }
 
 // failingAuditStore is a minimal auth.AuditStore whose Store method always
-// fails, used to verify A4's error-counting surfaces through /stats.
+// fails, used to verify the error-counting surfaces through /stats.
 type failingAuditStore struct{}
 
 func (failingAuditStore) Store(auth.AuditEvent) error { return errAuditStoreUnavailable }
@@ -135,7 +135,7 @@ func (failingAuditStore) Close() error                             { return nil 
 
 var errAuditStoreUnavailable = errors.New("audit store unavailable")
 
-// TestAdminAPI_Stats_AuditStoreErrors verifies A4: persistent AuditStore
+// TestAdminAPI_Stats_AuditStoreErrors verifies persistent AuditStore
 // failures are surfaced as a monitorable counter on /stats rather than
 // being invisible.
 func TestAdminAPI_Stats_AuditStoreErrors(t *testing.T) {

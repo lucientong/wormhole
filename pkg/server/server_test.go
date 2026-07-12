@@ -86,7 +86,7 @@ func TestNewServer_NoAuthConfigured(t *testing.T) {
 }
 
 // TestNewServer_OIDCWiredToAuthenticator is a regression test for a bug
-// found while working on P3-4: OIDC validator initialization ran before
+// where OIDC validator initialization ran before
 // s.authenticator was constructed, so the `s.authenticator != nil` guard
 // was always false and --oidc-issuer silently had no effect server-side.
 // This builds a real signed RS256 JWT and confirms it validates
@@ -154,7 +154,7 @@ func TestNewServer_OIDCWiredToAuthenticator(t *testing.T) {
 	assert.Equal(t, "user@example.com", claims.TeamName)
 }
 
-// TestApplyClusterNodeIDDefault verifies H4: ClusterNodeID falls back to
+// TestApplyClusterNodeIDDefault verifies ClusterNodeID falls back to
 // the machine hostname when clustering is enabled but no ID was set, and
 // is left untouched otherwise (explicit value, or clustering disabled).
 func TestApplyClusterNodeIDDefault(t *testing.T) {
@@ -196,7 +196,7 @@ func TestInitAuthStore(t *testing.T) {
 	_ = sqliteStore.Close()
 }
 
-// TestInitAuthStore_Redis verifies H5's config wiring: --persistence redis
+// TestInitAuthStore_Redis verifies the config wiring: --persistence redis
 // uses AuthRedisAddr when set, and otherwise falls back to
 // ClusterRedisAddr so a single --cluster-redis-addr is enough to share one
 // Redis instance for both cluster routing state and auth/revocation state.
@@ -582,8 +582,8 @@ func TestServer_AuthenticateClient_Success(t *testing.T) {
 	require.NoError(t, <-errCh)
 }
 
-// TestServer_AuthenticateClient_ServerCtxCancelUnblocks verifies DP-05/
-// DP-06 together: authenticateClient derives its timeout from
+// TestServer_AuthenticateClient_ServerCtxCancelUnblocks verifies that
+// authenticateClient derives its timeout from
 // s.serverCtx(), and the auth-request Read uses ReadContext, so canceling
 // the server's root context (as Shutdown does) unblocks an in-flight
 // handshake immediately instead of only after the full AuthTimeout.
@@ -629,7 +629,7 @@ func TestServer_AuthenticateClient_ServerCtxCancelUnblocks(t *testing.T) {
 	}
 }
 
-// TestServer_AuthenticateClient_ReturnsRealCapabilities verifies DP-33:
+// TestServer_AuthenticateClient_ReturnsRealCapabilities verifies that
 // a successful AuthResponse carries the server's actual feature set
 // rather than an empty/placeholder Capabilities list.
 func TestServer_AuthenticateClient_ReturnsRealCapabilities(t *testing.T) {
@@ -675,7 +675,7 @@ func TestServer_AuthenticateClient_ReturnsRealCapabilities(t *testing.T) {
 	assert.Contains(t, resp.Capabilities, "multi-tunnel")
 }
 
-// TestServer_CheckClientVersion covers DP-30's version-gating logic
+// TestServer_CheckClientVersion covers the version-gating logic
 // directly, including the "unparseable version is never rejected" rule.
 func TestServer_CheckClientVersion(t *testing.T) {
 	cfg := DefaultConfig()
@@ -689,7 +689,7 @@ func TestServer_CheckClientVersion(t *testing.T) {
 	assert.NotEmpty(t, s.checkClientVersion("0.6.3"), "older version should be rejected")
 }
 
-// TestServer_Capabilities_ReflectsConfig verifies DP-33's capability
+// TestServer_Capabilities_ReflectsConfig verifies the capability
 // list grows with optional features actually wired up on this instance,
 // rather than being a static/hardcoded list.
 func TestServer_Capabilities_ReflectsConfig(t *testing.T) {
@@ -922,7 +922,7 @@ func TestServer_HandleRegister_HTTP(t *testing.T) {
 	assert.Equal(t, uint64(1), atomic.LoadUint64(&s.stats.ActiveTunnels))
 }
 
-// TestServer_HandleRegister_RBAC_ViewerRejected verifies S2: a client
+// TestServer_HandleRegister_RBAC_ViewerRejected verifies a client
 // authenticated with RoleViewer (read-only) must not be able to register a
 // tunnel once RequireAuth is enabled, even though it already has an open,
 // authenticated connection.
@@ -1011,7 +1011,7 @@ func TestServer_HandleRegister_RBAC_ViewerRejected(t *testing.T) {
 }
 
 // TestServer_HandleRegister_RBAC_MemberAllowed verifies that RoleMember
-// (the default authenticated role) is unaffected by the S2 RBAC check.
+// (the default authenticated role) is unaffected by the RBAC check.
 func TestServer_HandleRegister_RBAC_MemberAllowed(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.MuxConfig.KeepAliveInterval = 0
@@ -1445,7 +1445,7 @@ func TestServer_RemoveClient(t *testing.T) {
 	_ = clientConn.Close()
 }
 
-// TestServer_ServerCtx_FallsBackBeforeStart verifies serverCtx() (DP-05)
+// TestServer_ServerCtx_FallsBackBeforeStart verifies serverCtx()
 // returns a usable, non-nil context.Background() before Start has run —
 // e.g. for unit tests that invoke handlers directly, as most of this
 // file's tests do.
@@ -1458,7 +1458,7 @@ func TestServer_ServerCtx_FallsBackBeforeStart(t *testing.T) {
 }
 
 // TestServer_ServerCtx_CanceledByShutdown verifies that Start populates
-// s.rootCtx and Shutdown cancels it (DP-05), so any operation still
+// s.rootCtx and Shutdown cancels it, so any operation still
 // blocked on serverCtx() deep in the handler tree unblocks as soon as
 // Shutdown begins rather than waiting on its own fixed timeout.
 func TestServer_ServerCtx_CanceledByShutdown(t *testing.T) {
@@ -1520,7 +1520,7 @@ func TestServer_StartAndShutdown(t *testing.T) {
 	assert.True(t, s.isClosed())
 }
 
-// TestServer_Start_TunnelTLSRequiredFailsClosed verifies S4: if
+// TestServer_Start_TunnelTLSRequiredFailsClosed verifies that if
 // RequireAuth is set and the tunnel control channel's TLS config can't be
 // built (e.g. bad manual cert paths), Start must fail rather than silently
 // continue serving the control channel in plaintext.
@@ -1544,8 +1544,8 @@ func TestServer_Start_TunnelTLSRequiredFailsClosed(t *testing.T) {
 
 // TestServer_Start_TunnelTLSOptionalFallsBackToPlaintext verifies that,
 // without RequireAuth, a broken tunnel TLS config degrades to plaintext
-// with a logged error instead of failing the whole server (matching the
-// pre-S4 WrapListener behavior for the HTTP listener).
+// with a logged error instead of failing the whole server (matching
+// WrapListener's behavior for the HTTP listener).
 func TestServer_Start_TunnelTLSOptionalFallsBackToPlaintext(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ListenAddr = "127.0.0.1:0"
@@ -1862,7 +1862,7 @@ func TestServer_HandleTCPConnection(t *testing.T) {
 	<-clientDone
 }
 
-// TestServer_TryAcquireStreamSlot_GlobalLimit verifies DP-03: once the
+// TestServer_TryAcquireStreamSlot_GlobalLimit verifies that once the
 // global cap is reached, further acquisitions fail regardless of client,
 // and releasing frees the slot back up.
 func TestServer_TryAcquireStreamSlot_GlobalLimit(t *testing.T) {
@@ -1893,7 +1893,7 @@ func TestServer_TryAcquireStreamSlot_GlobalLimit(t *testing.T) {
 	assert.Equal(t, int64(0), s.proxy.activeDataStreams)
 }
 
-// TestServer_TryAcquireStreamSlot_PerClientLimit verifies DP-27: a single
+// TestServer_TryAcquireStreamSlot_PerClientLimit verifies that a single
 // client can be capped independently of the global budget, and a
 // different client is unaffected by the first client's saturation.
 func TestServer_TryAcquireStreamSlot_PerClientLimit(t *testing.T) {
@@ -1942,10 +1942,11 @@ func TestServer_TryAcquireStreamSlot_ReleaseIsIdempotent(t *testing.T) {
 	assert.Equal(t, int32(0), client.activeDataStreams)
 }
 
-// TestServer_HandleTCPConnection_RejectsWhenSaturated verifies DP-03/DP-27
-// apply to the raw TCP tunnel path too, not just HTTP: once the stream
-// budget is exhausted, handleTCPConnection must not open a stream to the
-// tunnel client at all, and must simply drop the external connection.
+// TestServer_HandleTCPConnection_RejectsWhenSaturated verifies the
+// stream-slot limits apply to the raw TCP tunnel path too, not just HTTP:
+// once the stream budget is exhausted, handleTCPConnection must not open
+// a stream to the tunnel client at all, and must simply drop the
+// external connection.
 func TestServer_HandleTCPConnection_RejectsWhenSaturated(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.MaxConcurrentStreams = 1
@@ -2374,8 +2375,8 @@ func TestServer_HandleRegister_TCP(t *testing.T) {
 	s.registry.portAllocator.Release(int(tcpPort))
 }
 
-// TestServer_HandleRegister_TCP_PortAllocationFailure verifies the DP-18
-// fix: when no TCP port can be allocated, registration is rejected
+// TestServer_HandleRegister_TCP_PortAllocationFailure verifies that
+// when no TCP port can be allocated, registration is rejected
 // (Success=false) instead of silently "succeeding" with TCPPort 0, which
 // would advertise a tunnel that can never actually receive traffic.
 func TestServer_HandleRegister_TCP_PortAllocationFailure(t *testing.T) {
@@ -2487,7 +2488,7 @@ func TestServer_HandleP2POffer_SymmetricSymmetric(t *testing.T) {
 	// Goroutine simulating the peer client — reads the notification stream
 	// opened by notifyPeerOfP2P and asserts that BOTH the P2PCandidates
 	// message and the terminal P2POfferResponse are correctly framed and
-	// decoded (DP-24 fix), rather than silently discarding one of them.
+	// decoded, rather than silently discarding one of them.
 	peerGotCandidates := 0
 	peerGotOfferResponse := false
 	peerDone := make(chan struct{})
@@ -2564,8 +2565,7 @@ func TestServer_HandleP2POffer_SymmetricSymmetric(t *testing.T) {
 	<-peerDone
 
 	// Both sides must have received and correctly decoded their predicted
-	// candidates in addition to the terminal offer response — this is the
-	// DP-24 acceptance criterion.
+	// candidates in addition to the terminal offer response.
 	assert.Greater(t, initiatorGotCandidates, 0, "initiator should receive peer's predicted candidates")
 	assert.Greater(t, peerGotCandidates, 0, "peer should receive initiator's predicted candidates")
 	assert.True(t, peerGotOfferResponse, "peer should receive a successful offer notification")
@@ -2770,8 +2770,8 @@ func doRegisterRequest(t *testing.T, s *Server, client *ClientSession, req *prot
 	return <-respCh
 }
 
-// TestServer_HandleRegister_MultiTunnel_DistinctSubdomains verifies the
-// DP-21/DP-22 fix: a single client connection can register multiple
+// TestServer_HandleRegister_MultiTunnel_DistinctSubdomains verifies that
+// a single client connection can register multiple
 // tunnels, each with its own subdomain, and each gets routed independently
 // (not all collapsed onto the connection-level default subdomain).
 func TestServer_HandleRegister_MultiTunnel_DistinctSubdomains(t *testing.T) {
@@ -3482,7 +3482,7 @@ func TestServer_HandleClose_Success(t *testing.T) {
 	assert.Equal(t, uint64(1), atomic.LoadUint64(&s.stats.ActiveTunnels))
 }
 
-// TestServer_HandleClose_RBAC_ViewerRejected verifies S2: a RoleViewer
+// TestServer_HandleClose_RBAC_ViewerRejected verifies a RoleViewer
 // client cannot close/delete a tunnel once RequireAuth is enabled.
 func TestServer_HandleClose_RBAC_ViewerRejected(t *testing.T) {
 	cfg := DefaultConfig()
@@ -3864,8 +3864,8 @@ func TestProto_NewStatsResponse(t *testing.T) {
 	assert.Equal(t, uint64(3600), msg.StatsResponse.UptimeSeconds)
 }
 
-// TestServer_Shutdown_DrainsInFlightHTTPRequest is the DP-26 regression
-// test: it drives a real HTTP request through the actual s.httpServer
+// TestServer_Shutdown_DrainsInFlightHTTPRequest drives a real HTTP
+// request through the actual s.httpServer
 // (listening on a real TCP port, not the in-process httptest.Recorder
 // used by handler_test.go) while the backend is deliberately slow, then
 // triggers Shutdown mid-request. Before the fix, Shutdown closed

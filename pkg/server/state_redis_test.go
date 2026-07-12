@@ -25,7 +25,7 @@ func newTestRedisStateStore(t *testing.T) (*RedisStateStore, *miniredis.Miniredi
 
 // TestRedisStateStore_RegisterRoute_ReservesFreeSubdomain verifies the
 // happy path: reserving a never-before-seen subdomain succeeds and the
-// route becomes lookupable (S3/H6).
+// route becomes lookupable.
 func TestRedisStateStore_RegisterRoute_ReservesFreeSubdomain(t *testing.T) {
 	store, _ := newTestRedisStateStore(t)
 
@@ -55,9 +55,10 @@ func TestRedisStateStore_RegisterRoute_SameClientRefresh(t *testing.T) {
 }
 
 // TestRedisStateStore_RegisterRoute_ConflictWithLiveOwner verifies the core
-// S3/H6 guarantee: when a *different*, still-live client already owns the
-// subdomain, RegisterRoute must reject with ErrSubdomainConflict instead of
-// silently overwriting the reservation (the pre-fix last-writer-wins bug).
+// atomic-reservation guarantee: when a *different*, still-live client
+// already owns the subdomain, RegisterRoute must reject with
+// ErrSubdomainConflict instead of silently overwriting the reservation
+// (as a naive last-writer-wins implementation would).
 func TestRedisStateStore_RegisterRoute_ConflictWithLiveOwner(t *testing.T) {
 	store, _ := newTestRedisStateStore(t)
 
@@ -148,8 +149,8 @@ func TestRedisStateStore_EvictDeadNodes_NoOp(t *testing.T) {
 	assert.NoError(t, store.EvictDeadNodes(time.Minute))
 }
 
-// TestRedisStateStore_HostnameRoute verifies H3: custom-hostname routes are
-// now indexed in Redis (previously only subdomains were), so a cluster
+// TestRedisStateStore_HostnameRoute verifies custom-hostname routes are
+// indexed in Redis just like subdomains, so a cluster
 // peer can find a client's hostname-based tunnel via LookupByHostname.
 func TestRedisStateStore_HostnameRoute(t *testing.T) {
 	store, _ := newTestRedisStateStore(t)
@@ -170,7 +171,7 @@ func TestRedisStateStore_HostnameRoute(t *testing.T) {
 	assert.Nil(t, entry)
 }
 
-// TestRedisStateStore_PathPrefixRoute_LongestMatch verifies H3's
+// TestRedisStateStore_PathPrefixRoute_LongestMatch verifies the
 // longest-prefix-match semantics for path routes, mirroring Router.matchPath.
 func TestRedisStateStore_PathPrefixRoute_LongestMatch(t *testing.T) {
 	store, _ := newTestRedisStateStore(t)
@@ -193,7 +194,7 @@ func TestRedisStateStore_PathPrefixRoute_LongestMatch(t *testing.T) {
 	assert.Nil(t, entry)
 }
 
-// TestRedisStateStore_MultipleRoutesPerClient verifies H3: a single client
+// TestRedisStateStore_MultipleRoutesPerClient verifies a single client
 // can register a subdomain, a hostname, and a path-prefix route
 // simultaneously (distinguished by RouteID), and UnregisterRoute cleans up
 // all of them via the wormhole:clientroutes:<clientID> index — without a
@@ -241,8 +242,8 @@ func TestRedisStateStore_UnregisterRouteEntry(t *testing.T) {
 	assert.Equal(t, "c1", entry.ClientID)
 }
 
-// TestRedisStateStore_HostnameConflict verifies S3/H6's conflict rejection
-// also applies to hostname routes (H3), not just subdomains.
+// TestRedisStateStore_HostnameConflict verifies the same conflict rejection
+// also applies to hostname routes, not just subdomains.
 func TestRedisStateStore_HostnameConflict(t *testing.T) {
 	store, _ := newTestRedisStateStore(t)
 

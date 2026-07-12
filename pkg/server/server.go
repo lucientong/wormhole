@@ -20,13 +20,13 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// defaultShutdownTimeout is used when Config.ShutdownTimeout is unset
-// (DP-26): it bounds how long Shutdown waits for http.Server.Shutdown
+// defaultShutdownTimeout is used when Config.ShutdownTimeout is unset.
+// It bounds how long Shutdown waits for http.Server.Shutdown
 // to drain in-flight HTTP/admin requests before forcing them closed.
 const defaultShutdownTimeout = 15 * time.Second
 
 // Server is the wormhole server. It is the composition root for three
-// independently-owned components (P3-6 Batch D): TunnelRegistry (which
+// independently-owned components: TunnelRegistry (which
 // clients are connected and what routes they own), ProxyService (data
 // forwarding: HTTP/WebSocket/TCP), and P2PBroker (`wormhole connect`
 // signaling). Server itself is left holding only connection lifecycle,
@@ -41,8 +41,8 @@ type Server struct {
 	adminListener  net.Listener
 
 	// httpServer/adminServer are held so Shutdown can call their
-	// Shutdown(ctx) instead of just closing the underlying listener
-	// (DP-26): closing the listener alone stops new connections but
+	// Shutdown(ctx) instead of just closing the underlying listener:
+	// closing the listener alone stops new connections but
 	// hard-cuts in-flight requests, since http.Server.Serve returns
 	// immediately on a closed listener without draining anything.
 	httpServer  *http.Server
@@ -86,7 +86,7 @@ type Server struct {
 
 	// rootCtx/rootCancel back the lifecycle context handed to hot-path
 	// operations deep in the call tree (auth handshake, port allocation,
-	// P2P notification, TCP tunnel stream open — DP-05) so Shutdown can
+	// P2P notification, TCP tunnel stream open) so Shutdown can
 	// interrupt them immediately instead of leaving them to block out
 	// their own fixed timeouts. Set by Start; nil until then, so
 	// serverCtx() falls back to context.Background() for callers (mostly
@@ -95,7 +95,7 @@ type Server struct {
 	rootCancel context.CancelFunc
 }
 
-// serverCtx returns the server's root lifecycle context (DP-05):
+// serverCtx returns the server's root lifecycle context:
 // derived from the ctx passed to Start and canceled as the first step of
 // Shutdown, so long-running or blocking operations initiated deep in the
 // handler call tree (auth handshake waits, TCP port allocation, P2P
@@ -134,12 +134,12 @@ type ClientSession struct {
 	// clusterRoutes records every cluster StateStore route entry this
 	// client currently owns (connect-time subdomain plus any per-tunnel
 	// hostname/path entries), so the heartbeat loop can periodically
-	// re-register them to refresh their TTL (H1) without needing to
+	// re-register them to refresh their TTL without needing to
 	// recompute what should still be registered from scratch.
 	clusterRoutes []RouteEntry
 
 	// activeDataStreams counts this client's own in-flight data-plane
-	// streams, bounded by config.MaxStreamsPerClient (DP-27) independent
+	// streams, bounded by config.MaxStreamsPerClient independent
 	// of the global activeDataStreams cap on ProxyService.
 	activeDataStreams int32
 
@@ -300,8 +300,8 @@ func NewServer(config Config) *Server {
 	return s
 }
 
-// applyClusterNodeIDDefault implements H4: ClusterNodeID "defaults to
-// hostname" was documented but never implemented — an operator who enables
+// applyClusterNodeIDDefault makes ClusterNodeID actually default to the
+// hostname, as documented: without it, an operator who enables
 // clustering without explicitly setting --cluster-node-id got an empty
 // NodeID, which breaks isLocalNode() (every route looks "remote") and
 // produces ambiguous wormhole:node: entries in the state store if more
@@ -325,7 +325,7 @@ func applyClusterNodeIDDefault(config *Config) {
 
 // Start starts the server.
 func (s *Server) Start(ctx context.Context) error {
-	// DP-05: derive the root lifecycle context up front so every
+	// Derive the root lifecycle context up front so every
 	// goroutine spawned below (and the handlers they call, several
 	// layers deep) can observe cancellation the instant Shutdown runs,
 	// rather than only via their own AuthTimeout/etc. deadlines.
@@ -347,7 +347,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	s.tunnelListener = tunnelLn
 
-	// Wrap tunnel listener with TLS if configured (S4: decoupled from
+	// Wrap tunnel listener with TLS if configured (decoupled from
 	// Config.TLSEnabled — see TunnelTLSConfig's doc comment). When
 	// RequireAuth is set, a TLS config error is fatal rather than a
 	// silent fallback to plaintext: auth tokens travel over this
@@ -388,7 +388,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Build the *http.Server instances synchronously, before the
 	// goroutines that call Serve() on them are spawned below, so
-	// Shutdown (DP-26) can safely read s.httpServer/s.adminServer
+	// Shutdown can safely read s.httpServer/s.adminServer
 	// without racing their assignment.
 	s.httpServer = &http.Server{
 		Handler:        s.proxy,
@@ -407,8 +407,8 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Start ACME HTTP-01 challenge server if AutoTLS is enabled. This is
 	// needed whenever *either* the HTTP or the tunnel listener sources its
-	// certificate from AutoTLS (S4 can enable AutoTLS purely to serve the
-	// tunnel control channel, with TLSEnabled/HTTP TLS left off) — Let's
+	// certificate from AutoTLS (TunnelTLSEnabled can enable AutoTLS purely
+	// to serve the tunnel control channel, with TLSEnabled/HTTP TLS left off) — Let's
 	// Encrypt's HTTP-01 challenge has to be answered regardless of which
 	// listener ultimately presents the resulting certificate.
 	if s.config.AutoTLS && (s.config.TLSEnabled || s.config.TunnelTLSEnabled) {
@@ -419,17 +419,15 @@ func (s *Server) Start(ctx context.Context) error {
 	// Start cluster heartbeat (no-op for single-node / nil store).
 	s.registry.StartHeartbeat(ctx)
 
-	// S10: periodically purge expired entries from the token revocation
-	// blacklist. CleanupRevokedTokens() existed and was fully implemented,
-	// but nothing ever called it, so the blacklist (and, with SQLite
-	// persistence, its backing table) grew without bound over the life of
-	// a long-running server.
+	// Periodically purge expired entries from the token revocation
+	// blacklist, so it (and, with SQLite persistence, its backing table)
+	// doesn't grow without bound over the life of a long-running server.
 	if s.authenticator != nil {
 		s.closeWg.Add(1)
 		go s.runRevokedTokenCleanup()
 	}
 
-	// A5: periodically purge audit events older than the configured
+	// Periodically purge audit events older than the configured
 	// retention window, so long-running servers with --audit enabled don't
 	// grow the (potentially SQLite-backed) audit log without bound.
 	if s.auditLogger != nil && s.config.AuditRetentionDays > 0 {
@@ -450,7 +448,7 @@ func (s *Server) Start(ctx context.Context) error {
 	// ctx is already Done here, so there's nothing meaningful left to
 	// propagate to Shutdown; it deliberately derives its own bounded
 	// context.WithTimeout(context.Background(), ShutdownTimeout) for the
-	// graceful drain instead (DP-26).
+	// graceful drain instead.
 	return s.Shutdown() //nolint:contextcheck // ctx already canceled; Shutdown uses its own bounded timeout
 }
 
@@ -462,7 +460,7 @@ func (s *Server) Shutdown() error {
 
 	log.Info().Msg("Shutting down server...")
 	close(s.closeCh)
-	// DP-05: cancel the root context first so anything blocked on it deep
+	// Cancel the root context first so anything blocked on it deep
 	// in the handler tree (auth stream accept, TCP port allocation, P2P
 	// notify stream open) unblocks immediately instead of running out
 	// its own fixed timeout while the rest of Shutdown proceeds below.
@@ -477,7 +475,7 @@ func (s *Server) Shutdown() error {
 		_ = s.tunnelListener.Close()
 	}
 
-	// Gracefully drain the HTTP and admin API servers (DP-26): unlike
+	// Gracefully drain the HTTP and admin API servers: unlike
 	// closing the listener directly, http.Server.Shutdown(ctx) stops
 	// accepting new connections immediately but lets in-flight handlers
 	// finish (up to ShutdownTimeout) before returning, so a request that's
@@ -613,10 +611,9 @@ func (s *Server) handleClient(conn net.Conn) {
 		return
 	}
 
-	// A1: record successful authentication events, not just failures — the
-	// audit log previously only ever saw auth_failure entries, making it
-	// impossible to answer "who successfully authenticated, from where,
-	// and when" from the audit trail.
+	// Record successful authentication events, not just failures, so the
+	// audit trail can answer "who successfully authenticated, from where,
+	// and when", not just who failed.
 	if s.config.RequireAuth && s.auditLogger != nil {
 		s.auditLogger.LogAuthSuccess(clientIP, teamName, role, sessionID, subdomain)
 	}
@@ -638,12 +635,13 @@ func (s *Server) handleClient(conn net.Conn) {
 	}
 
 	// Register route via TunnelRegistry and (if clustered) the shared
-	// state store *before* exposing the client anywhere else. F6/H6/S3: a
-	// subdomain conflict here previously only got logged, and the
-	// connection was allowed to proceed — but the client had already been
-	// told (in the AuthResponse) that it owns `subdomain`, so it would
-	// silently receive zero traffic for it while believing it was live.
-	// Reject the connection instead so the client's reconnect/retry logic
+	// state store *before* exposing the client anywhere else. A subdomain
+	// conflict here must reject the connection rather than merely log it
+	// and proceed — the client has already been told (in the
+	// AuthResponse) that it owns `subdomain`, so silently letting it
+	// through would leave it believing the tunnel is live while
+	// receiving zero traffic. Reject the connection instead so the
+	// client's reconnect/retry logic
 	// kicks in. On success, registerClientRoute also adds client to the
 	// registry's directory.
 	if !s.registerClientRoute(client, clientIP) {
@@ -714,9 +712,8 @@ func (s *Server) handleClientAuth(mux *tunnel.Mux, sessionID, clientIP, remoteAd
 			blocked := s.rateLimiter.RecordFailure(clientIP)
 			if blocked {
 				log.Warn().Str("ip", clientIP).Msg("IP blocked due to repeated auth failures")
-				// A2: this was previously never recorded in the audit
-				// trail — only the auth_failure events were, with no
-				// signal that they had escalated into an IP-level block.
+				// Record the escalation to an IP-level block in the audit
+				// trail too, not just the individual auth_failure events.
 				if s.auditLogger != nil {
 					s.auditLogger.LogIPBlocked(clientIP, s.config.RateLimitMaxFailures)
 				}
@@ -759,7 +756,7 @@ func (s *Server) handleClientAuth(mux *tunnel.Mux, sessionID, clientIP, remoteAd
 // The sessionID parameter is the pre-generated ID to include in the response.
 func (s *Server) authenticateClient(mux *tunnel.Mux, sessionID string) (*auth.Claims, string, error) {
 	// Accept the auth stream with a timeout, bounded on the short side by
-	// AuthTimeout and on the long side by server shutdown (DP-05): a
+	// AuthTimeout and on the long side by server shutdown: a
 	// client mid-handshake when the server shuts down no longer holds up
 	// the accept for the full AuthTimeout.
 	ctx, cancel := context.WithTimeout(s.serverCtx(), s.config.AuthTimeout)
@@ -776,7 +773,7 @@ func (s *Server) authenticateClient(mux *tunnel.Mux, sessionID string) (*auth.Cl
 		return nil, "", fmt.Errorf("set auth deadline: %w", deadlineErr)
 	}
 
-	// Read auth request. ReadContext (DP-06) additionally wakes up on ctx
+	// Read auth request. ReadContext additionally wakes up on ctx
 	// cancellation, so a shutdown mid-handshake unblocks this immediately
 	// rather than waiting out the AuthTimeout deadline set above.
 	buf := make([]byte, 4096)
@@ -798,7 +795,7 @@ func (s *Server) authenticateClient(mux *tunnel.Mux, sessionID string) (*auth.Cl
 	authReq := msg.AuthRequest
 
 	// Reject clients reporting a version older than MinClientVersion, if
-	// configured (DP-30). Unparseable versions (e.g. "dev" builds) are
+	// configured. Unparseable versions (e.g. "dev" builds) are
 	// never rejected — see Config.MinClientVersion doc.
 	if rejectMsg := s.checkClientVersion(authReq.Version); rejectMsg != "" {
 		s.sendAuthFailure(stream, rejectMsg)
@@ -825,7 +822,7 @@ func (s *Server) authenticateClient(mux *tunnel.Mux, sessionID string) (*auth.Cl
 	}
 
 	// Send success response with the pre-generated session ID and this
-	// node's real feature set (DP-33), so clients can gate optional
+	// node's real feature set, so clients can gate optional
 	// behavior (e.g. P2P offers) on what the server actually supports
 	// instead of assuming.
 	resp := proto.NewAuthResponse(true, "", subdomain, "", sessionID)
@@ -878,7 +875,7 @@ func (s *Server) checkClientVersion(clientVersion string) string {
 }
 
 // capabilities returns the set of optional protocol features this server
-// instance actually supports (DP-33), reported to clients via
+// instance actually supports, reported to clients via
 // AuthResponse.Capabilities so they can gate optional behavior instead of
 // assuming a fixed feature set. "p2p" and "multi-tunnel" relay/routing are
 // unconditional server-side; cluster/audit reflect this node's config.
@@ -948,13 +945,13 @@ func (s *Server) handleClientStream(client *ClientSession, stream *tunnel.Stream
 	}
 }
 
-// requireWritePermission enforces RBAC (S2) on tunnel-mutating control
+// requireWritePermission enforces RBAC on tunnel-mutating control
 // messages. Role/permission checks previously only ran at the connection
 // handshake (PermissionConnect) — once connected, a RoleViewer token could
 // still register or close tunnels and claim subdomains, because
 // handleRegister/handleClose never consulted auth.HasPermission at all.
 // When authentication is disabled, client.Role is always empty and every
-// operation is allowed, matching pre-P3-4 behavior.
+// operation is allowed, matching the no-auth behavior elsewhere.
 func (s *Server) requireWritePermission(client *ClientSession) bool {
 	if !s.config.RequireAuth {
 		return true
@@ -979,9 +976,9 @@ func (s *Server) rejectInsufficientPermission(client *ClientSession, action stri
 //
 //nolint:gocyclo // registration coordinates TLS, TCP, routing and audit in one flow
 func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, req *proto.RegisterRequest) {
-	// S2: RoleViewer (and any other role without PermissionWrite) must not
-	// be able to register tunnels or claim subdomains — previously RBAC was
-	// only checked once, at the PermissionConnect stage of the handshake.
+	// RoleViewer (and any other role without PermissionWrite) must not
+	// be able to register tunnels or claim subdomains — RBAC must be
+	// re-checked here, not just once at the PermissionConnect stage of the handshake.
 	if !s.requireWritePermission(client) {
 		s.rejectInsufficientPermission(client, "register tunnel")
 		resp := proto.NewRegisterResponse(false, "insufficient permissions: role lacks write access", "", "", 0)
@@ -1040,9 +1037,9 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 	// Register this tunnel's routing keys — subdomain (if it differs from
 	// the connection's default, which is already routed at auth time),
 	// custom hostname, and path prefix — in both the local Router and, if
-	// clustered, the shared state store (H3: hostname/path routes were
-	// previously local-only, so cluster peers had no way to find them and
-	// silently 404'd cross-node hostname/path requests). A conflict on any
+	// clustered, the shared state store, so cluster peers can find
+	// hostname/path routes too and cross-node hostname/path requests
+	// don't silently 404. A conflict on any
 	// of them, local or cluster-wide, rejects the whole registration.
 	extraSubdomain := ""
 	if subdomain != "" && subdomain != client.Subdomain {
@@ -1061,7 +1058,7 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 	// share the existing HTTP listener via routing), a TCP tunnel is
 	// useless without its own dedicated port — registering it as
 	// "successful" with TCPPort 0 would silently advertise a tunnel that
-	// can never receive traffic (DP-18). Reject the registration instead
+	// can never receive traffic. Reject the registration instead
 	// so the client can surface the failure and retry.
 	var tcpPort uint32
 	if req.Protocol == proto.ProtocolTCP {
@@ -1179,7 +1176,7 @@ func (s *Server) handleStats(client *ClientSession, stream *tunnel.Stream, _ *pr
 // It finds the specified tunnel, cleans up its routes and TCP port,
 // removes it from the client session, and returns a CloseResponse.
 func (s *Server) handleClose(client *ClientSession, stream *tunnel.Stream, req *proto.CloseRequest) {
-	// S2: closing/deleting a tunnel is a write operation just like
+	// Closing/deleting a tunnel is a write operation just like
 	// registering one — enforce the same RBAC gate.
 	if !s.requireWritePermission(client) {
 		s.rejectInsufficientPermission(client, "close tunnel")
@@ -1309,7 +1306,7 @@ func (s *Server) serveACMEChallenge() {
 }
 
 // revokedTokenCleanupInterval controls how often runRevokedTokenCleanup
-// sweeps expired entries from the token revocation blacklist (S10).
+// sweeps expired entries from the token revocation blacklist.
 const revokedTokenCleanupInterval = 10 * time.Minute
 
 // runRevokedTokenCleanup periodically calls Auth.CleanupRevokedTokens()
@@ -1333,7 +1330,7 @@ func (s *Server) runRevokedTokenCleanup() {
 }
 
 // auditRetentionSweepInterval controls how often runAuditRetention checks
-// for audit events past the configured retention window (A5).
+// for audit events past the configured retention window.
 const auditRetentionSweepInterval = 1 * time.Hour
 
 // runAuditRetention periodically deletes audit events older than
@@ -1480,7 +1477,7 @@ func initAuthStore(config Config) auth.Store {
 			Msg("Using SQLite persistence for auth data")
 		return sqliteStore
 	case PersistenceRedis:
-		// H5: default to the cluster Redis connection when a dedicated
+		// Default to the cluster Redis connection when a dedicated
 		// one isn't configured, so enabling clustering with a Redis
 		// backend and shared revocation only requires one Redis address
 		// in the common case of using a single instance for both.
@@ -1495,7 +1492,7 @@ func initAuthStore(config Config) auth.Store {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize Redis auth store")
 		}
-		log.Info().Str("addr", addr).Msg("Using Redis persistence for auth data (shared token revocation, H5)")
+		log.Info().Str("addr", addr).Msg("Using Redis persistence for auth data (shared token revocation)")
 		return redisStore
 	default:
 		log.Info().Msg("Using in-memory storage for auth data (no persistence)")

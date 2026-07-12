@@ -183,7 +183,7 @@ func TestOIDCValidator_CustomRoleClaim(t *testing.T) {
 }
 
 // TestOIDCValidator_RejectsAlgNone verifies the classic JWT `alg:none`
-// signature-bypass attack (S6): a token forged with a real `kid` (so the
+// signature-bypass attack: a token forged with a real `kid` (so the
 // JWKS lookup succeeds) but `alg: none` and an empty signature must be
 // rejected, not accidentally accepted because no signature check ran.
 func TestOIDCValidator_RejectsAlgNone(t *testing.T) {
@@ -222,7 +222,7 @@ func TestVerifyJWTSignature_RejectsAlgNoneAndEmpty(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestOIDCValidator_IssuerTrailingSlashNormalized verifies S7: issuer
+// TestOIDCValidator_IssuerTrailingSlashNormalized verifies issuer
 // comparison tolerates a trailing slash difference between the configured
 // issuer and the token's `iss` claim.
 func TestOIDCValidator_IssuerTrailingSlashNormalized(t *testing.T) {
@@ -241,7 +241,7 @@ func TestOIDCValidator_IssuerTrailingSlashNormalized(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestOIDCValidator_NotYetValid verifies S7: a token whose `nbf` is in the
+// TestOIDCValidator_NotYetValid verifies a token whose `nbf` is in the
 // future (beyond the clock-skew leeway) is rejected.
 func TestOIDCValidator_NotYetValid(t *testing.T) {
 	key := testGenRSAKey(t)

@@ -67,7 +67,7 @@ func (a *AdminAPI) Handler() http.Handler {
 	mux.HandleFunc("/audit", a.requireAdminAuth(a.handleAudit))
 	mux.HandleFunc("/audit/export", a.requireAdminAuth(a.handleAuditExport))
 
-	// Expose Prometheus metrics endpoint. S11: metrics can leak operational
+	// Expose Prometheus metrics endpoint. Metrics can leak operational
 	// details (client counts, throughput, team/tunnel activity patterns),
 	// so it goes through the same requireAdminAuth gate as every other
 	// admin endpoint — Bearer token when --admin-token is set, loopback-only
@@ -105,7 +105,7 @@ type HealthResponse struct {
 	Cluster *ClusterHealth `json:"cluster,omitempty"`
 }
 
-// ClusterHealth reports cluster state-store connectivity (H9). Without it,
+// ClusterHealth reports cluster state-store connectivity. Without it,
 // a Redis outage only ever showed up as scattered WARN log lines — there
 // was no queryable signal an operator or monitoring system could poll to
 // tell "this node can't currently reach the shared state store" apart from
@@ -129,8 +129,8 @@ type StatsResponse struct {
 	AllocatedPorts      int    `json:"allocated_ports"`
 	MaxClients          int    `json:"max_clients"`
 	MaxTunnelsPerClient int    `json:"max_tunnels_per_client"`
-	// AuditStoreErrors counts failed AuditStore.Store persistence attempts
-	// (A4); non-zero and growing means audit events are being lost from
+	// AuditStoreErrors counts failed AuditStore.Store persistence attempts;
+	// non-zero and growing means audit events are being lost from
 	// persistent storage (they still reach the JSON-line writer, if any).
 	// Omitted when audit logging is disabled.
 	AuditStoreErrors *uint64 `json:"audit_store_errors,omitempty"`
@@ -165,7 +165,7 @@ func (a *AdminAPI) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		Uptime: time.Since(a.server.stats.StartTime).Round(time.Second).String(),
 	}
 
-	// H9: surface cluster state-store connectivity instead of leaving
+	// Surface cluster state-store connectivity instead of leaving
 	// operators to infer a Redis outage purely from log lines.
 	if configured, healthy := a.server.registry.StateStoreHealth(); configured {
 		resp.Cluster = &ClusterHealth{
@@ -531,7 +531,7 @@ type GenerateTokenResponse struct {
 	Role    string `json:"role"`
 	Expires string `json:"expires,omitempty"`
 	// Warning carries a non-fatal issue that occurred while generating this
-	// token — e.g. a refresh-and-revoke request (F5) where the new token
+	// token — e.g. a refresh-and-revoke request where the new token
 	// was issued successfully but revoking the old one failed. The token
 	// itself is always valid when this response is returned.
 	Warning string `json:"warning,omitempty"`
@@ -940,7 +940,7 @@ func (a *AdminAPI) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 		}
 		newToken, err = a.server.authenticator.ExtendTokenExpiry(req.Token, duration) //nolint:contextcheck
 	case req.RevokeOld:
-		// Refresh and revoke old token. F5: RefreshAndRevokeToken may now
+		// Refresh and revoke old token. RefreshAndRevokeToken may
 		// return a valid newToken alongside a non-nil error when the new
 		// token was issued but revoking the old one failed — don't discard
 		// a perfectly good token in that case, just surface the warning.

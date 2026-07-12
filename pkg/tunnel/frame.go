@@ -118,7 +118,7 @@ type Frame struct {
 	// The length is stored in the header but derived from len(Payload).
 	Payload []byte
 
-	// pooledPayload marks Payload as borrowed from Mux.dataBufPool (DP-09):
+	// pooledPayload marks Payload as borrowed from Mux.dataBufPool:
 	// once writeFrame has handed it to the wire, the underlying array is
 	// returned to that pool for reuse instead of left for the GC. Frames
 	// built any other way (control frames, Clone, tests) leave this false

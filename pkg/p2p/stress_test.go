@@ -336,7 +336,7 @@ func BenchmarkUDPMux_MultiStream(b *testing.B) {
 }
 
 // BenchmarkUDPMux_Throughput_Encrypted is the encrypted counterpart to
-// BenchmarkUDPMux_Throughput, used to quantify the DP-14 send-path copy
+// BenchmarkUDPMux_Throughput, used to quantify the send-path copy
 // reduction (SessionCipher.EncryptInto writing straight into the mux
 // frame buffer instead of via a standalone ciphertext buffer that then
 // gets copied again).
@@ -414,7 +414,7 @@ func BenchmarkUDPMux_Throughput_Encrypted(b *testing.B) {
 // outgoing packets are dropped at dropRate and, if not dropped, delayed by
 // delay before actually being written — approximating a fixed one-way
 // latency plus random loss. Used by BenchmarkUDPMux_Throughput_SimulatedWAN
-// to validate DP-13 (adaptive RTO)/DP-14 (reduced copies) don't regress
+// to validate adaptive RTO and reduced-copy sends don't regress
 // throughput under realistic non-LAN conditions.
 type delayedLossyConn struct {
 	net.PacketConn
@@ -446,7 +446,7 @@ func (c *delayedLossyConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 
 // BenchmarkUDPMux_Throughput_SimulatedWAN measures single-stream throughput
 // over a simulated ~50ms-RTT, 1%-loss link (25ms one-way delay each way),
-// the condition class DP-13's adaptive RTO/backoff targets — as opposed to
+// the condition class the adaptive RTO/backoff targets — as opposed to
 // the near-zero-RTT loopback conditions of BenchmarkUDPMux_Throughput.
 func BenchmarkUDPMux_Throughput_SimulatedWAN(b *testing.B) {
 	conn1, conn2, peer1, peer2 := newUDPPairBench(b)
@@ -507,7 +507,7 @@ func BenchmarkUDPMux_Throughput_SimulatedWAN(b *testing.B) {
 }
 
 // BenchmarkMux_SendPacket isolates the allocation cost of a single
-// sendPacket call (DP-14: encryption now appends straight into the frame
+// sendPacket call: encryption appends straight into the frame
 // buffer via SessionCipher.EncryptInto instead of encrypting into a
 // standalone buffer that then gets copied into the frame). No receiver
 // reads these packets — this benchmark only measures encode+write cost.

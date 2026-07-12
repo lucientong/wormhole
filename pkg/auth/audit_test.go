@@ -12,7 +12,7 @@ import (
 )
 
 // failingAuditStore is a minimal AuditStore whose Store method always
-// fails, used to exercise AuditLogger's A4 error-counting path.
+// fails, used to exercise AuditLogger's error-counting path.
 type failingAuditStore struct{}
 
 func (failingAuditStore) Store(AuditEvent) error { return errors.New("store unavailable") }
@@ -57,7 +57,7 @@ func TestAuditLogger_AuthSuccess(t *testing.T) {
 	assert.False(t, event.Timestamp.IsZero())
 }
 
-// TestAuditLogger_StoreErrors_CountsFailures verifies A4: a persistently
+// TestAuditLogger_StoreErrors_CountsFailures verifies a persistently
 // failing AuditStore is counted rather than silently and invisibly
 // swallowed, and logging still succeeds to the JSON-line writer.
 func TestAuditLogger_StoreErrors_CountsFailures(t *testing.T) {

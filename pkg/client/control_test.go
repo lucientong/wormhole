@@ -93,7 +93,7 @@ func TestHandleCtrlTunnels_MethodNotAllowed(t *testing.T) {
 	assert.Equal(t, http.StatusMethodNotAllowed, w.Code)
 }
 
-// ─── Control API: create/delete (U1) ─────────────────────────────────────
+// ─── Control API: create/delete ─────────────────────────────────────
 
 func TestHandleCtrlCreateTunnel_InvalidBody(t *testing.T) {
 	c := NewClient(DefaultConfig())

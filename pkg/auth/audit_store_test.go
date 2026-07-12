@@ -124,7 +124,7 @@ func TestMemoryAuditStore_TimeFilter(t *testing.T) {
 	assert.Equal(t, "recent", results[0].SessionID)
 }
 
-// TestMemoryAuditStore_DeleteOlderThan verifies A5: events older than the
+// TestMemoryAuditStore_DeleteOlderThan verifies events older than the
 // cutoff are purged while recent events and query correctness (including
 // ordering) are preserved.
 func TestMemoryAuditStore_DeleteOlderThan(t *testing.T) {
@@ -253,7 +253,7 @@ func TestSQLiteAuditStore_DetailsRoundtrip(t *testing.T) {
 	assert.Equal(t, "https://example.com", results[0].Details["public_url"])
 }
 
-// TestSQLiteAuditStore_DeleteOlderThan verifies A5 for the SQLite backend.
+// TestSQLiteAuditStore_DeleteOlderThan verifies the same behavior for the SQLite backend.
 func TestSQLiteAuditStore_DeleteOlderThan(t *testing.T) {
 	f, err := os.CreateTemp(t.TempDir(), "audit-test-*.db")
 	require.NoError(t, err)

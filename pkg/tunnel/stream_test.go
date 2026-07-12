@@ -431,7 +431,7 @@ func TestStream_ReadTimeout(t *testing.T) {
 	assert.True(t, elapsed < 200*time.Millisecond, "Should not wait too long")
 }
 
-// TestStream_ReadContext_CancelUnblocks verifies that ReadContext (DP-06)
+// TestStream_ReadContext_CancelUnblocks verifies that ReadContext
 // returns ctx.Err() promptly when ctx is canceled while blocked waiting
 // for data, instead of only being interruptible via SetReadDeadline or
 // closing the stream/mux.
@@ -492,8 +492,8 @@ func TestStream_ReadContext_AlreadyCanceled(t *testing.T) {
 }
 
 // TestStream_ReadContext_BackgroundStillWorks verifies Read (which
-// delegates to ReadContext with context.Background()) is unaffected by
-// the DP-06 change: no watcher goroutine is spawned (Done() is nil) and
+// delegates to ReadContext with context.Background()) is unaffected:
+// no watcher goroutine is spawned (Done() is nil) and
 // data already in the buffer is returned normally.
 func TestStream_ReadContext_BackgroundStillWorks(t *testing.T) {
 	mux := &Mux{
@@ -515,7 +515,7 @@ func TestStream_ReadContext_BackgroundStillWorks(t *testing.T) {
 }
 
 // TestStream_WriteContext_CancelUnblocks verifies that WriteContext
-// (DP-06) returns ctx.Err() promptly when ctx is canceled while blocked
+// returns ctx.Err() promptly when ctx is canceled while blocked
 // waiting for send-window space to free up.
 func TestStream_WriteContext_CancelUnblocks(t *testing.T) {
 	mux := &Mux{

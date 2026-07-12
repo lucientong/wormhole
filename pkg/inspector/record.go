@@ -9,7 +9,7 @@ import (
 
 // sensitiveHeaders lists header names (case-insensitive) whose values are
 // replaced with a fixed redaction marker before being stored in a Record
-// (S14). The inspector's stated purpose is debugging request/response
+// . The inspector's stated purpose is debugging request/response
 // shape and routing, not exfiltrating credentials — so bearer tokens,
 // session cookies, and API keys captured incidentally while inspecting
 // traffic must never be persisted or shown in the local dashboard/API in
@@ -28,7 +28,7 @@ var sensitiveHeaders = map[string]struct{}{
 const redactedHeaderValue = "[redacted]"
 
 // captureHeaders copies HTTP headers into a flat map, redacting sensitive
-// ones (S14) instead of storing them verbatim.
+// ones instead of storing them verbatim.
 func captureHeaders(h http.Header) map[string]string {
 	headers := make(map[string]string, len(h))
 	for k, v := range h {

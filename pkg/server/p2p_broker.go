@@ -41,7 +41,7 @@ const (
 // prediction candidates for Symmetric+Symmetric pairs, and notifying the
 // matched peer so it can attempt the same hole-punch.
 //
-// Extracted from Server (P3-6 Batch D): it depends only on TunnelRegistry
+// Extracted from Server: it depends only on TunnelRegistry
 // (to find the peer a `wormhole connect` request targets) plus metrics
 // and the audit logger, not the rest of Server's state.
 type P2PBroker interface {
@@ -59,7 +59,7 @@ type p2pBroker struct {
 	metrics     *Metrics
 	auditLogger *auth.AuditLogger
 	// serverCtx returns the root lifecycle context to use for the
-	// peer-notification stream open (DP-05). Falls back to
+	// peer-notification stream open. Falls back to
 	// context.Background() if nil.
 	serverCtx func() context.Context
 }
@@ -157,7 +157,7 @@ func (b *p2pBroker) HandleOffer(client *ClientSession, stream *tunnel.Stream, re
 	// Both messages are length-prefixed (proto.WriteControlMessage) so the
 	// client can reliably distinguish and decode each one in turn — see
 	// Client.sendP2POffer, which now loop-reads framed messages instead of
-	// doing a single raw stream.Read() (DP-24).
+	// doing a single raw stream.Read().
 	bothSymmetric := req.NATType == natTypeSymmetric && peerNATType == natTypeSymmetric
 	if bothSymmetric {
 		initiatorCandidates := predictCandidatesForSymmetric(req.PublicAddr, req.NATType, 8)
@@ -266,7 +266,7 @@ func (b *p2pBroker) notifyPeer(peer *ClientSession, initiator *ClientSession) {
 	// For Symmetric+Symmetric, send initiator's predicted candidates first.
 	// Framed with proto.WriteControlMessage (length-prefixed) to match the
 	// client's Client.handleStream, which loop-reads framed control
-	// messages off this notification stream (DP-24).
+	// messages off this notification stream.
 	if initiatorNATType == natTypeSymmetric && peerNATType == natTypeSymmetric {
 		candidates := predictCandidatesForSymmetric(initiatorAddr, initiatorNATType, 8)
 		if len(candidates) > 0 {

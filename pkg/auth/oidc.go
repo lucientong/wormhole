@@ -282,7 +282,7 @@ func (v *OIDCValidator) buildClaims(_, payloadJSON []byte) (*Claims, error) {
 		return nil, fmt.Errorf("%w: cannot parse JWT payload", ErrInvalidToken)
 	}
 
-	// S7: normalize both sides (trailing slash) before comparing — some
+	// Normalize both sides (trailing slash) before comparing — some
 	// providers include or omit the trailing slash inconsistently between
 	// their discovery document and issued tokens.
 	if normalizeIssuer(payload.Iss) != normalizeIssuer(v.config.Issuer) {
@@ -295,7 +295,7 @@ func (v *OIDCValidator) buildClaims(_, payloadJSON []byte) (*Claims, error) {
 	if payload.Exp > 0 && now.After(time.Unix(payload.Exp, 0).Add(clockSkewLeeway)) {
 		return nil, ErrTokenExpired
 	}
-	// S7: reject tokens that aren't valid yet (nbf), with the same leeway.
+	// Reject tokens that aren't valid yet (nbf), with the same leeway.
 	if payload.Nbf > 0 && now.Before(time.Unix(payload.Nbf, 0).Add(-clockSkewLeeway)) {
 		return nil, fmt.Errorf("%w: token not yet valid (nbf)", ErrInvalidToken)
 	}
@@ -348,7 +348,7 @@ func mapRole(rawClaims map[string]json.RawMessage, mapping OIDCClaimMapping) Rol
 func verifyJWTSignature(alg string, key crypto.PublicKey, signingInput, sig []byte) error {
 	switch alg {
 	case "none", "":
-		// S6: explicitly reject the "none" algorithm (and a missing alg,
+		// Explicitly reject the "none" algorithm (and a missing alg,
 		// which some vulnerable parsers treat the same way) rather than
 		// relying on it falling through to the generic "unsupported
 		// algorithm" default below. This is the classic JWT `alg:none`
@@ -492,7 +492,7 @@ func parseECJWK(k jwkKey) (*ecdsa.PublicKey, error) {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 // normalizeIssuer strips a trailing "/" so that "https://issuer.example.com"
-// and "https://issuer.example.com/" compare as equal (S7).
+// and "https://issuer.example.com/" compare as equal.
 func normalizeIssuer(iss string) string {
 	return strings.TrimRight(iss, "/")
 }

@@ -38,7 +38,7 @@ func (c *Client) StartControlServer(ctrlHost string, ctrlPort int) error {
 	addr := net.JoinHostPort(ctrlHost, fmt.Sprintf("%d", ctrlPort))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/tunnels", c.handleCtrlTunnels)
-	// Go 1.22+ ServeMux method+wildcard pattern (U1): DELETE /tunnels/{name}.
+	// Go 1.22+ ServeMux method+wildcard pattern: DELETE /tunnels/{name}.
 	mux.HandleFunc("DELETE /tunnels/{name}", c.handleCtrlDeleteTunnel)
 
 	srv := &http.Server{
@@ -68,7 +68,7 @@ func (c *Client) StartControlServer(ctrlHost string, ctrlPort int) error {
 	return nil
 }
 
-// handleCtrlTunnels handles GET (list) and POST (create, U1) on /tunnels.
+// handleCtrlTunnels handles GET (list) and POST (create) on /tunnels.
 func (c *Client) handleCtrlTunnels(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -92,7 +92,7 @@ func (c *Client) handleCtrlListTunnels(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(infos)
 }
 
-// createTunnelRequest is the JSON body accepted by POST /tunnels (U1),
+// createTunnelRequest is the JSON body accepted by POST /tunnels,
 // mirroring the fields of a YAML config file tunnel entry.
 type createTunnelRequest struct {
 	Name       string `json:"name"`
@@ -105,7 +105,7 @@ type createTunnelRequest struct {
 }
 
 // handleCtrlCreateTunnel registers a new tunnel on the running client
-// (U1: `wormhole tunnels create`), the imperative counterpart to the
+// (backing `wormhole tunnels create`), the imperative counterpart to the
 // declarative config-file + SIGHUP reload workflow.
 func (c *Client) handleCtrlCreateTunnel(w http.ResponseWriter, r *http.Request) {
 	var req createTunnelRequest
@@ -149,7 +149,7 @@ func (c *Client) handleCtrlCreateTunnel(w http.ResponseWriter, r *http.Request) 
 }
 
 // handleCtrlDeleteTunnel closes and removes an active tunnel by name
-// (U1: `wormhole tunnels delete`).
+// (backing `wormhole tunnels delete`).
 func (c *Client) handleCtrlDeleteTunnel(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if err := c.DeleteTunnel(r.Context(), name); err != nil {

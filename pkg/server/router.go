@@ -46,7 +46,7 @@ func isStaleOwner(existing, incoming *ClientSession) bool {
 // RegisterSubdomain registers a subdomain route for a client session. If
 // the subdomain is currently held by a session whose connection has already
 // died (Mux.IsClosed()) but hasn't been cleaned up yet server-side, the
-// stale entry is reclaimed instead of rejecting the new registration (H10:
+// stale entry is reclaimed instead of rejecting the new registration:
 // otherwise a client reconnecting faster than the old session's death is
 // detected — e.g. a network blip with no clean FIN — would be wrongly
 // told its own subdomain is "already registered").
@@ -64,7 +64,7 @@ func (r *Router) RegisterSubdomain(subdomain string, client *ClientSession) erro
 }
 
 // RegisterHostname registers a custom hostname route for a client session.
-// See RegisterSubdomain's doc comment for the stale-owner reclaim rule (H10).
+// See RegisterSubdomain's doc comment for the stale-owner reclaim rule.
 func (r *Router) RegisterHostname(hostname string, client *ClientSession) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -79,7 +79,7 @@ func (r *Router) RegisterHostname(hostname string, client *ClientSession) error 
 }
 
 // RegisterPath registers a path-based route for a client session.
-// See RegisterSubdomain's doc comment for the stale-owner reclaim rule (H10).
+// See RegisterSubdomain's doc comment for the stale-owner reclaim rule.
 func (r *Router) RegisterPath(pathPrefix string, client *ClientSession) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

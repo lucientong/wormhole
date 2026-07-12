@@ -110,7 +110,7 @@ func (sc *SessionCipher) Encrypt(plaintext []byte) ([]byte, error) {
 // following the same convention as cipher.AEAD.Seal. This lets a caller
 // that's assembling a larger buffer (e.g. UDPMux.sendPacket prepending a
 // wire header) avoid the extra allocation+copy of first encrypting into a
-// standalone buffer and then copying that into the final one (DP-14).
+// standalone buffer and then copying that into the final one.
 func (sc *SessionCipher) EncryptInto(dst, plaintext []byte) ([]byte, error) {
 	// Increment nonce counter atomically.
 	counter := atomic.AddUint64(&sc.sendNonce, 1)

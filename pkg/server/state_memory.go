@@ -25,7 +25,7 @@ func NewMemoryStateStore() *MemoryStateStore {
 }
 
 // conflictsWith reports whether existing (a different route entry) claims
-// the same routing key as entry (H3: any of Subdomain/Hostname/PathPrefix,
+// the same routing key as entry (any of Subdomain/Hostname/PathPrefix,
 // compared case-insensitively / prefix-normalized to match Router's
 // semantics).
 func conflictsWith(entry, existing RouteEntry) bool {
@@ -47,7 +47,7 @@ func (m *MemoryStateStore) RegisterRoute(entry RouteEntry) error {
 
 	key := entry.Key()
 
-	// S3/H6/H3: reject when the routing key is already owned by a
+	// Reject when the routing key is already owned by a
 	// different route entry instead of silently overwriting it
 	// (last-writer-wins).
 	for routeID, existing := range m.routes {
@@ -182,8 +182,8 @@ func (m *MemoryStateStore) EvictDeadNodes(olderThan time.Duration) error {
 
 	for _, id := range deadNodes {
 		delete(m.nodes, id)
-		// Remove routes owned by the dead node (H8: unify with Redis,
-		// which relies on route TTL rather than an explicit sweep, but a
+		// Remove routes owned by the dead node. Redis
+		// relies on route TTL rather than an explicit sweep, but a
 		// dead node's routes should disappear from ListRoutes/lookups
 		// immediately rather than lingering until some unrelated TTL).
 		for routeID, route := range m.routes {

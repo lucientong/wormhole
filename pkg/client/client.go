@@ -42,16 +42,16 @@ const (
 
 // protocolUDP is the (rejected) tunnel protocol string checked by
 // ValidateProtocolString — see validProtocolStrings' doc for why it's not
-// in that list (V1: the server has no UDP dataplane).
+// in that list: the server has no UDP dataplane.
 const protocolUDP = "udp"
 
 // copyBufSize matches the buffer size io.Copy allocates internally by
-// default, so pooling it (DP-11) preserves throughput while avoiding a
+// default, so pooling it preserves throughput while avoiding a
 // fresh 32KB allocation on every proxied local<->tunnel connection.
 const copyBufSize = 32 * 1024
 
 // copyBufPool recycles the buffers dialAndProxy and proxyConnectConn use
-// for bidirectional proxying (DP-11), reducing steady-state memory
+// for bidirectional proxying, reducing steady-state memory
 // footprint under many concurrent tunnel connections.
 var copyBufPool = sync.Pool{
 	New: func() any {
@@ -79,7 +79,7 @@ type ActiveTunnel struct {
 
 // Client is the wormhole client.
 //
-// It is a composition root (P3-6 batch D): the actual control-plane
+// It is a composition root: the actual control-plane
 // connection lifecycle (dial/auth/register/heartbeat/reconnect) lives in
 // RelayClient, and the `wormhole connect` P2P hole-punching lifecycle
 // lives in P2PSession. Client wires the two together — relay's inbound
@@ -226,7 +226,7 @@ func (c *Client) dialAndProxy(ctx context.Context, inReader io.Reader, outWriter
 	// InReader -> Local. When the remote side is done sending (EOF/error
 	// on inReader), half-close localConn's write side so the local
 	// service sees EOF and can finish responding, instead of leaving it
-	// blocked waiting for more input that will never arrive (DP-04):
+	// blocked waiting for more input that will never arrive:
 	// without this, the "Local -> OutWriter" goroutine below could block
 	// forever on a local service that never closes its own connection,
 	// leaking both goroutines and localConn past dialAndProxy's return.
@@ -296,7 +296,7 @@ func (c *Client) forwardHTTPWithInspect(ctx context.Context, stream streamConn, 
 	}
 	defer httpReq.Body.Close()
 
-	// 2. Read request body for inspection, capped at MaxBodySize+1 (DP-12):
+	// 2. Read request body for inspection, capped at MaxBodySize+1:
 	// this also becomes the body forwarded to the local service below, so
 	// enabling the inspector trades unbounded body size for a bounded
 	// memory footprint — consistent with Inspector.Wrap's same trade-off
@@ -359,7 +359,7 @@ func (c *Client) forwardHTTPWithInspect(ctx context.Context, stream streamConn, 
 	defer resp.Body.Close()
 
 	// 5. Read response body for inspection, same MaxBodySize+1 cap as the
-	// request body above (DP-12) — it also becomes the body written back
+	// request body above — it also becomes the body written back
 	// to the stream in step 6, so this bounds memory for large downloads
 	// too, not just uploads.
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
@@ -445,12 +445,12 @@ func (c *Client) ReloadTunnels(ctx context.Context, newDefs []TunnelDef) {
 }
 
 // CreateTunnel registers a single new tunnel on an already-connected
-// client (U1). See RelayClient.CreateTunnel.
+// client. See RelayClient.CreateTunnel.
 func (c *Client) CreateTunnel(ctx context.Context, def TunnelDef) (*ActiveTunnel, error) {
 	return c.relay.CreateTunnel(ctx, def)
 }
 
-// DeleteTunnel closes and removes a single active tunnel by name (U1).
+// DeleteTunnel closes and removes a single active tunnel by name.
 // See RelayClient.DeleteTunnel.
 func (c *Client) DeleteTunnel(ctx context.Context, name string) error {
 	return c.relay.DeleteTunnel(ctx, name)
@@ -572,7 +572,7 @@ func parseProtocol(s string) proto.Protocol {
 
 // validProtocolStrings lists the tunnel protocol values accepted by
 // --protocol / the YAML config file's protocol field. UDP is deliberately
-// excluded (V1): the server has no UDP dataplane handling at all — it would
+// excluded: the server has no UDP dataplane handling at all — it would
 // silently register the tunnel as if it were HTTP, which is broken and
 // misleading rather than merely unsupported. Once the server implements a
 // real UDP tunnel path, add it back here alongside the server-side work.

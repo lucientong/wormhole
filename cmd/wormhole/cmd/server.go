@@ -102,7 +102,7 @@ Examples:
   # Specify custom database path
   wormhole server --require-auth --auth-secret my-secret --persistence sqlite --persistence-path /var/lib/wormhole/data.db
 
-  # Start from a YAML config file instead of flags (U4)
+  # Start from a YAML config file instead of flags
   wormhole server -c server.yml`,
 	Run: runServer,
 }
@@ -121,7 +121,7 @@ func init() {
 	serverCmd.Flags().StringSliceVar(&serverAuthTokens, "auth-tokens", nil, "Comma-separated list of valid authentication tokens")
 	serverCmd.Flags().StringVar(&serverAuthSecret, "auth-secret", "", "HMAC secret for signed tokens (min 16 chars)")
 	serverCmd.Flags().StringVar(&serverAdminToken, "admin-token", "", "Token for admin API authentication")
-	serverCmd.Flags().StringVar(&serverPersistence, "persistence", "memory", "Storage backend for auth data: memory (default), sqlite, or redis (H5: shared team/revocation state across cluster nodes)")
+	serverCmd.Flags().StringVar(&serverPersistence, "persistence", "memory", "Storage backend for auth data: memory (default), sqlite, or redis (shared team/revocation state across cluster nodes)")
 	serverCmd.Flags().StringVar(&serverPersistencePath, "persistence-path", "", "Path to SQLite database (default: ~/.wormhole/wormhole.db)")
 	serverCmd.Flags().BoolVar(&serverTunnelTLS, "tunnel-tls", false, "Enable TLS for the tunnel control listener (default: same as --tls, or true when --require-auth is set with a real --domain)")
 	serverCmd.Flags().StringVar(&serverAdminHost, "admin-host", "127.0.0.1", "Host for admin API (default: 127.0.0.1 for safety)")
@@ -148,13 +148,13 @@ func init() {
 	serverCmd.Flags().StringVar(&serverClusterRedisAddr, "cluster-redis-addr", "", "Redis address for cluster state (e.g. localhost:6379)")
 	serverCmd.Flags().StringVar(&serverClusterRedisPassword, "cluster-redis-password", "", "Redis AUTH password")
 	serverCmd.Flags().IntVar(&serverClusterRedisDB, "cluster-redis-db", 0, "Redis database number")
-	serverCmd.Flags().StringVar(&serverClusterSecret, "cluster-secret", "", "Shared secret validated on requests forwarded between cluster nodes (S1)")
+	serverCmd.Flags().StringVar(&serverClusterSecret, "cluster-secret", "", "Shared secret validated on requests forwarded between cluster nodes")
 	serverCmd.Flags().StringVar(&serverAuthRedisAddr, "auth-redis-addr", "", "Redis address for shared auth/revocation state when --persistence=redis (default: --cluster-redis-addr)")
 	serverCmd.Flags().StringVar(&serverAuthRedisPassword, "auth-redis-password", "", "Redis AUTH password for --auth-redis-addr (default: --cluster-redis-password)")
 	serverCmd.Flags().IntVar(&serverAuthRedisDB, "auth-redis-db", 0, "Redis database number for --auth-redis-addr (default: --cluster-redis-db)")
 }
 
-// applyTunnelTLSDefaults implements S4: it decides whether the tunnel
+// applyTunnelTLSDefaults decides whether the tunnel
 // control channel should default to TLS, independently of the operator's
 // --tunnel-tls flag, and enables AutoTLS when needed to serve it.
 //
@@ -176,8 +176,8 @@ func applyTunnelTLSDefaults(cmd *cobra.Command, config *server.Config) {
 // applyTunnelTLSDefaultsExplicit is applyTunnelTLSDefaults' core logic,
 // parameterized on whether the caller explicitly set TunnelTLSEnabled
 // (and to what value) instead of reading cobra flag-changed state
-// directly — this lets the YAML config-file path (U4) reuse the exact
-// same S4 defaulting/warning behavior as the --tunnel-tls flag path.
+// directly — this lets the YAML config-file path reuse the exact
+// same defaulting/warning behavior as the --tunnel-tls flag path.
 func applyTunnelTLSDefaultsExplicit(config *server.Config, explicit bool, value bool) {
 	hasRealDomain := config.Domain != "" && config.Domain != defaultDomain
 
@@ -285,7 +285,7 @@ func runServer(cmd *cobra.Command, _ []string) {
 
 	// Warn if admin API is exposed on non-loopback without a token. Derived
 	// from the resolved config.AdminAddr (not the --admin-host flag global)
-	// so this also works correctly when config came from a YAML file (U4).
+	// so this also works correctly when config came from a YAML file.
 	adminHost, _, splitErr := net.SplitHostPort(config.AdminAddr)
 	isLoopbackAdminHost := splitErr == nil && (adminHost == "127.0.0.1" || adminHost == "::1" || adminHost == "localhost")
 	if config.AdminToken == "" && !isLoopbackAdminHost {

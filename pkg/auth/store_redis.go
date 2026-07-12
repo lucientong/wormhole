@@ -15,14 +15,14 @@ const (
 	redisAuthRevokedPrefix = "wormhole:auth:revoked:" // wormhole:auth:revoked:<tokenID> → expiry unix (0 = permanent)
 
 	// redisAuthScanCount is the COUNT hint passed to SCAN (see RedisStateStore
-	// in pkg/server for the same H7 rationale: SCAN iterates in bounded
+	// in pkg/server for the same rationale: SCAN iterates in bounded
 	// batches instead of blocking the whole keyspace like KEYS would).
 	redisAuthScanCount = 200
 )
 
 // RedisStore implements Store using Redis, so that team records and the
 // token-revocation blacklist are visible to every node in a cluster instead
-// of being trapped in one node's local SQLite file or in-memory map (H5).
+// of being trapped in one node's local SQLite file or in-memory map.
 // Without this, a token revoked (or a team version bumped) on node A stayed
 // valid on node B until an operator manually restarted every other node.
 type RedisStore struct {
@@ -126,8 +126,8 @@ func (s *RedisStore) DeleteTeam(name string) error {
 	return nil
 }
 
-// SaveRevokedToken saves a revoked token to Redis, shared cluster-wide
-// (H5): a token revoked on one node is immediately rejected by every other
+// SaveRevokedToken saves a revoked token to Redis, shared cluster-wide:
+// a token revoked on one node is immediately rejected by every other
 // node's ValidatePayload, since they all query the same Redis key. When
 // expiresAt is non-zero, the key's own Redis TTL is set to match, so the
 // blacklist entry disappears automatically once the token itself would
@@ -178,7 +178,7 @@ func (s *RedisStore) RemoveRevokedToken(tokenID string) error {
 // sets a matching TTL on every non-permanent revocation, so Redis expires
 // them on its own without needing an explicit sweep (mirrors
 // RedisStateStore.EvictDeadNodes's rationale in pkg/server for the same
-// "TTL already handles it" reason, S10/A5's periodic-sweep callers still
+// "TTL already handles it" reason; periodic-sweep callers still
 // call this uniformly across all Store implementations).
 func (s *RedisStore) CleanupExpiredRevocations() (int, error) {
 	return 0, nil
@@ -200,7 +200,7 @@ func (s *RedisStore) Close() error {
 }
 
 // scanKeys returns all keys matching keyPattern using SCAN rather than KEYS
-// (H7's non-blocking-scan rationale applies here too).
+// (the same non-blocking-scan rationale applies here too).
 func (s *RedisStore) scanKeys(ctx context.Context, keyPattern string) ([]string, error) {
 	var keys []string
 	var cursor uint64

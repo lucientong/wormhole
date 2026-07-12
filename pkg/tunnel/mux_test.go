@@ -688,7 +688,7 @@ func BenchmarkMux_Throughput(b *testing.B) {
 	}
 }
 
-// BenchmarkMux_SendData isolates the sendData hot path (DP-09: dataBufPool
+// BenchmarkMux_SendData isolates the sendData hot path (dataBufPool
 // reuse instead of a fresh make+copy per call) from the Stream.Read/Write
 // and frame-decoding overhead the other Mux benchmarks also incur, so the
 // alloc/byte delta shown by `go test -bench BenchmarkMux_SendData -benchmem`

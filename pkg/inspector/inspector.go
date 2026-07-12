@@ -21,7 +21,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		MaxRecords: 1000,
-		// S14: lowered from 1MB — the inspector is a debugging aid for
+		// Deliberately modest — the inspector is a debugging aid for
 		// request/response shape, not a full traffic recorder, and a
 		// smaller default cap reduces how much (potentially sensitive)
 		// body content sits in memory/the local dashboard by default.
@@ -160,7 +160,7 @@ func (i *Inspector) SetEnabled(enabled bool) {
 // MaxBodySize returns the configured per-request/response body capture
 // limit, so callers reading a body ahead of Capture (e.g. to also forward
 // it) can bound their own read with an equivalent io.LimitReader instead
-// of buffering an unbounded body in memory (DP-12).
+// of buffering an unbounded body in memory.
 func (i *Inspector) MaxBodySize() int64 {
 	return i.config.MaxBodySize
 }

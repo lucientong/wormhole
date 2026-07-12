@@ -307,7 +307,7 @@ func TestUDPMux_LargePayload(t *testing.T) {
 	assert.Equal(t, large, received, "large payload should be received intact")
 }
 
-// TestUDPMux_SlowConsumer_NoSilentDataLoss verifies the DP-10 fix: when a
+// TestUDPMux_SlowConsumer_NoSilentDataLoss verifies that when a
 // stream's receive buffer fills up because the local consumer isn't
 // draining Read() fast enough, deliverLocked blocks with a bounded
 // timeout and withholds the ACK on failure — instead of the old behavior

@@ -9,7 +9,7 @@ import (
 )
 
 // FileConfig is the YAML schema for a wormhole server configuration file
-// (U4: `wormhole server -c server.yml`), covering the same settings
+// (loaded via `wormhole server -c server.yml`), covering the same settings
 // exposed via CLI flags so operators can check a config into version
 // control instead of maintaining a long flag invocation. Durations are
 // plain strings parsed with time.ParseDuration (e.g. "30s", "5m").

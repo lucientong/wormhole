@@ -18,7 +18,7 @@ import (
 
 var tunnelsCtrlPort int
 
-// Flags for `wormhole tunnels create` (U1).
+// Flags for `wormhole tunnels create`.
 var (
 	tunnelsCreateLocalPort  int
 	tunnelsCreateLocalHost  string
@@ -58,7 +58,7 @@ var tunnelsListCmd = &cobra.Command{
 	Run:   runTunnelsList,
 }
 
-// tunnelsCreateCmd registers a new tunnel on a running client (U1), the
+// tunnelsCreateCmd registers a new tunnel on a running client, the
 // imperative counterpart to editing the YAML config file and sending
 // SIGHUP. Useful for scripting/ad-hoc tunnels without touching the
 // client's config file at all.
@@ -75,7 +75,7 @@ the client's config file.`,
 	Run:  runTunnelsCreate,
 }
 
-// tunnelsDeleteCmd removes an active tunnel from a running client (U1).
+// tunnelsDeleteCmd removes an active tunnel from a running client.
 var tunnelsDeleteCmd = &cobra.Command{
 	Use:   "delete <name>",
 	Short: "Remove a tunnel from a running client",

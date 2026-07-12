@@ -7,7 +7,7 @@ import (
 
 // ErrSubdomainConflict is returned by StateStore.RegisterRoute when the
 // requested subdomain/hostname/path is already held by a different, still-live
-// client (S3/H6). Callers should reject the connection rather than proceed with
+// client. Callers should reject the connection rather than proceed with
 // a route the cluster considers ambiguous.
 var ErrSubdomainConflict = errors.New("subdomain already registered to another client")
 
@@ -18,7 +18,7 @@ var ErrSubdomainConflict = errors.New("subdomain already registered to another c
 //
 // A single client can own more than one RouteEntry — e.g. its connect-time
 // subdomain plus a custom hostname and/or path prefix registered by an
-// individual tunnel (H3). RouteID distinguishes these reservations from each
+// individual tunnel. RouteID distinguishes these reservations from each
 // other; it defaults to ClientID when empty, which preserves the original
 // one-entry-per-client behavior for the primary connect-time subdomain.
 type RouteEntry struct {
@@ -33,10 +33,10 @@ type RouteEntry struct {
 	// Subdomain is set when this entry reserves a subdomain route.
 	Subdomain string
 
-	// Hostname is set when this entry reserves a custom-hostname route (H3).
+	// Hostname is set when this entry reserves a custom-hostname route.
 	Hostname string
 
-	// PathPrefix is set when this entry reserves a path-prefix route (H3).
+	// PathPrefix is set when this entry reserves a path-prefix route.
 	PathPrefix string
 
 	// NodeID is the cluster node that owns this client connection.
@@ -81,9 +81,9 @@ type StateStore interface {
 	// RegisterRoute atomically reserves the routing key set on entry
 	// (exactly one of Subdomain/Hostname/PathPrefix). Implementations must
 	// return ErrSubdomainConflict (wrapped or not) when the key is already
-	// held by a different, still-live route entry (S3/H6), instead of
+	// held by a different, still-live route entry, instead of
 	// silently overwriting the existing owner. Re-registering the same
-	// entry.Key() (e.g. a TTL refresh, see H1) must succeed idempotently,
+	// entry.Key() (e.g. a periodic TTL refresh) must succeed idempotently,
 	// as must reclaiming a key whose previous owner has gone stale (its
 	// entry already expired/removed).
 	RegisterRoute(entry RouteEntry) error
@@ -104,11 +104,11 @@ type StateStore interface {
 	LookupBySubdomain(subdomain string) (*RouteEntry, error)
 
 	// LookupByHostname returns the route entry for the given custom
-	// hostname (H3). Returns (nil, nil) when not found.
+	// hostname. Returns (nil, nil) when not found.
 	LookupByHostname(hostname string) (*RouteEntry, error)
 
 	// LookupByPathPrefix returns the route entry whose PathPrefix is the
-	// longest prefix match of path (H3), mirroring Router.matchPath's
+	// longest prefix match of path, mirroring Router.matchPath's
 	// local semantics. Returns (nil, nil) when no path route matches.
 	LookupByPathPrefix(path string) (*RouteEntry, error)
 

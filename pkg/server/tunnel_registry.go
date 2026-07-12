@@ -17,7 +17,7 @@ import (
 // — see startHeartbeat).
 const (
 	// defaultHeartbeatInterval is how often a node sends heartbeats to the store.
-	// H1: this is also how often the node refreshes the TTL of every route
+	// This is also how often the node refreshes the TTL of every route
 	// it currently owns, so a long-lived connection's route never actually
 	// expires as long as its owning node keeps heartbeating — the 30s
 	// cadence is comfortably inside defaultRouteTTL (5 minutes).
@@ -38,7 +38,7 @@ const (
 // for TCP-protocol tunnels, and the shared StateStore's heartbeat/eviction
 // loop.
 //
-// Extracted from Server (P3-6 Batch D) so this state has exactly one
+// Extracted from Server so this state has exactly one
 // owner — previously it was a set of fields on Server directly mutated
 // from server.go, handler.go, admin.go and cluster.go alike, with no
 // single place that could be reasoned about (or tested) independently of
@@ -100,7 +100,7 @@ type TunnelRegistry interface {
 	// waits for it to fully exit.
 	StartHeartbeat(ctx context.Context)
 	// StateStoreHealth reports whether the cluster state store is
-	// currently reachable, for exposure via /health (H9). Returns
+	// currently reachable, for exposure via /health. Returns
 	// (configured=false, ...) for single-node deployments.
 	StateStoreHealth() (configured, healthy bool)
 	// ActiveRoutes returns the number of routes currently registered in
@@ -130,7 +130,7 @@ type tunnelRegistry struct {
 	// stateStore is nil for single-node deployments.
 	stateStore StateStore
 	// stateStoreHealthy tracks whether the most recent heartbeat/route
-	// refresh against stateStore succeeded, surfaced via /health (H9).
+	// refresh against stateStore succeeded, surfaced via /health.
 	stateStoreHealthy atomic.Bool
 
 	// wg tracks the background heartbeat goroutine started by
@@ -154,7 +154,7 @@ func newTunnelRegistry(cfg Config) *tunnelRegistry {
 		// heartbeat/route refresh (sent moments after Start()) proves
 		// otherwise, so /health doesn't report "degraded" for the brief
 		// startup window before the cluster heartbeat goroutine gets its
-		// first tick in (H9).
+		// first tick in.
 		tr.stateStoreHealthy.Store(true)
 	}
 	return tr
@@ -200,11 +200,11 @@ func (tr *tunnelRegistry) addClient(client *ClientSession) {
 // directory. It returns (false, reason) if the subdomain is already
 // claimed by another client (locally or cluster-wide), in which case the
 // caller must reject the connection rather than let it proceed silently
-// unrouted (F6/H6/S3).
+// unrouted.
 func (tr *tunnelRegistry) registerClientRoute(client *ClientSession) (ok bool, reason string) {
 	subdomain, sessionID := client.Subdomain, client.ID
 
-	// H10: Router.RegisterSubdomain (below) already reclaims a
+	// Router.RegisterSubdomain (below) already reclaims a
 	// subdomain locally when its current owner's mux has died but
 	// hasn't been cleaned up yet — e.g. a client reconnecting faster
 	// than the old session's death was detected. Proactively evict that
@@ -224,7 +224,7 @@ func (tr *tunnelRegistry) registerClientRoute(client *ClientSession) (ok bool, r
 		return false, fmt.Sprintf("subdomain %q already in use", subdomain)
 	}
 
-	// H6/S3: RegisterRoute atomically reserves the subdomain cluster-wide
+	// RegisterRoute atomically reserves the subdomain cluster-wide
 	// (Redis SETNX) instead of last-writer-wins; a genuine conflict with a
 	// live owner on another node must reject the connection too, for the
 	// same reason as the local check above. RouteID defaults to
@@ -243,7 +243,7 @@ func (tr *tunnelRegistry) registerClientRoute(client *ClientSession) (ok bool, r
 // registerClusterRoute reserves entry in the shared state store (a no-op,
 // always-true success when running single-node) and, on success, appends
 // it to client.clusterRoutes so the heartbeat loop keeps refreshing its TTL
-// (H1). NodeID/NodeAddr are filled in from the registry's own config.
+// . NodeID/NodeAddr are filled in from the registry's own config.
 // Returns (false, ErrSubdomainConflict-wrapping err) only for a genuine
 // live conflict; a state-store error unrelated to conflict resolution is
 // logged and treated as non-fatal (losing cluster visibility temporarily
@@ -400,7 +400,7 @@ func (tr *tunnelRegistry) lookupRemoteBySubdomain(subdomain string) *RouteEntry 
 }
 
 // lookupRemoteByHostname is lookupRemoteBySubdomain's counterpart for
-// custom hostnames (H3).
+// custom hostnames.
 func (tr *tunnelRegistry) lookupRemoteByHostname(hostname string) *RouteEntry {
 	if tr.stateStore == nil || hostname == "" {
 		return nil
@@ -414,7 +414,7 @@ func (tr *tunnelRegistry) lookupRemoteByHostname(hostname string) *RouteEntry {
 }
 
 // lookupRemoteByPath is lookupRemoteBySubdomain's counterpart for
-// path-prefix routes (H3).
+// path-prefix routes.
 func (tr *tunnelRegistry) lookupRemoteByPath(path string) *RouteEntry {
 	if tr.stateStore == nil {
 		return nil
@@ -491,10 +491,12 @@ func (tr *tunnelRegistry) ActiveRoutes() int {
 // StartHeartbeat starts a background goroutine that:
 //   - Periodically calls StateStore.NodeHeartbeat to mark this node as alive.
 //   - Periodically refreshes the TTL of every route this node currently
-//     owns (H1), so long-lived connections don't silently fall out of the
-//     cluster's routing table after defaultRouteTTL just because nothing
-//     re-registered them.
-//   - Periodically evicts routes owned by nodes that have stopped heartbeating.
+//
+// owns, so long-lived connections don't silently fall out of the
+//
+//	  cluster's routing table after defaultRouteTTL just because nothing
+//	  re-registered them.
+//	- Periodically evicts routes owned by nodes that have stopped heartbeating.
 //
 // It stops when ctx is canceled; Close waits for it to fully exit.
 func (tr *tunnelRegistry) StartHeartbeat(ctx context.Context) {
@@ -532,7 +534,7 @@ func (tr *tunnelRegistry) StartHeartbeat(ctx context.Context) {
 }
 
 // sendHeartbeat records this node's heartbeat in the state store, and
-// tracks whether the last attempt succeeded (H9) so /health can report
+// tracks whether the last attempt succeeded so /health can report
 // cluster state-store connectivity instead of staying silent about it.
 func (tr *tunnelRegistry) sendHeartbeat() {
 	err := tr.stateStore.NodeHeartbeat(NodeInfo{
@@ -548,7 +550,7 @@ func (tr *tunnelRegistry) sendHeartbeat() {
 }
 
 // refreshClusterRoutes re-registers every cluster route entry this node's
-// currently-connected clients own (H1). RegisterRoute's same-key branch is
+// currently-connected clients own. RegisterRoute's same-key branch is
 // an idempotent TTL refresh, so calling it again on every heartbeat is
 // enough to keep a long-lived connection's routes alive indefinitely
 // without ever needing a dedicated "just bump the TTL" store method.

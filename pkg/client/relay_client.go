@@ -310,7 +310,7 @@ func (r *relayClient) ServerSupports(name string) bool {
 
 // capabilities returns the set of optional protocol features this client
 // build actually supports/wants, advertised to the server via
-// AuthRequest.Capabilities (DP-33). "multi-tunnel" is unconditional;
+// AuthRequest.Capabilities. "multi-tunnel" is unconditional;
 // "p2p" reflects whether P2P is enabled in this client's config.
 func (r *relayClient) capabilities() []string {
 	caps := []string{"multi-tunnel"}
@@ -368,7 +368,7 @@ func (r *relayClient) authenticate(ctx context.Context) error {
 	}
 
 	// Send auth request, advertising this client's real feature set
-	// (DP-33) rather than leaving Capabilities empty.
+	// rather than leaving Capabilities empty.
 	req := proto.NewAuthRequest(r.config.Token, version.Short(), r.config.Subdomain)
 	req.AuthRequest.Capabilities = r.capabilities()
 	data, err := req.Encode()
@@ -415,7 +415,7 @@ func (r *relayClient) authenticate(ctx context.Context) error {
 		r.mu.Unlock()
 	}
 
-	// Remember what the server actually supports (DP-33) so optional
+	// Remember what the server actually supports so optional
 	// behavior, like attempting a P2P offer, can be gated on it instead
 	// of assumed. An empty list means an older server that predates this
 	// field — treated as "unknown", not "supports nothing" (see
@@ -718,7 +718,7 @@ func (r *relayClient) ReloadTunnels(ctx context.Context, newDefs []TunnelDef) {
 }
 
 // CreateTunnel registers a single new tunnel on an already-connected
-// client and adds it to the active tunnel set (U1), for imperative
+// client and adds it to the active tunnel set, for imperative
 // tunnel management via the control API (`wormhole tunnels create`) as a
 // complement to the declarative config-file + SIGHUP reload path
 // (ReloadTunnels). Returns an error if a tunnel with the same name is
@@ -746,7 +746,7 @@ func (r *relayClient) CreateTunnel(ctx context.Context, def TunnelDef) (*ActiveT
 	return at, nil
 }
 
-// DeleteTunnel closes and removes a single active tunnel by name (U1),
+// DeleteTunnel closes and removes a single active tunnel by name,
 // the imperative counterpart to CreateTunnel. Returns an error if no
 // tunnel with that name is currently active.
 func (r *relayClient) DeleteTunnel(ctx context.Context, name string) error {
@@ -880,7 +880,7 @@ func (r *relayClient) acceptStreams(ctx context.Context) {
 // prediction — ahead of the terminal P2POfferResponse, both length-prefixed
 // via proto.WriteControlMessage. We therefore loop-read until we hit a
 // message that concludes the exchange (StreamRequest or P2POfferResponse),
-// rather than assuming a single read yields the whole exchange (DP-24).
+// rather than assuming a single read yields the whole exchange.
 func (r *relayClient) handleStream(ctx context.Context, stream *tunnel.Stream) {
 	defer stream.Close()
 
@@ -904,9 +904,9 @@ func (r *relayClient) handleStream(ctx context.Context, stream *tunnel.Stream) {
 			return
 
 		case msg.P2PCandidates != nil:
-			// Not yet consumed by the hole-punching algorithm (tracked in
-			// P3-3); retained here purely so the exchange doesn't stall or
-			// get misclassified while waiting for the offer response.
+			// Not yet consumed by the hole-punching algorithm; retained
+			// here purely so the exchange doesn't stall or get
+			// misclassified while waiting for the offer response.
 			p2pCandidates = append(p2pCandidates, msg.P2PCandidates.Candidates...)
 			continue
 

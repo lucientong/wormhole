@@ -205,7 +205,7 @@ func (m *UDPMux) RemoteAddr() net.Addr { return m.peerAddr }
 // sendPacket constructs and sends a mux frame.
 // payload is encrypted if a cipher is configured.
 //
-// DP-14: the frame buffer is pre-sized for header + (encrypted) payload
+// The frame buffer is pre-sized for header + (encrypted) payload
 // up front, and the header is written directly into it; encryption (when
 // enabled) then appends its output straight into the same buffer via
 // EncryptInto instead of encrypting into a standalone buffer that then

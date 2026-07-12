@@ -64,7 +64,7 @@ type AuditLogger struct {
 	mu      sync.Mutex
 	enabled bool
 
-	// storeErrors counts failed AuditStore.Store calls (A4). This package
+	// storeErrors counts failed AuditStore.Store calls. This package
 	// deliberately has no logging dependency of its own, so a failure
 	// can't be logged here; StoreErrors() lets callers (e.g. the server,
 	// which does have a logger) surface/alert on persistent store
@@ -115,7 +115,7 @@ func (l *AuditLogger) Log(event AuditEvent) {
 
 	// Persist to store. A failure here must not block or fail the
 	// caller's hot path (auditing is best-effort), but it also must not
-	// vanish without a trace (A4) — count it so StoreErrors() can be
+	// vanish without a trace — count it so StoreErrors() can be
 	// monitored/alerted on.
 	if l.store != nil {
 		if err := l.store.Store(event); err != nil {
@@ -135,7 +135,7 @@ func (l *AuditLogger) Log(event AuditEvent) {
 
 // StoreErrors returns the number of AuditEvent persistence failures
 // (AuditStore.Store returning an error) since this logger was created
-// (A4). A non-zero, growing value indicates the audit store is
+// . A non-zero, growing value indicates the audit store is
 // unreachable or broken and events are being lost from persistent
 // storage (they're still written to the JSON-line writer, if any).
 func (l *AuditLogger) StoreErrors() uint64 {

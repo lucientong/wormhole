@@ -75,7 +75,7 @@ type Mux struct {
 	pongCh   chan uint32
 
 	// dataBufPool recycles the payload buffers sendData copies outgoing
-	// writes into (DP-09), replacing a fresh make+copy per Stream.Write
+	// writes into, replacing a fresh make+copy per Stream.Write
 	// call with pool reuse on the hot data path. Buffers are always
 	// DefaultFramePayloadSize (the cap that stream.go's Write ever
 	// requests); sendData falls back to a plain make for anything larger,
@@ -449,7 +449,7 @@ func (m *Mux) sendLoop() {
 }
 
 // writeFrame writes a frame to the connection. If the frame's payload was
-// borrowed from dataBufPool (DP-09), it is returned to the pool once the
+// borrowed from dataBufPool, it is returned to the pool once the
 // write completes (success or failure) — the wire encoder never retains a
 // reference to Payload past Encode returning, so reuse is always safe here.
 func (m *Mux) writeFrame(f *Frame) error {
@@ -542,7 +542,7 @@ func (m *Mux) sendData(streamID uint32, data []byte) error {
 
 	// Copy the payload because the caller (e.g., io.CopyBuffer) may
 	// reuse the underlying buffer before the sendLoop writes the frame.
-	// The copy target comes from dataBufPool when possible (DP-09),
+	// The copy target comes from dataBufPool when possible,
 	// turning what was a make+copy on every Stream.Write call into a
 	// pool-reuse + copy; writeFrame returns the buffer once sent.
 	payload, pooled := m.getDataBuf(len(data))

@@ -38,7 +38,7 @@ const (
 	maxConsecutiveDeliverFailures = 25 // ~5s at 200ms each
 )
 
-// Adaptive retransmission (DP-13): RFC 6298-style SRTT/RTTVAR/RTO estimation.
+// Adaptive retransmission: RFC 6298-style SRTT/RTTVAR/RTO estimation.
 // alpha/beta match the RFC's recommended gains; the RTO bounds are tuned
 // down from RFC 6298's 1s floor because P2P paths here are typically a
 // single hole-punched hop (tens to low hundreds of ms), not a general
@@ -101,7 +101,7 @@ type UDPStream struct {
 	// The channel is pre-filled with maxSendWindow tokens.
 	sendCreditCh chan struct{}
 
-	// Adaptive retransmission (DP-13): RFC 6298-style RTO estimator, fed by
+	// Adaptive retransmission: RFC 6298-style RTO estimator, fed by
 	// RTT samples from handleAck (Karn's algorithm: only from segments that
 	// were never retransmitted, since a retransmitted segment's ACK is
 	// ambiguous about which transmission it's acknowledging).
@@ -374,7 +374,7 @@ func (s *UDPStream) drainCredits() {
 
 // handleData processes an incoming DATA frame.
 //
-// Backpressure (DP-10): if the local consumer isn't draining Read() fast
+// Backpressure: if the local consumer isn't draining Read() fast
 // enough, recvCh fills up. Rather than silently dropping the segment
 // while still ACKing it (which would desync recvSeq from what was
 // actually delivered — permanent, silent data loss with no recovery),
@@ -423,7 +423,7 @@ func (s *UDPStream) handleData(seq uint32, payload []byte) {
 		// Out-of-order: buffer. payload is already a freshly-allocated
 		// slice owned by this call (see decryptPayload/dispatch in
 		// mux.go — it's never the read loop's reused scratch buffer), so
-		// it's safe to retain directly without another copy (DP-14).
+		// it's safe to retain directly without another copy.
 		if _, exists := s.recvBuf[seq]; !exists {
 			s.recvBuf[seq] = payload
 		}
@@ -446,7 +446,7 @@ func (s *UDPStream) handleData(seq uint32, payload []byte) {
 // just-arrived in-order segment, or a slice previously stored (and thus
 // already independently owned — see handleData's out-of-order branch) in
 // recvBuf; either way it's never aliased to the read loop's reused scratch
-// buffer, so it can be handed to recvCh directly without copying (DP-14).
+// buffer, so it can be handed to recvCh directly without copying.
 // On a failed send (timeout/close), the value is simply left untouched for
 // the caller to retry — channel sends only take effect when they succeed.
 func (s *UDPStream) deliverLocked(seq uint32, data []byte) bool {
@@ -595,7 +595,7 @@ func (s *UDPStream) handleFin() {
 // ---------------------------------------------------------------------------
 
 // retransmit resends unacknowledged packets that have exceeded their
-// adaptive RTO (DP-13): each segment's effective timeout is the stream's
+// adaptive RTO: each segment's effective timeout is the stream's
 // current RFC 6298 RTO estimate (falling back to defaultTimeout before the
 // first RTT sample), backed off exponentially per how many times that
 // specific segment has already been retransmitted. If a packet exceeds

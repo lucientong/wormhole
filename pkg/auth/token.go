@@ -167,7 +167,7 @@ func (a *Auth) GenerateTeamToken(teamName string, role Role) (string, error) {
 // ExtendTokenExpiry, and RefreshToken. The expiry is passed explicitly
 // rather than read from a.config.TokenExpiry so that callers computing a
 // custom expiry (e.g. ExtendTokenExpiry) never have to mutate the shared,
-// concurrently-read Auth.config — doing so was a data race (S9).
+// concurrently-read Auth.config — doing so was a data race.
 func (a *Auth) generateTeamToken(teamName string, role Role, expiry time.Duration) (string, error) {
 	if teamName == "" {
 		return "", ErrInvalidTeamName
@@ -567,7 +567,7 @@ func (a *Auth) RefreshToken(token string) (string, error) {
 //
 // If the old token cannot be revoked after the new one has already been
 // issued, this returns the new token alongside a wrapped error (rather than
-// silently swallowing the failure, per F5) so callers can decide whether to
+// silently swallowing the failure) so callers can decide whether to
 // surface a warning, retry the revocation, or treat it as fatal. The new
 // token itself is always valid and usable even when this error is non-nil.
 func (a *Auth) RefreshAndRevokeToken(oldToken string) (string, error) {
@@ -602,7 +602,7 @@ func (a *Auth) ExtendTokenExpiry(token string, extension time.Duration) (string,
 
 	// Compute the extended expiry as a local value and pass it straight
 	// through to generateTeamToken instead of temporarily mutating the
-	// shared a.config.TokenExpiry (S9): the latter was read concurrently by
+	// shared a.config.TokenExpiry: the latter was read concurrently by
 	// every other in-flight GenerateTeamToken/ValidateToken call without any
 	// lock, so two overlapping ExtendTokenExpiry calls (or one racing with a
 	// plain GenerateTeamToken) could hand out tokens with the wrong expiry.
