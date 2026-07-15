@@ -218,6 +218,19 @@ func TestRunServer_ConfigFileTunnelTLSDefault_EndToEnd(t *testing.T) {
 	assert.True(t, config.AutoTLS)
 }
 
+// TestNormalizeReservedSubdomains covers pflag's StringSliceVar quirk
+// this function exists to work around: `--reserved-subdomains=""`
+// parses to []string{""} (one empty element), not an empty slice, which
+// must become nil so server.Config sees "disabled" rather than a
+// reserved list containing only the empty string.
+func TestNormalizeReservedSubdomains(t *testing.T) {
+	assert.Nil(t, normalizeReservedSubdomains([]string{""}), "a single empty element must normalize to nil (disabled)")
+	assert.Nil(t, normalizeReservedSubdomains(nil))
+	assert.Equal(t, []string{"admin", "api"}, normalizeReservedSubdomains([]string{"admin", "api"}))
+	// A genuinely empty (but non-nil) slice is passed through unchanged.
+	assert.Equal(t, []string{}, normalizeReservedSubdomains([]string{}))
+}
+
 // TestBuildServerConfig_MinClientVersion verifies the
 // --min-client-version flag is wired into server.Config.
 func TestBuildServerConfig_MinClientVersion(t *testing.T) {

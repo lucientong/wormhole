@@ -2,6 +2,7 @@ package client
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -26,6 +27,19 @@ tunnels:
     local_port: 5432
     protocol: tcp
 `
+
+// TestDefaultTunnelConfigPath verifies the conventional multi-tunnel
+// config path is rooted at the user's home directory, without asserting
+// on its exact value (which varies per OS/CI environment).
+func TestDefaultTunnelConfigPath(t *testing.T) {
+	home, err := os.UserHomeDir()
+	require.NoError(t, err)
+
+	path := DefaultTunnelConfigPath()
+	require.NotEmpty(t, path)
+	assert.True(t, strings.HasPrefix(path, home), "expected %q to be rooted at home dir %q", path, home)
+	assert.True(t, strings.HasSuffix(path, "wormhole.yml"))
+}
 
 func TestLoadFileConfig_Valid(t *testing.T) {
 	f := writeTempConfig(t, validConfigYAML)

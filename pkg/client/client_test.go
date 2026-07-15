@@ -726,6 +726,44 @@ func TestClient_DeleteTunnel_NotFound(t *testing.T) {
 	assert.Contains(t, err.Error(), "not found")
 }
 
+// TestClient_ReloadTunnels_DelegatesToRelay verifies Client.ReloadTunnels
+// is a thin pass-through to relayClient.ReloadTunnels (already covered
+// in depth by TestRelayClient_ReloadTunnels_* in relay_client_test.go) by
+// checking the same add/remove/keep outcome is visible via the public
+// *Client API.
+func TestClient_ReloadTunnels_DelegatesToRelay(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Tunnels = []TunnelDef{{Name: "a", LocalPort: 8001, Subdomain: "a"}}
+	c := NewClient(cfg)
+
+	clientMux, serverMux := newClientMuxPair(t)
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
+	c.relay.activeTunnels = map[string]*ActiveTunnel{
+		"a": {Def: cfg.Tunnels[0], TunnelID: "tid-a"},
+	}
+
+	// serveFakeRegistryPeer (relay_client_test.go) answers both the
+	// CloseRequest for the removed "a" tunnel and the RegisterRequest for
+	// the newly-added "b" tunnel — a single one-shot handler would only
+	// accept one of the two streams ReloadTunnels opens and leave the
+	// other blocked reading a response that never arrives.
+	registered, _ := serveFakeRegistryPeer(t, serverMux)
+
+	c.ReloadTunnels(context.Background(), []TunnelDef{{Name: "b", LocalPort: 8002, Subdomain: "b"}})
+
+	select {
+	case subdomain := <-registered:
+		assert.Equal(t, "b", subdomain)
+	case <-time.After(2 * time.Second):
+		t.Fatal("newly added tunnel \"b\" was never registered with the server")
+	}
+	list := c.ListActiveTunnels()
+	require.Len(t, list, 1)
+	assert.Equal(t, "b", list[0].Def.Name)
+}
+
 func TestClient_SendPing_Success(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.HeartbeatTimeout = 5 * time.Second

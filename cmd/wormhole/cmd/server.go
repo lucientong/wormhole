@@ -213,7 +213,7 @@ func applyTunnelTLSDefaultsExplicit(config *server.Config, explicit bool, value 
 // string and never match a real subdomain anyway — but a nil slice is
 // the clearer, intentional way to represent "disabled".
 func normalizeReservedSubdomains(v []string) []string {
-	if len(v) == 1 && v[0] == "" {
+	if len(v) == 1 && v[0] == "" { // #nosec G602 -- len(v)==1 guards the v[0] access
 		return nil
 	}
 	return v

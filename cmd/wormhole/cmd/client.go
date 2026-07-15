@@ -137,13 +137,9 @@ func runClientFromConfig(cfgPath string, ctrlPort int) {
 			switch sig {
 			case syscall.SIGHUP:
 				log.Info().Msg("SIGHUP received — reloading config file")
-				newFC, loadErr := client.LoadFileConfig(cfgPath)
-				if loadErr != nil {
-					log.Error().Err(loadErr).Msg("Failed to reload config file; keeping current config")
-					continue
+				if reloadErr := reloadClientConfig(ctx, cfgPath, c); reloadErr != nil {
+					log.Error().Err(reloadErr).Msg("Failed to reload config file; keeping current config")
 				}
-				newCfg := newFC.ToClientConfig(client.DefaultConfig())
-				c.ReloadTunnels(ctx, newCfg.Tunnels)
 			default:
 				log.Info().Str("signal", sig.String()).Msg("Received shutdown signal")
 				cancel()
@@ -159,6 +155,24 @@ func runClientFromConfig(cfgPath string, ctrlPort int) {
 	}
 	cancel()
 	_ = c.Close()
+}
+
+// reloadClientConfig re-reads the tunnel config file at cfgPath and pushes
+// the resulting tunnel set into the already-running client c via
+// ReloadTunnels. Split out of runClientFromConfig's SIGHUP handler so it
+// can be unit-tested without going through an actual OS signal or a
+// live server connection (ReloadTunnels itself is a safe no-op when c
+// isn't currently connected). A malformed/missing config file returns an
+// error and leaves the client's existing tunnel set untouched, rather
+// than tearing anything down.
+func reloadClientConfig(ctx context.Context, cfgPath string, c *client.Client) error {
+	newFC, err := client.LoadFileConfig(cfgPath)
+	if err != nil {
+		return err
+	}
+	newCfg := newFC.ToClientConfig(client.DefaultConfig())
+	c.ReloadTunnels(ctx, newCfg.Tunnels)
+	return nil
 }
 
 // startClient creates and starts a Wormhole client with the given parameters.

@@ -77,6 +77,18 @@ jobs:
           files: coverage.out
           fail_ci_if_error: false
 
+      # NT-08: short, time-budgeted fuzz runs for the two parsers that sit
+      # directly on attacker-controlled wire bytes (frame header and
+      # control-message decoding). This isn't meant to replace the seed
+      # corpus (already covered by the `go test` run above via `f.Add`),
+      # just to keep spending a small, fixed CI budget looking for new
+      # crashers on every push.
+      - name: Fuzz frame decoder
+        run: go test ./pkg/tunnel/ -run=^$ -fuzz=FuzzDecodeFrame -fuzztime=20s
+
+      - name: Fuzz control message decoder
+        run: go test ./pkg/proto/ -run=^$ -fuzz=FuzzDecodeControlMessage -fuzztime=20s
+
   build:
     name: Build
     runs-on: ubuntu-latest

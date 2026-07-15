@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -151,6 +153,50 @@ func TestResolveClientCredentials_OnAuthFailure_NoCredentials_ReturnsFalse(t *te
 
 	_, ok := cfg.OnAuthFailure(context.Background())
 	assert.False(t, ok)
+}
+
+// NT-04: reloadClientConfig is what runClientFromConfig's SIGHUP handler
+// calls; testing it directly (rather than sending a real os.Signal to a
+// live client process) covers the same reload logic without needing a
+// running server connection — ReloadTunnels itself is a documented
+// no-op when the client isn't currently connected.
+
+func TestReloadClientConfig_ValidFile_ReloadsTunnels(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wormhole.yml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+server: tunnel.example.com:7000
+tunnels:
+  web:
+    local_port: 8080
+  api:
+    local_port: 9090
+`), 0o600))
+
+	c := client.NewClient(client.DefaultConfig())
+	err := reloadClientConfig(context.Background(), path, c)
+	require.NoError(t, err)
+
+	// Not connected, so ReloadTunnels is a safe no-op — the point of this
+	// assertion is that reloadClientConfig didn't error out or panic
+	// walking the newly-loaded tunnel set.
+	assert.Empty(t, c.ListActiveTunnels())
+}
+
+func TestReloadClientConfig_MissingFile_ReturnsErrorWithoutTouchingClient(t *testing.T) {
+	c := client.NewClient(client.DefaultConfig())
+	err := reloadClientConfig(context.Background(), filepath.Join(t.TempDir(), "does-not-exist.yml"), c)
+	assert.Error(t, err)
+}
+
+func TestReloadClientConfig_MalformedYAML_ReturnsError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wormhole.yml")
+	require.NoError(t, os.WriteFile(path, []byte("not: valid: yaml: at all:::"), 0o600))
+
+	c := client.NewClient(client.DefaultConfig())
+	err := reloadClientConfig(context.Background(), path, c)
+	assert.Error(t, err)
 }
 
 func TestRefreshSavedCredentials_CannotRefresh(t *testing.T) {
