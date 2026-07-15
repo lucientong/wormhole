@@ -106,18 +106,59 @@ func indexKey(entry RouteEntry) (key, desc string) {
 	}
 }
 
+// registerRouteScript atomically reserves entry's routing index key,
+// writes its JSON record, and (when ClientID is set) tracks it in the
+// client's route-ID set, all as one Redis-side transaction (NH-04).
+//
+// A previous implementation did this as SETNX(idx) + pipeline SET(route
+// data), which left a window — between the two round trips — where the
+// index key pointed at a routeID with no backing record yet: a concurrent
+// lookup landing in that window would see the route as "not found" even
+// though the reservation had technically succeeded, and if the process
+// crashed or lost its connection between the two calls, that broken state
+// could persist until routeID re-registered (which NH-01's heartbeat
+// retry now makes likely, but isn't a substitute for closing the race
+// itself). Running the whole thing as one EVAL removes the window
+// entirely: a lookup interleaved with a RegisterRoute call now always
+// finds a fully-formed reservation or none.
+//
+// Semantics (identical to the previous multi-round-trip version):
+//   - Key free                                → reserve it for entry.Key().
+//   - Key already owned by entry.Key()         → idempotent TTL refresh.
+//   - Key owned by a route whose record has expired/gone (crashed
+//     without UnregisterRoute) → reclaim it.
+//   - Key owned by another *live* route entry  → "CONFLICT:<routeID>".
+const registerRouteScript = `
+local idxKey = KEYS[1]
+local routeKey = KEYS[2]
+local clientRoutesKey = KEYS[3]
+local routeID = ARGV[1]
+local data = ARGV[2]
+local ttl = ARGV[3]
+local routePrefix = ARGV[4]
+
+local existing = redis.call("GET", idxKey)
+if existing ~= false and existing ~= routeID then
+  local ownerAlive = redis.call("EXISTS", routePrefix .. existing)
+  if ownerAlive == 1 then
+    return "CONFLICT:" .. existing
+  end
+end
+
+redis.call("SET", idxKey, routeID, "EX", ttl)
+redis.call("SET", routeKey, data, "EX", ttl)
+if clientRoutesKey ~= "" then
+  redis.call("SADD", clientRoutesKey, routeID)
+  redis.call("EXPIRE", clientRoutesKey, ttl)
+end
+return "OK"
+`
+
 // RegisterRoute atomically reserves entry's routing key (whichever of
-// Subdomain/Hostname/PathPrefix is set) via SetArgs{Mode:"NX"}
-// instead of a plain SET, which previously let two nodes racing to
-// register the same key silently overwrite each other (last-writer-wins).
-// Semantics:
-//
-//   - Key free                              → reserve it for entry.Key().
-//
-// - Key already owned by entry.Key() → idempotent TTL refresh.
-//   - Key owned by another route entry whose storage record has expired
-//     (crashed without calling UnregisterRoute) → reclaim it.
-//   - Key owned by another *live* route entry  → ErrSubdomainConflict.
+// Subdomain/Hostname/PathPrefix is set) via registerRouteScript instead of
+// a plain last-writer-wins SET, and instead of the older SETNX-then-
+// pipeline sequence that had a brief window between the two calls (see
+// registerRouteScript's doc comment).
 func (r *RedisStateStore) RegisterRoute(entry RouteEntry) error {
 	ctx := context.Background()
 
@@ -134,68 +175,25 @@ func (r *RedisStateStore) RegisterRoute(entry RouteEntry) error {
 	}
 
 	routeKey := redisRoutePrefix + routeID
+	clientRoutesKey := ""
+	if entry.ClientID != "" {
+		clientRoutesKey = redisClientRoutesIdx + entry.ClientID
+	}
 
-	_, err = r.client.SetArgs(ctx, idxKey, routeID, redis.SetArgs{
-		Mode: "NX",
-		TTL:  defaultRouteTTL,
-	}).Result()
-	switch {
-	case err == nil:
-		// Reserved successfully.
-	case errors.Is(err, redis.Nil):
-		if resolveErr := r.resolveConflict(ctx, idxKey, routeID, desc); resolveErr != nil {
-			return resolveErr
-		}
-	default:
+	res, err := r.client.Eval(ctx, registerRouteScript,
+		[]string{idxKey, routeKey, clientRoutesKey},
+		routeID, data, int(defaultRouteTTL.Seconds()), redisRoutePrefix,
+	).Result()
+	if err != nil {
 		return fmt.Errorf("reserve %s: %w", desc, err)
 	}
 
-	pipe := r.client.Pipeline()
-	pipe.Set(ctx, routeKey, data, defaultRouteTTL)
-	if entry.ClientID != "" {
-		clientRoutesKey := redisClientRoutesIdx + entry.ClientID
-		pipe.SAdd(ctx, clientRoutesKey, routeID)
-		pipe.Expire(ctx, clientRoutesKey, defaultRouteTTL)
+	result, ok := res.(string)
+	if !ok {
+		return fmt.Errorf("reserve %s: unexpected script result %v", desc, res)
 	}
-	if _, err := pipe.Exec(ctx); err != nil {
-		return fmt.Errorf("store route entry: %w", err)
-	}
-	return nil
-}
-
-// resolveConflict is called when SetNX on an index key found it already
-// occupied. It distinguishes an idempotent refresh by the current owner, a
-// stale reservation left by a crashed node, and a genuine conflict with
-// another live owner.
-func (r *RedisStateStore) resolveConflict(ctx context.Context, idxKey, routeID, desc string) error {
-	existingRouteID, err := r.client.Get(ctx, idxKey).Result()
-	if err != nil && !errors.Is(err, redis.Nil) {
-		return fmt.Errorf("check owner of %s: %w", desc, err)
-	}
-
-	if existingRouteID == routeID {
-		// Same route re-registering (e.g. a refresh or a retry) — just
-		// refresh the TTL.
-		if err := r.client.Expire(ctx, idxKey, defaultRouteTTL).Err(); err != nil {
-			return fmt.Errorf("refresh ttl for %s: %w", desc, err)
-		}
-		return nil
-	}
-
-	if existingRouteID != "" {
-		ownerAlive, err := r.client.Exists(ctx, redisRoutePrefix+existingRouteID).Result()
-		if err != nil {
-			return fmt.Errorf("check owner liveness for %s: %w", desc, err)
-		}
-		if ownerAlive > 0 {
-			return fmt.Errorf("%w: %s is held by another client", ErrSubdomainConflict, desc)
-		}
-	}
-
-	// Stale reservation (owner's route entry already expired/removed, or
-	// the key vanished between SetNX and Get) — reclaim it for routeID.
-	if err := r.client.Set(ctx, idxKey, routeID, defaultRouteTTL).Err(); err != nil {
-		return fmt.Errorf("reclaim stale %s: %w", desc, err)
+	if strings.HasPrefix(result, "CONFLICT:") {
+		return fmt.Errorf("%w: %s is held by another client", ErrSubdomainConflict, desc)
 	}
 	return nil
 }

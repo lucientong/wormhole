@@ -39,8 +39,19 @@ func NewRouter(domain string) *Router {
 // gone away. A nil Mux (as in some unit tests that construct a
 // *ClientSession by hand) is never treated as stale, to avoid accidentally
 // reclaiming routes in tests that don't wire up a real Mux.
+//
+// Reclaiming also requires the incoming client to belong to the same team
+// as the stale owner (or either side to have no team, i.e. auth disabled
+// or single-tenant deployments): without this, a client from team B
+// racing to claim the exact subdomain team A's client just dropped (e.g.
+// a network blip mid-reconnect) could transiently steal a route that
+// legitimately belongs to team A, before team A's own reconnect attempt
+// lands. NS-04 (see docs/architecture.md "Multi-tenancy").
 func isStaleOwner(existing, incoming *ClientSession) bool {
-	return existing != incoming && existing.Mux != nil && existing.Mux.IsClosed()
+	if existing == incoming || existing.Mux == nil || !existing.Mux.IsClosed() {
+		return false
+	}
+	return existing.TeamName == "" || incoming.TeamName == "" || existing.TeamName == incoming.TeamName
 }
 
 // RegisterSubdomain registers a subdomain route for a client session. If

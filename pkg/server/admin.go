@@ -563,12 +563,12 @@ func (a *AdminAPI) handleGenerateToken(w http.ResponseWriter, r *http.Request) {
 	// Default to member role.
 	role := auth.RoleMember
 	if req.Role != "" {
-		switch req.Role {
-		case "admin":
+		switch auth.Role(req.Role) {
+		case auth.RoleAdmin:
 			role = auth.RoleAdmin
-		case "member":
+		case auth.RoleMember:
 			role = auth.RoleMember
-		case "viewer":
+		case auth.RoleViewer:
 			role = auth.RoleViewer
 		default:
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid role, must be: admin, member, or viewer"})
@@ -742,7 +742,7 @@ func (a *AdminAPI) handleAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	q, err := parseAuditQuery(r)
+	q, err := parseAuditQuery(r, auditListMaxLimit, auditListDefaultLimit)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error()})
 		return
@@ -762,7 +762,9 @@ func (a *AdminAPI) handleAudit(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAuditExport handles GET /audit/export — exports audit events as JSON
-// or CSV.  Accepts the same query parameters as /audit, plus:
+// or CSV.  Accepts the same query parameters as /audit (with a higher
+// 'limit' default/max of auditExportDefaultLimit/auditExportMaxLimit, for
+// bulk export rather than interactive paging), plus:
 //
 //	format - "json" (default) or "csv"
 func (a *AdminAPI) handleAuditExport(w http.ResponseWriter, r *http.Request) {
@@ -778,14 +780,17 @@ func (a *AdminAPI) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	q, err := parseAuditQuery(r)
+	// Export endpoints default to (and allow up to) a higher limit than
+	// /audit's paginated list view, matching this handler's stated intent
+	// to support bulk export — NA-03: parseAuditQuery previously always
+	// capped 'limit' at 1000 regardless of caller, so an explicit
+	// `?limit=10000` on /audit/export was silently truncated back down
+	// to 1000, contradicting the "export endpoints default to a higher
+	// limit" comment that only covered the *unset* case.
+	q, err := parseAuditQuery(r, auditExportMaxLimit, auditExportDefaultLimit)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error()})
 		return
-	}
-	// Export endpoints should default to a higher limit.
-	if q.Limit == 0 {
-		q.Limit = 10_000
 	}
 
 	events, err := a.server.auditLogger.Store().Query(q)
@@ -810,8 +815,24 @@ func (a *AdminAPI) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// Audit query 'limit' bounds. /audit is a paginated list view meant for
+// interactive browsing, so it keeps a conservative cap; /audit/export is
+// explicitly for bulk export and gets a much higher one (NA-03 — these
+// used to share a single hardcoded 1000 cap that silently truncated any
+// /audit/export?limit=... above it, contradicting the higher default
+// export claims to use).
+const (
+	auditListDefaultLimit   = 100
+	auditListMaxLimit       = 1000
+	auditExportDefaultLimit = 10_000
+	auditExportMaxLimit     = 100_000
+)
+
 // parseAuditQuery parses query parameters into an auth.AuditQuery.
-func parseAuditQuery(r *http.Request) (auth.AuditQuery, error) {
+// 'limit' is clamped to [0, maxLimit] and defaults to defaultLimit when
+// unset (or explicitly 0), so callers can apply a stricter cap for
+// interactive listing vs. bulk export.
+func parseAuditQuery(r *http.Request, maxLimit, defaultLimit int) (auth.AuditQuery, error) {
 	q := auth.AuditQuery{}
 	params := r.URL.Query()
 
@@ -842,13 +863,13 @@ func parseAuditQuery(r *http.Request) (auth.AuditQuery, error) {
 		if err != nil || n < 0 {
 			return q, fmt.Errorf("invalid 'limit' value")
 		}
-		if n > 1000 {
-			n = 1000
+		if n > maxLimit {
+			n = maxLimit
 		}
 		q.Limit = n
 	}
 	if q.Limit == 0 {
-		q.Limit = 100
+		q.Limit = defaultLimit
 	}
 
 	if s := params.Get("offset"); s != "" {
@@ -929,10 +950,12 @@ func (a *AdminAPI) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 	var newToken string
 	var err error
 	var revokeWarning string
+	mode := "refresh"
 
 	switch {
 	case req.ExtendBy != "":
 		// Extend token expiry.
+		mode = "extend"
 		duration, parseErr := time.ParseDuration(req.ExtendBy)
 		if parseErr != nil {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid extend_by duration"})
@@ -944,6 +967,7 @@ func (a *AdminAPI) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 		// return a valid newToken alongside a non-nil error when the new
 		// token was issued but revoking the old one failed — don't discard
 		// a perfectly good token in that case, just surface the warning.
+		mode = "refresh_and_revoke"
 		newToken, err = a.server.authenticator.RefreshAndRevokeToken(req.Token) //nolint:contextcheck
 		if err != nil && newToken != "" {
 			revokeWarning = err.Error()
@@ -973,6 +997,13 @@ func (a *AdminAPI) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 		logEvent = logEvent.Str("revoke_warning", revokeWarning)
 	}
 	logEvent.Msg("Token refreshed via admin API")
+
+	// NA-02: token refresh/extension previously had no audit trail at
+	// all — an admin-API caller could mint a renewed credential for any
+	// team without leaving any record queryable via /audit.
+	if a.server.auditLogger != nil {
+		a.server.auditLogger.LogTokenRefreshed(claims.TeamName, claims.Role, mode)
+	}
 
 	writeJSON(w, http.StatusOK, GenerateTokenResponse{
 		Token:   newToken,

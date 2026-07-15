@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/lucientong/wormhole/pkg/proto"
 	"github.com/lucientong/wormhole/pkg/tunnel"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -345,6 +347,152 @@ func newCapturingTunnelBackend(t *testing.T, sessionID, subdomain, body string, 
 	}()
 
 	return tb
+}
+
+// flakyStateStore wraps a StateStore and fails the first failAfter calls
+// to RegisterRoute with a non-conflict error, then delegates normally —
+// simulating a transient Redis outage for the NH-01 tests below.
+type flakyStateStore struct {
+	StateStore
+	remainingFailures int
+}
+
+func (f *flakyStateStore) RegisterRoute(entry RouteEntry) error {
+	if f.remainingFailures > 0 {
+		f.remainingFailures--
+		return errors.New("simulated transient state-store outage")
+	}
+	return f.StateStore.RegisterRoute(entry)
+}
+
+// TestTunnelRegistry_RegisterClusterRoute_NH01RetriesAfterTransientFailure
+// verifies NH-01's core fix: a non-conflict RegisterRoute failure still
+// appends the route to client.clusterRoutes (instead of dropping it
+// forever), so the very next heartbeat's refreshClusterRoutes retries —
+// and eventually succeeds — it without requiring the client to reconnect.
+func TestTunnelRegistry_RegisterClusterRoute_NH01RetriesAfterTransientFailure(t *testing.T) {
+	store := &flakyStateStore{StateStore: NewMemoryStateStore(), remainingFailures: 1}
+	s := newClusterTestServer("node-a", "node-a:7000", store)
+
+	client := &ClientSession{ID: "client-1", Subdomain: "myapp", CreatedAt: time.Now(), LastSeen: time.Now()}
+
+	// The first attempt hits the simulated outage. registerClusterRoute
+	// must still report success (fail-open) rather than rejecting the
+	// connection over a state-store hiccup.
+	ok, err := s.registry.registerClusterRoute(client, RouteEntry{ClientID: client.ID, Subdomain: "myapp"})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	// The route must be tracked for retry even though the store call
+	// failed — this is the exact gap NH-01 closes.
+	client.mu.Lock()
+	require.Len(t, client.clusterRoutes, 1, "failed registration must still be tracked in clusterRoutes for retry")
+	client.mu.Unlock()
+
+	if s.metrics != nil {
+		assert.Equal(t, float64(1), testutil.ToFloat64(s.metrics.ClusterRouteSyncFailuresTotal))
+	}
+
+	// Not yet visible cluster-wide (the underlying store never got the
+	// write).
+	entry, err := store.LookupBySubdomain("myapp")
+	require.NoError(t, err)
+	assert.Nil(t, entry, "route must not be visible yet — the underlying RegisterRoute call failed")
+
+	// Add the client to the registry's directory (registerClusterRoute
+	// alone doesn't do this) so refreshClusterRoutes' Snapshot() picks it
+	// up, then simulate the next heartbeat tick: the outage has now
+	// "recovered" (remainingFailures reached 0).
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
+
+	s.registry.refreshClusterRoutes()
+
+	entry, err = store.LookupBySubdomain("myapp")
+	require.NoError(t, err)
+	require.NotNil(t, entry, "route must self-heal on the next heartbeat retry once the store recovers")
+	assert.Equal(t, "client-1", entry.ClientID)
+}
+
+// TestTunnelRegistry_RefreshClusterRoutes_NH01DetectsSplitBrainConflict
+// verifies that once a node's belief that it owns a route ("clusterRoutes"
+// contains that entry) turns out to be false — the cluster-wide state now
+// disagrees, e.g. another node grabbed the same key while this node was
+// registering it during an outage — refreshClusterRoutes surfaces it as a
+// counted conflict instead of a routine, silently-retried warning.
+func TestTunnelRegistry_RefreshClusterRoutes_NH01DetectsSplitBrainConflict(t *testing.T) {
+	store := NewMemoryStateStore()
+	s := newClusterTestServer("node-a", "node-a:7000", store)
+
+	client := &ClientSession{ID: "client-1", Subdomain: "myapp", CreatedAt: time.Now(), LastSeen: time.Now()}
+	client.clusterRoutes = []RouteEntry{{ClientID: client.ID, Subdomain: "myapp"}}
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
+
+	// A different client (as if on a different node) has since claimed
+	// the exact same subdomain for real — a genuine, live conflict.
+	require.NoError(t, store.RegisterRoute(RouteEntry{ClientID: "client-2", Subdomain: "myapp", NodeID: "node-b"}))
+
+	s.registry.refreshClusterRoutes()
+
+	if s.metrics != nil {
+		assert.Equal(t, float64(1), testutil.ToFloat64(s.metrics.ClusterRouteConflictsTotal))
+	}
+
+	entry, err := store.LookupBySubdomain("myapp")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Equal(t, "client-2", entry.ClientID, "the other node's route must win; this node's stale belief must not overwrite it")
+}
+
+// TestServer_RegisterClientRoute_CrossTeamCannotReclaimStaleSession is
+// NS-04's core regression test: a subdomain left behind by a dead-but-
+// not-yet-cleaned-up session must not be reclaimable by a *different*
+// team's client during the transient window before RemoveClient runs —
+// only the stale owner's own team (or a deployment not using teams at
+// all) may reclaim it. Complements
+// TestServer_RegisterClientRoute_ReclaimsStaleLocalSession, which covers
+// the same-team (and no-team) reclaim path that must keep working.
+func TestServer_RegisterClientRoute_CrossTeamCannotReclaimStaleSession(t *testing.T) {
+	s := newClusterTestServer("node-a", "node-a:7000", nil)
+
+	oldBackend := newTunnelBackend(t, "old-session", "myapp", "old")
+	oldBackend.session.TeamName = "team-a"
+	require.True(t, s.registerClientRoute(oldBackend.session, "127.0.0.1"))
+
+	// Simulate the old connection dying without a clean disconnect.
+	_ = oldBackend.serverMux.Close()
+
+	newSession := &ClientSession{
+		ID: "new-session", Subdomain: "myapp", TeamName: "team-b",
+		CreatedAt: time.Now(), LastSeen: time.Now(),
+	}
+	assert.False(t, s.registerClientRoute(newSession, "127.0.0.1"),
+		"a different team must not be able to reclaim another team's stale subdomain")
+	assert.Same(t, oldBackend.session, s.registry.router.LookupSubdomain("myapp"))
+}
+
+// TestServer_RegisterClientRoute_SameTeamCanReclaimStaleSession verifies
+// the positive counterpart: the *same* team reconnecting (e.g. a new
+// session replacing the dead one) can still reclaim immediately, exactly
+// as before NS-04.
+func TestServer_RegisterClientRoute_SameTeamCanReclaimStaleSession(t *testing.T) {
+	s := newClusterTestServer("node-a", "node-a:7000", nil)
+
+	oldBackend := newTunnelBackend(t, "old-session", "myapp", "old")
+	oldBackend.session.TeamName = "team-a"
+	require.True(t, s.registerClientRoute(oldBackend.session, "127.0.0.1"))
+
+	_ = oldBackend.serverMux.Close()
+
+	newSession := &ClientSession{
+		ID: "new-session", Subdomain: "myapp", TeamName: "team-a",
+		CreatedAt: time.Now(), LastSeen: time.Now(),
+	}
+	assert.True(t, s.registerClientRoute(newSession, "127.0.0.1"), "the same team's reconnect must still reclaim immediately")
+	assert.Same(t, newSession, s.registry.router.LookupSubdomain("myapp"))
 }
 
 // TestServer_RefreshClusterRoutes verifies a connected client's

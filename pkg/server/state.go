@@ -30,6 +30,13 @@ type RouteEntry struct {
 	// ClientID is the unique identifier of the owning client session.
 	ClientID string
 
+	// TeamName is the team that owns this route, threaded through from
+	// the owning ClientSession at registration time. Used to reject a
+	// different team from reclaiming a route that looks momentarily
+	// stale (e.g. the owner is mid-reconnect) — see isStaleOwner and
+	// the "Multi-tenancy" section of docs/architecture.md.
+	TeamName string
+
 	// Subdomain is set when this entry reserves a subdomain route.
 	Subdomain string
 

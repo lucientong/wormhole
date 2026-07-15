@@ -41,6 +41,7 @@ var (
 	serverMaxCtrlStreamsPerCli int
 	serverShutdownTimeout      time.Duration
 	serverMinClientVersion     string
+	serverReservedSubdomains   []string
 	serverConfigFile           string
 	serverAuditEnabled         bool
 	serverAuditPersistence     string
@@ -133,6 +134,7 @@ func init() {
 	serverCmd.Flags().IntVar(&serverMaxCtrlStreamsPerCli, "max-control-streams-per-client", 128, "Maximum concurrent control-plane streams (register/ping/stats/close/P2P-offer) for a single client's own connection (0 = unlimited)")
 	serverCmd.Flags().DurationVar(&serverShutdownTimeout, "shutdown-timeout", 15*time.Second, "How long to wait for in-flight HTTP/admin requests to finish on shutdown before forcing them closed")
 	serverCmd.Flags().StringVar(&serverMinClientVersion, "min-client-version", "", "Reject clients reporting an older semantic version, e.g. 0.6.0 (default: disabled). Clients with a non-semver version (e.g. dev builds) are never rejected")
+	serverCmd.Flags().StringSliceVar(&serverReservedSubdomains, "reserved-subdomains", server.DefaultReservedSubdomains(), "Subdomains only auth.RoleAdmin tokens may claim (requires --require-auth); pass an empty string to disable")
 	serverCmd.Flags().BoolVar(&serverAuditEnabled, "audit", false, "Enable structured audit logging")
 	serverCmd.Flags().StringVar(&serverAuditPersistence, "audit-persistence", "memory", "Audit storage backend: memory (default) or sqlite")
 	serverCmd.Flags().StringVar(&serverAuditPath, "audit-path", "", "Path to SQLite audit database (default: ~/.wormhole/audit.db)")
@@ -203,6 +205,20 @@ func applyTunnelTLSDefaultsExplicit(config *server.Config, explicit bool, value 
 	}
 }
 
+// normalizeReservedSubdomains turns the --reserved-subdomains flag's
+// parsed value into what server.Config expects: a nil/empty slice
+// explicitly disables the check, but pflag's StringSliceVar turns
+// `--reserved-subdomains=""` into []string{""} (one empty element)
+// rather than an empty slice, which would otherwise "reserve" the empty
+// string and never match a real subdomain anyway — but a nil slice is
+// the clearer, intentional way to represent "disabled".
+func normalizeReservedSubdomains(v []string) []string {
+	if len(v) == 1 && v[0] == "" {
+		return nil
+	}
+	return v
+}
+
 // buildServerConfig assembles a server.Config from CLI flags.
 func buildServerConfig(cmd *cobra.Command) server.Config {
 	// Support WORMHOLE_DOMAIN environment variable as default for --domain.
@@ -234,6 +250,7 @@ func buildServerConfig(cmd *cobra.Command) server.Config {
 	config.MaxControlStreamsPerClient = serverMaxCtrlStreamsPerCli
 	config.ShutdownTimeout = serverShutdownTimeout
 	config.MinClientVersion = serverMinClientVersion
+	config.ReservedSubdomains = normalizeReservedSubdomains(serverReservedSubdomains)
 
 	applyTunnelTLSDefaults(cmd, &config)
 

@@ -133,6 +133,11 @@ type tunnelRegistry struct {
 	// refresh against stateStore succeeded, surfaced via /health.
 	stateStoreHealthy atomic.Bool
 
+	// metrics is nil when Config.EnableMetrics is false. Used only to
+	// surface cluster route sync/conflict counters (NH-01); every other
+	// registry operation is metrics-agnostic.
+	metrics *Metrics
+
 	// wg tracks the background heartbeat goroutine started by
 	// StartHeartbeat, so Close can wait for it to fully exit.
 	wg sync.WaitGroup
@@ -140,14 +145,17 @@ type tunnelRegistry struct {
 
 // newTunnelRegistry constructs a TunnelRegistry from server config,
 // initializing the local Router, TCP port allocator and (if configured)
-// the shared cluster state store.
-func newTunnelRegistry(cfg Config) *tunnelRegistry {
+// the shared cluster state store. metrics may be nil (EnableMetrics
+// false); when non-nil it must already be fully constructed, since
+// newTunnelRegistry never mutates it beyond storing the pointer.
+func newTunnelRegistry(cfg Config, metrics *Metrics) *tunnelRegistry {
 	tr := &tunnelRegistry{
 		cfg:           cfg,
 		clients:       make(map[string]*ClientSession),
 		router:        NewRouter(cfg.Domain),
 		portAllocator: NewTCPPortAllocator(cfg.TCPPortRangeStart, cfg.TCPPortRangeEnd),
 		stateStore:    initStateStore(cfg),
+		metrics:       metrics,
 	}
 	if tr.stateStore != nil {
 		// Optimistic default: assume healthy until the first
@@ -229,7 +237,7 @@ func (tr *tunnelRegistry) registerClientRoute(client *ClientSession) (ok bool, r
 	// live owner on another node must reject the connection too, for the
 	// same reason as the local check above. RouteID defaults to
 	// sessionID/ClientID, matching this connection's primary route.
-	if regOK, err := tr.registerClusterRoute(client, RouteEntry{ClientID: sessionID, Subdomain: subdomain}); !regOK {
+	if regOK, err := tr.registerClusterRoute(client, RouteEntry{ClientID: sessionID, Subdomain: subdomain, TeamName: client.TeamName}); !regOK {
 		log.Error().Err(err).Str("subdomain", subdomain).Str("session_id", sessionID).
 			Msg("Cluster: subdomain already claimed by another node — rejecting connection")
 		tr.router.UnregisterSubdomain(subdomain)
@@ -248,6 +256,16 @@ func (tr *tunnelRegistry) registerClientRoute(client *ClientSession) (ok bool, r
 // live conflict; a state-store error unrelated to conflict resolution is
 // logged and treated as non-fatal (losing cluster visibility temporarily
 // is preferable to rejecting every connection whenever Redis hiccups).
+//
+// NH-01: a non-conflict failure still appends entry to client.clusterRoutes
+// (marked unsynced), instead of silently dropping it. That's what makes
+// the "availability over strict consistency" trade-off self-healing
+// rather than a permanent gap: refreshClusterRoutes retries every route in
+// clusterRoutes on each heartbeat tick regardless of whether the previous
+// attempt succeeded, so a transient Redis outage resolves itself within
+// one heartbeat interval of Redis recovering, with no client reconnect
+// required. See docs/architecture.md "High Availability & Multi-tenancy"
+// for the full trade-off writeup.
 func (tr *tunnelRegistry) registerClusterRoute(client *ClientSession, entry RouteEntry) (bool, error) {
 	if tr.stateStore == nil {
 		return true, nil
@@ -264,7 +282,14 @@ func (tr *tunnelRegistry) registerClusterRoute(client *ClientSession, entry Rout
 		return true, nil
 	}
 	if !errors.Is(err, ErrSubdomainConflict) {
-		log.Warn().Err(err).Str("route", entry.Key()).Msg("Cluster: failed to register route in state store")
+		log.Warn().Err(err).Str("route", entry.Key()).
+			Msg("Cluster: failed to register route in state store — will retry on next heartbeat")
+		if tr.metrics != nil {
+			tr.metrics.ClusterRouteSyncFailuresTotal.Inc()
+		}
+		client.mu.Lock()
+		client.clusterRoutes = append(client.clusterRoutes, entry)
+		client.mu.Unlock()
 		return true, nil
 	}
 	return false, err
@@ -296,7 +321,7 @@ func (tr *tunnelRegistry) RegisterTunnel(client *ClientSession, tunnelID, subdom
 			return fmt.Sprintf("subdomain %q already in use", subdomain)
 		}
 		routeID := tunnelID + ":sub"
-		if ok, _ := tr.registerClusterRoute(client, RouteEntry{RouteID: routeID, ClientID: client.ID, Subdomain: subdomain}); !ok {
+		if ok, _ := tr.registerClusterRoute(client, RouteEntry{RouteID: routeID, ClientID: client.ID, Subdomain: subdomain, TeamName: client.TeamName}); !ok {
 			tr.router.UnregisterSubdomain(subdomain)
 			return fmt.Sprintf("subdomain %q already claimed cluster-wide", subdomain)
 		}
@@ -308,7 +333,7 @@ func (tr *tunnelRegistry) RegisterTunnel(client *ClientSession, tunnelID, subdom
 			return fmt.Sprintf("hostname %q already in use", hostname)
 		}
 		routeID := tunnelID + ":host"
-		if ok, _ := tr.registerClusterRoute(client, RouteEntry{RouteID: routeID, ClientID: client.ID, Hostname: hostname}); !ok {
+		if ok, _ := tr.registerClusterRoute(client, RouteEntry{RouteID: routeID, ClientID: client.ID, Hostname: hostname, TeamName: client.TeamName}); !ok {
 			tr.router.UnregisterHostname(hostname)
 			tr.UnregisterTunnel(client, tunnelID, subdomain, "", "")
 			return fmt.Sprintf("hostname %q already claimed cluster-wide", hostname)
@@ -321,7 +346,7 @@ func (tr *tunnelRegistry) RegisterTunnel(client *ClientSession, tunnelID, subdom
 			return fmt.Sprintf("path prefix %q already in use", pathPrefix)
 		}
 		routeID := tunnelID + ":path"
-		if ok, _ := tr.registerClusterRoute(client, RouteEntry{RouteID: routeID, ClientID: client.ID, PathPrefix: pathPrefix}); !ok {
+		if ok, _ := tr.registerClusterRoute(client, RouteEntry{RouteID: routeID, ClientID: client.ID, PathPrefix: pathPrefix, TeamName: client.TeamName}); !ok {
 			tr.router.UnregisterPath(pathPrefix)
 			tr.UnregisterTunnel(client, tunnelID, subdomain, hostname, "")
 			return fmt.Sprintf("path prefix %q already claimed cluster-wide", pathPrefix)
@@ -454,6 +479,19 @@ func (tr *tunnelRegistry) IsLocalNode(nodeID string) bool {
 func (tr *tunnelRegistry) FindPeerBySubdomain(targetSubdomain string, initiator *ClientSession) (peer *ClientSession, tunnelID, reason string) {
 	peer = tr.router.LookupSubdomain(targetSubdomain)
 	if peer == nil {
+		// NH-02: `wormhole connect` P2P signaling only works between two
+		// clients on the *same* node — this node has no ClientSession
+		// (Mux, NAT/address info, ECDH key) for a peer connected
+		// elsewhere, and the cluster state store only knows routing
+		// metadata (NodeID/NodeAddr), not P2P reachability info. Rather
+		// than reporting the misleading "not found" for a target that
+		// actually is connected (just remotely), check the state store
+		// so the initiator's client gets an honest reason and falls
+		// back to relay immediately instead of a confusing dead end.
+		// See docs/architecture.md "High Availability & Multi-tenancy".
+		if route := tr.lookupRemoteBySubdomain(targetSubdomain); route != nil && !tr.IsLocalNode(route.NodeID) {
+			return nil, "", errP2PTargetOnOtherNode
+		}
 		return nil, "", errP2PTargetNotFound
 	}
 	if peer == initiator {
@@ -553,7 +591,10 @@ func (tr *tunnelRegistry) sendHeartbeat() {
 // currently-connected clients own. RegisterRoute's same-key branch is
 // an idempotent TTL refresh, so calling it again on every heartbeat is
 // enough to keep a long-lived connection's routes alive indefinitely
-// without ever needing a dedicated "just bump the TTL" store method.
+// without ever needing a dedicated "just bump the TTL" store method. It's
+// also NH-01's retry mechanism for routes that failed to sync at
+// registration time (see registerClusterRoute) — those keep being retried
+// here, indistinguishable from an ordinary refresh, until they succeed.
 func (tr *tunnelRegistry) refreshClusterRoutes() {
 	if tr.stateStore == nil {
 		return
@@ -568,9 +609,31 @@ func (tr *tunnelRegistry) refreshClusterRoutes() {
 		c.mu.Unlock()
 
 		for _, entry := range entries {
-			if err := tr.stateStore.RegisterRoute(entry); err != nil {
-				log.Warn().Err(err).Str("client", c.ID).Str("route", entry.Key()).
-					Msg("Cluster: failed to refresh route TTL")
+			err := tr.stateStore.RegisterRoute(entry)
+			if err == nil {
+				continue
+			}
+			if errors.Is(err, ErrSubdomainConflict) {
+				// This node believed it owned this route (it's in
+				// clusterRoutes) but the cluster now disagrees — the
+				// route was registered locally during a Redis outage
+				// (NH-01) and another node has since claimed the same
+				// key for real. This node's copy is split-brained:
+				// it will keep serving local traffic for it, but the
+				// rest of the cluster now routes elsewhere. Logged at
+				// Error (not Warn) and counted so it's impossible to
+				// miss, since there's no automatic remediation.
+				log.Error().Err(err).Str("client", c.ID).Str("route", entry.Key()).
+					Msg("Cluster: route conflict detected on refresh — this node's route is no longer cluster-visible (split-brain)")
+				if tr.metrics != nil {
+					tr.metrics.ClusterRouteConflictsTotal.Inc()
+				}
+				continue
+			}
+			log.Warn().Err(err).Str("client", c.ID).Str("route", entry.Key()).
+				Msg("Cluster: failed to refresh route TTL")
+			if tr.metrics != nil {
+				tr.metrics.ClusterRouteSyncFailuresTotal.Inc()
 			}
 		}
 	}

@@ -28,11 +28,18 @@ const (
 // rather than a P2P failure worth falling back from (see
 // Client.handleP2POfferResponse).
 const (
-	errP2PNoTarget         = "no target specified"
-	errP2PTargetNotFound   = "target not found: no client with that subdomain is currently connected"
-	errP2PTargetIsSelf     = "cannot connect to your own tunnel via P2P"
-	errP2PNATIncompatible  = "NAT types not compatible"
-	errP2PTargetTunnelMeta = "target tunnel metadata unavailable"
+	errP2PNoTarget       = "no target specified"
+	errP2PTargetNotFound = "target not found: no client with that subdomain is currently connected"
+	// errP2PTargetOnOtherNode is returned instead of errP2PTargetNotFound
+	// when the target subdomain is connected, but to a different cluster
+	// node: `wormhole connect` P2P signaling is same-node only (NH-02),
+	// since the peer's NAT/address/ECDH info only ever lives in that
+	// node's own in-memory ClientSession. The client treats this the
+	// same as any other P2P rejection reason and falls back to relay.
+	errP2PTargetOnOtherNode = "target is connected to a different cluster node; P2P connect is only supported within the same node — falling back to relay"
+	errP2PTargetIsSelf      = "cannot connect to your own tunnel via P2P"
+	errP2PNATIncompatible   = "NAT types not compatible"
+	errP2PTargetTunnelMeta  = "target tunnel metadata unavailable"
 )
 
 // P2PBroker orchestrates `wormhole connect` P2P signaling between two

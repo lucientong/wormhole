@@ -264,6 +264,23 @@ type Config struct {
 	// non-semver version (e.g. "dev" builds) are never rejected by this
 	// check, since they have no meaningful version to compare.
 	MinClientVersion string
+
+	// ReservedSubdomains is a list of subdomain labels (case-insensitive)
+	// that regular (non-admin) clients may never claim, e.g. so
+	// "admin"/"api"/"www" stay available for the operator's own use
+	// regardless of which team gets there first. auth.RoleAdmin tokens
+	// bypass this list. Ignored entirely when RequireAuth is false
+	// (there's no role to check). See DefaultReservedSubdomains.
+	ReservedSubdomains []string
+}
+
+// DefaultReservedSubdomains is the built-in reserved-word list applied
+// when Config.ReservedSubdomains is left nil (as opposed to explicitly
+// set to an empty, non-nil slice to disable the check). It covers the
+// handful of labels an operator is most likely to want for their own
+// infrastructure rather than handing to whichever team registers first.
+func DefaultReservedSubdomains() []string {
+	return []string{"admin", "api", "www", "status", "metrics", "health"} //nolint:goconst // a word list, not a value duplicated by accident
 }
 
 // DefaultConfig returns the default server configuration.
@@ -297,5 +314,6 @@ func DefaultConfig() Config {
 		AuditEnabled:               false,
 		AuditPersistence:           PersistenceMemory,
 		AuditBufferSize:            10_000,
+		ReservedSubdomains:         DefaultReservedSubdomains(),
 	}
 }

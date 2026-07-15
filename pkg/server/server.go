@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -207,15 +208,16 @@ func NewServer(config Config) *Server {
 		},
 	}
 
-	// TunnelRegistry owns the router, client directory, TCP port
-	// allocator and (if configured) the cluster state store.
-	s.registry = newTunnelRegistry(config)
-
-	// Initialize Prometheus metrics.
+	// Initialize Prometheus metrics first: TunnelRegistry optionally
+	// reports cluster route sync/conflict counters into it (NH-01).
 	if config.EnableMetrics {
 		s.metrics = NewMetrics()
 		log.Info().Msg("Prometheus metrics enabled")
 	}
+
+	// TunnelRegistry owns the router, client directory, TCP port
+	// allocator and (if configured) the cluster state store.
+	s.registry = newTunnelRegistry(config, s.metrics)
 
 	// Initialize audit logger.
 	if config.AuditEnabled {
@@ -832,11 +834,15 @@ func (s *Server) authenticateClient(mux *tunnel.Mux, sessionID string) (*auth.Cl
 	// malformed values rather than letting them reach the router/state
 	// store or logs.
 	subdomain := authReq.Subdomain
-	if subdomain == "" {
+	switch {
+	case subdomain == "":
 		subdomain = generateSubdomain()
-	} else if !isValidSubdomainLabel(subdomain) {
+	case !isValidSubdomainLabel(subdomain):
 		s.sendAuthFailure(stream, "invalid subdomain")
 		return nil, "", fmt.Errorf("invalid subdomain requested: %q", subdomain)
+	case s.isReservedSubdomain(subdomain, claims.Role):
+		s.sendAuthFailure(stream, "subdomain is reserved")
+		return nil, "", fmt.Errorf("reserved subdomain requested: %q", subdomain)
 	}
 
 	// Send success response with the pre-generated session ID and this
@@ -1059,11 +1065,19 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 	// the connection-level subdomain assigned at auth time (legacy
 	// single-tunnel behavior).
 	subdomain := req.Subdomain
-	if subdomain == "" {
+	switch {
+	case subdomain == "":
 		subdomain = client.Subdomain
-	} else if !isValidSubdomainLabel(subdomain) {
+	case !isValidSubdomainLabel(subdomain):
 		log.Warn().Str("client", client.ID).Msg("Tunnel registration rejected: invalid subdomain")
 		resp := proto.NewRegisterResponse(false, "invalid subdomain", "", "", 0)
+		if data, encErr := resp.Encode(); encErr == nil {
+			_, _ = stream.Write(data)
+		}
+		return
+	case s.isReservedSubdomain(subdomain, client.Role):
+		log.Warn().Str("client", client.ID).Str("subdomain", subdomain).Msg("Tunnel registration rejected: reserved subdomain")
+		resp := proto.NewRegisterResponse(false, "subdomain is reserved", "", "", 0)
 		if data, encErr := resp.Encode(); encErr == nil {
 			_, _ = stream.Write(data)
 		}
@@ -1500,6 +1514,24 @@ func isValidSubdomainLabel(s string) bool {
 		}
 	}
 	return true
+}
+
+// isReservedSubdomain reports whether subdomain is blocked for role by
+// Config.ReservedSubdomains (NS-04) — e.g. "admin"/"api"/"www" staying
+// available for the operator's own use regardless of which team's client
+// registers first. Only enforced when RequireAuth is on (role is
+// otherwise always "" and meaningless); auth.RoleAdmin always bypasses
+// it, matching the "admin 保留字" carve-out.
+func (s *Server) isReservedSubdomain(subdomain string, role auth.Role) bool {
+	if !s.config.RequireAuth || role == auth.RoleAdmin {
+		return false
+	}
+	for _, reserved := range s.config.ReservedSubdomains {
+		if strings.EqualFold(reserved, subdomain) {
+			return true
+		}
+	}
+	return false
 }
 
 // extractIP extracts the IP address from a remote address string.

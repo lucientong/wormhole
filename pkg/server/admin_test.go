@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1260,6 +1261,51 @@ func TestAdminAPI_RefreshToken_InvalidDuration(t *testing.T) {
 	assert.Equal(t, "invalid extend_by duration", resp.Error)
 }
 
+// TestAdminAPI_RefreshToken_EmitsAuditEvent verifies NA-02: refreshing a
+// token via the admin API (in any of its three modes) now leaves an
+// audit trail, where previously it left none at all.
+func TestAdminAPI_RefreshToken_EmitsAuditEvent(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     string
+		wantMode string
+	}{
+		{"simple refresh", `{"token":"%s"}`, "refresh"},
+		{"revoke old", `{"token":"%s","revoke_old":true}`, "refresh_and_revoke"},
+		{"extend expiry", `{"token":"%s","extend_by":"1h"}`, "extend"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := newTestServerWithAuth(t)
+			server.auditLogger = auth.NewAuditLogger(auth.AuditLoggerConfig{
+				Enabled: true,
+				Writer:  io.Discard,
+				Store:   auth.NewMemoryAuditStore(100),
+			})
+
+			token, err := server.authenticator.GenerateTeamToken("team1", auth.RoleMember)
+			require.NoError(t, err)
+
+			api := NewAdminAPI(server)
+			handler := api.Handler()
+
+			body := bytes.NewBufferString(fmt.Sprintf(tt.body, token))
+			req := loopbackRequest(http.MethodPost, "/tokens/refresh", body)
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			require.Equal(t, http.StatusOK, rec.Code)
+
+			events, err := server.auditLogger.Store().Query(auth.AuditQuery{Type: auth.EventTokenRefreshed})
+			require.NoError(t, err)
+			require.Len(t, events, 1, "token refresh must be audited")
+			assert.Equal(t, "team1", events[0].TeamName)
+			assert.Equal(t, tt.wantMode, events[0].Details["mode"])
+		})
+	}
+}
+
 func TestAdminAPI_RevokeTeamTokens(t *testing.T) {
 	server := newTestServerWithAuth(t)
 
@@ -1569,4 +1615,74 @@ func TestAdminAPI_LoopbackProtection_WithToken(t *testing.T) {
 			assert.Equal(t, tt.wantStatus, rec.Code)
 		})
 	}
+}
+
+// newTestServerWithAuditEvents builds a server with n stored audit events
+// (all EventClientConnected, for a trivially matchable type filter) and
+// its own AdminAPI handler, for the NA-03 limit tests below.
+func newTestServerWithAuditEvents(t *testing.T, n int) http.Handler {
+	t.Helper()
+	server := newTestServer()
+	server.auditLogger = auth.NewAuditLogger(auth.AuditLoggerConfig{
+		Enabled: true,
+		Writer:  io.Discard,
+		Store:   auth.NewMemoryAuditStore(n + 100),
+	})
+	for i := 0; i < n; i++ {
+		server.auditLogger.LogClientConnected("10.0.0.1", fmt.Sprintf("sess-%d", i), "sub", "team1", auth.RoleMember)
+	}
+	api := NewAdminAPI(server)
+	return api.Handler()
+}
+
+// TestAdminAPI_Audit_LimitCappedAtListMax verifies /audit keeps its
+// conservative interactive-listing cap (auditListMaxLimit): an explicit
+// `?limit=` above it is still clamped down, unlike /audit/export.
+func TestAdminAPI_Audit_LimitCappedAtListMax(t *testing.T) {
+	handler := newTestServerWithAuditEvents(t, auditListMaxLimit+500)
+
+	req := loopbackRequest(http.MethodGet, fmt.Sprintf("/audit?limit=%d", auditListMaxLimit+500), nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var events []auth.AuditEvent
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &events))
+	assert.Len(t, events, auditListMaxLimit)
+}
+
+// TestAdminAPI_AuditExport_LimitAboveListMax verifies NA-03's fix:
+// /audit/export honors an explicit `?limit=` above auditListMaxLimit
+// (previously parseAuditQuery's single hardcoded 1000 cap silently
+// truncated it down to /audit's own limit, contradicting the "export
+// endpoints default to a higher limit" intent).
+func TestAdminAPI_AuditExport_LimitAboveListMax(t *testing.T) {
+	wantLimit := auditListMaxLimit + 500
+	handler := newTestServerWithAuditEvents(t, wantLimit+500)
+
+	req := loopbackRequest(http.MethodGet, fmt.Sprintf("/audit/export?limit=%d", wantLimit), nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var events []auth.AuditEvent
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &events))
+	assert.Len(t, events, wantLimit, "export limit above the list-view cap must not be truncated")
+}
+
+// TestAdminAPI_AuditExport_DefaultLimit verifies /audit/export's default
+// (no `?limit=` at all) is auditExportDefaultLimit, higher than /audit's
+// own default — bulk export shouldn't require callers to guess a limit
+// just to get more than a handful of events back.
+func TestAdminAPI_AuditExport_DefaultLimit(t *testing.T) {
+	handler := newTestServerWithAuditEvents(t, auditExportDefaultLimit+500)
+
+	req := loopbackRequest(http.MethodGet, "/audit/export", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var events []auth.AuditEvent
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &events))
+	assert.Len(t, events, auditExportDefaultLimit)
 }

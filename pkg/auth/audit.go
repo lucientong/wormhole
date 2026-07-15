@@ -25,6 +25,9 @@ const (
 	EventTokenGenerated AuditEventType = "token_generated"
 	// EventTokenRevoked indicates a token was revoked.
 	EventTokenRevoked AuditEventType = "token_revoked"
+	// EventTokenRefreshed indicates a token was refreshed/extended via
+	// the admin API (RefreshToken/RefreshAndRevokeToken/ExtendTokenExpiry).
+	EventTokenRefreshed AuditEventType = "token_refreshed"
 	// EventTeamTokensRevoked indicates all tokens for a team were revoked.
 	EventTeamTokensRevoked AuditEventType = "team_tokens_revoked" // #nosec G101 -- audit event type name, not a credential
 	// EventClientConnected indicates a client connected.
@@ -225,6 +228,20 @@ func (l *AuditLogger) LogTokenRevoked(tokenID, teamName string) {
 		TeamName: teamName,
 		Details: map[string]interface{}{
 			"token_id": tokenID,
+		},
+	})
+}
+
+// LogTokenRefreshed logs a token refresh/extension event issued via the
+// admin API. mode is one of "refresh", "refresh_and_revoke" or "extend",
+// distinguishing which admin-API operation performed the refresh.
+func (l *AuditLogger) LogTokenRefreshed(teamName string, role Role, mode string) {
+	l.Log(AuditEvent{
+		Type:     EventTokenRefreshed,
+		TeamName: teamName,
+		Role:     string(role),
+		Details: map[string]interface{}{
+			"mode": mode,
 		},
 	})
 }

@@ -4,6 +4,10 @@
 
 **[English](CHANGELOG.md)**
 
+## v0.6.12
+
+HA 正确性与多租户：向集群状态存储注册路由时，若失败原因不是真正的冲突（例如 Redis 短暂不可用），该路由不再被静默丢弃——而是保留下来，在此后的每次心跳中持续重试直至成功，修复了此前 Redis 抖动后客户端可能永久对集群其它节点不可见的缺口（自愈机制同时配有 `wormhole_cluster_route_sync_failures_total`/`wormhole_cluster_route_conflicts_total` 两个指标用于可观测性，后者专门标记"重试后的注册其实撞上了真实冲突"这一更罕见的场景）。Redis 路由注册现在是单条原子 Lua 脚本，取代了此前 `SETNX` 再 `SET` 的两步操作，消除了并发查询或注册过程中崩溃时可能出现的"路由已保留但尚不可解析"的窗口。回收因会话异常退出（未走正常断连流程）而遗留的 subdomain/hostname/path 时，现在还要求回收方与原持有者属于同一个 team（或双方任一方没有 team），避免另一个 team 在原持有者重连的窗口期内抢先占用其路由。新增 `--reserved-subdomains`（默认含 `admin`/`api`/`www`/`status`/`metrics`/`health`），防止运营方自用的子域名被抢先注册的 team 占用；admin 角色 token 不受此限制。`wormhole connect` 的 P2P 信令若发现目标连接在*另一个*集群节点上，现在会返回明确的"目标在其他节点，回退至 relay"提示，而不是容易误导的"未找到"（真正的跨节点 P2P 信令仍不支持——对端的 NAT/地址/密钥信息只存在于其所在节点自己的内存中）。通过 Admin API 刷新/延长 token 现在会写入审计事件（`token_refreshed`）；`/audit/export` 的 `limit` 参数不再被 `/audit` 自身面向交互式分页的 1000 条上限静默截断，现在支持批量导出，上限提升至 100000 条（默认 10000）。
+
 ## v0.6.11
 
 数据面韧性加固：P2P 会话建立时会先关闭旧的连接/UDP socket/accept 循环再安装新会话，并防止并发打洞尝试互相竞争——此前重试或竞态的 offer 可能留下孤儿会话继续运行，造成资源泄漏。P2P 加密层新增滑动窗口反重放校验（在解密前拒绝重复或过旧的包，窗口内的乱序包仍会被接受）——此前仅靠 GCM tag 校验无法防御无连接传输上的重放攻击。TCP mux 现在将控制帧（`WINDOW_UPDATE`/`PING`/`PONG`/`HANDSHAKE`）放入独立通道并优先于批量 `DATA` 帧发送，双向打满的连接不会再因数据积压而饿死本应解除阻塞的心跳/流控消息（`CLOSE` 帧仍与 `DATA` 共用队列，保证它永远不会抢在该流自己尚未发出的数据前被投递）。客户端（relay 与 P2P 两条路径）与服务端控制面现在都对并发入站 stream 数设置了可配置上限，防止突发的 stream 开启耗尽 goroutine。此外：删除了从未被读取的死配置项 `EnableFlowControl`；客户端本地拨号失败时不再向对端当作纯 HTTP/TCP 字节流处理的 stream 里写入裸 protobuf 响应；客户端应用层心跳现在会校验回显的 ping ID，而不是把任何读到的响应都当作成功。

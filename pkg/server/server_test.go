@@ -327,6 +327,45 @@ func TestServer_FindPeerBySubdomain_MissingTunnelMetadata(t *testing.T) {
 	assert.Equal(t, errP2PTargetTunnelMeta, reason)
 }
 
+// TestServer_FindPeerBySubdomain_OnOtherNode verifies NH-02: when the
+// target subdomain has no local ClientSession but the cluster state store
+// shows it's owned by a *different* node, FindPeerBySubdomain returns the
+// honest errP2PTargetOnOtherNode reason (P2P is same-node only) instead of
+// the misleading "not found" — the target is connected, just not here.
+func TestServer_FindPeerBySubdomain_OnOtherNode(t *testing.T) {
+	s := newClusterTestServer("node-a", "node-a:7000", NewMemoryStateStore())
+
+	require.NoError(t, s.registry.stateStore.RegisterRoute(RouteEntry{
+		ClientID: "remote-client", Subdomain: "myapp", NodeID: "node-b",
+	}))
+
+	initiator := &ClientSession{ID: "client-1"}
+	peer, tunnelID, reason := s.registry.FindPeerBySubdomain("myapp", initiator)
+	assert.Nil(t, peer)
+	assert.Empty(t, tunnelID)
+	assert.Equal(t, errP2PTargetOnOtherNode, reason)
+}
+
+// TestServer_FindPeerBySubdomain_OnOtherNode_ButLocalWins verifies that a
+// route entry for this exact node (e.g. this node's own registration
+// visible via the state store) never triggers errP2PTargetOnOtherNode —
+// only IsLocalNode(route.NodeID) == false should. A genuinely local
+// client that just isn't in the router yet still correctly falls through
+// to errP2PTargetNotFound.
+func TestServer_FindPeerBySubdomain_LocalNodeRouteStaysNotFound(t *testing.T) {
+	s := newClusterTestServer("node-a", "node-a:7000", NewMemoryStateStore())
+
+	require.NoError(t, s.registry.stateStore.RegisterRoute(RouteEntry{
+		ClientID: "some-client", Subdomain: "myapp", NodeID: "node-a",
+	}))
+
+	initiator := &ClientSession{ID: "client-1"}
+	peer, tunnelID, reason := s.registry.FindPeerBySubdomain("myapp", initiator)
+	assert.Nil(t, peer)
+	assert.Empty(t, tunnelID)
+	assert.Equal(t, errP2PTargetNotFound, reason)
+}
+
 func TestServer_GetStats(t *testing.T) {
 	cfg := DefaultConfig()
 	s := NewServer(cfg)
@@ -4030,4 +4069,118 @@ func TestIsValidSubdomainLabel(t *testing.T) {
 			assert.Equal(t, tt.want, isValidSubdomainLabel(tt.input))
 		})
 	}
+}
+
+// TestServer_IsReservedSubdomain covers NS-04's reserved-word mechanism:
+// regular roles are blocked from claiming a reserved subdomain,
+// auth.RoleAdmin always bypasses it, and the whole check is a no-op when
+// RequireAuth is off (role is meaningless then).
+func TestServer_IsReservedSubdomain(t *testing.T) {
+	const reserved = "internal-ops"
+
+	cfg := DefaultConfig()
+	cfg.RequireAuth = true
+	cfg.ReservedSubdomains = []string{reserved, "billing"}
+	s := NewServer(cfg)
+
+	assert.True(t, s.isReservedSubdomain(reserved, auth.RoleMember), "reserved word must block a regular member")
+	assert.True(t, s.isReservedSubdomain("BILLING", auth.RoleMember), "reserved-word check must be case-insensitive")
+	assert.False(t, s.isReservedSubdomain("myapp", auth.RoleMember), "non-reserved subdomains are unaffected")
+	assert.False(t, s.isReservedSubdomain(reserved, auth.RoleAdmin), "auth.RoleAdmin must bypass the reserved list")
+
+	cfgNoAuth := DefaultConfig()
+	cfgNoAuth.ReservedSubdomains = []string{reserved}
+	sNoAuth := NewServer(cfgNoAuth)
+	assert.False(t, sNoAuth.isReservedSubdomain(reserved, ""), "the check is a no-op when RequireAuth is off")
+}
+
+// TestServer_HandleRegister_RejectsReservedSubdomain verifies the
+// reserved-subdomain check is actually wired into tunnel registration
+// (handleRegister), not just the standalone helper: a RoleMember client
+// requesting a reserved subdomain gets an explicit rejection, and no
+// tunnel is added.
+func TestServer_HandleRegister_RejectsReservedSubdomain(t *testing.T) {
+	const reserved = "internal-ops"
+
+	cfg := DefaultConfig()
+	cfg.MuxConfig.KeepAliveInterval = 0
+	cfg.RequireAuth = true
+	cfg.ReservedSubdomains = []string{reserved}
+	s := NewServer(cfg)
+
+	clientMux, serverMux := newMuxPair(t)
+
+	client := &ClientSession{
+		ID: "member-client", Subdomain: "member-sub", Mux: serverMux, Role: auth.RoleMember,
+		CreatedAt: time.Now(), LastSeen: time.Now(),
+	}
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
+
+	errCh := make(chan error, 1)
+	go func() {
+		stream, openErr := clientMux.OpenStream()
+		if openErr != nil {
+			errCh <- openErr
+			return
+		}
+		defer stream.Close()
+
+		req := proto.NewRegisterRequest(8080, proto.ProtocolHTTP, reserved, "", "")
+		data, encErr := req.Encode()
+		if encErr != nil {
+			errCh <- encErr
+			return
+		}
+		if _, writeErr := stream.Write(data); writeErr != nil {
+			errCh <- writeErr
+			return
+		}
+
+		buf := make([]byte, 4096)
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			errCh <- readErr
+			return
+		}
+
+		msg, decErr := proto.DecodeControlMessage(buf[:n])
+		if decErr != nil {
+			errCh <- decErr
+			return
+		}
+		if msg.RegisterResponse == nil {
+			errCh <- errors.New("expected register response")
+			return
+		}
+		if msg.RegisterResponse.Success {
+			errCh <- errors.New("expected registration of a reserved subdomain to be rejected")
+			return
+		}
+		if msg.RegisterResponse.Error != "subdomain is reserved" {
+			errCh <- fmt.Errorf("unexpected rejection reason: %q", msg.RegisterResponse.Error)
+			return
+		}
+		errCh <- nil
+	}()
+
+	stream, err := serverMux.AcceptStream()
+	require.NoError(t, err)
+	defer stream.Close()
+
+	buf := make([]byte, 4096)
+	n, err := stream.Read(buf)
+	require.NoError(t, err)
+
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	require.NoError(t, err)
+	require.NotNil(t, msg.RegisterRequest)
+
+	s.handleRegister(client, stream, msg.RegisterRequest)
+	require.NoError(t, <-errCh)
+
+	client.mu.Lock()
+	assert.Empty(t, client.Tunnels)
+	client.mu.Unlock()
 }

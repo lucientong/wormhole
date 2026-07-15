@@ -38,6 +38,21 @@ type Metrics struct {
 	// TunnelDurationSeconds is the histogram of tunnel lifetimes in seconds.
 	TunnelDurationSeconds prometheus.Histogram
 
+	// ClusterRouteSyncFailuresTotal counts state-store RegisterRoute
+	// calls (initial registration or heartbeat refresh) that failed for
+	// a reason other than a genuine conflict — e.g. Redis unreachable.
+	// These self-heal on a later heartbeat (NH-01) but a sustained
+	// non-zero rate indicates the cluster state store is degraded.
+	ClusterRouteSyncFailuresTotal prometheus.Counter
+
+	// ClusterRouteConflictsTotal counts routes this node believed it
+	// owned (present in a client's clusterRoutes) that a later
+	// refresh discovered are now claimed by a different route entry —
+	// i.e. a split-brain window opened by a transient state-store
+	// outage has been detected. There is no automatic remediation;
+	// operators should alert on this being non-zero.
+	ClusterRouteConflictsTotal prometheus.Counter
+
 	registry *prometheus.Registry
 }
 
@@ -98,6 +113,16 @@ func NewMetrics() *Metrics {
 			Help:      "Histogram of tunnel lifetimes in seconds.",
 			Buckets:   []float64{1, 5, 15, 30, 60, 120, 300, 600, 1800, 3600, 7200, 86400},
 		}),
+		ClusterRouteSyncFailuresTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "cluster_route_sync_failures_total",
+			Help:      "Total state-store route registrations/refreshes that failed for a reason other than a genuine conflict (e.g. Redis unreachable). Self-heals on a later heartbeat.",
+		}),
+		ClusterRouteConflictsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "cluster_route_conflicts_total",
+			Help:      "Total routes this node believed it owned that a later refresh found claimed by a different node — a split-brain window detected with no automatic remediation.",
+		}),
 		registry: reg,
 	}
 
@@ -112,6 +137,8 @@ func NewMetrics() *Metrics {
 		m.AuthAttemptsTotal,
 		m.P2PConnectionsTotal,
 		m.TunnelDurationSeconds,
+		m.ClusterRouteSyncFailuresTotal,
+		m.ClusterRouteConflictsTotal,
 	)
 
 	return m

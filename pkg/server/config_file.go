@@ -70,6 +70,11 @@ type FileConfig struct {
 
 	MinClientVersion string `yaml:"min_client_version"`
 
+	// ReservedSubdomains overrides Config.ReservedSubdomains. A present
+	// but empty list (`reserved_subdomains: []`) disables the check;
+	// omitting the key entirely keeps DefaultConfig's built-in list.
+	ReservedSubdomains *[]string `yaml:"reserved_subdomains"`
+
 	RateLimit struct {
 		Enabled       bool   `yaml:"enabled"`
 		MaxFailures   int    `yaml:"max_failures"`
@@ -250,6 +255,9 @@ func (fc *FileConfig) applyLimitsAndAuth(cfg *Config) {
 	overrideString(&cfg.AuthSecret, fc.AuthSecret)
 	overrideString(&cfg.AdminToken, fc.AdminToken)
 	overrideString(&cfg.MinClientVersion, fc.MinClientVersion)
+	if fc.ReservedSubdomains != nil {
+		cfg.ReservedSubdomains = *fc.ReservedSubdomains
+	}
 }
 
 func (fc *FileConfig) applyRateLimitAndPersistence(cfg *Config) {
