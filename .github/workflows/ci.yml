@@ -77,7 +77,7 @@ jobs:
           files: coverage.out
           fail_ci_if_error: false
 
-      # NT-08: short, time-budgeted fuzz runs for the two parsers that sit
+      # Short, time-budgeted fuzz runs for the two parsers that sit
       # directly on attacker-controlled wire bytes (frame header and
       # control-message decoding). This isn't meant to replace the seed
       # corpus (already covered by the `go test` run above via `f.Add`),

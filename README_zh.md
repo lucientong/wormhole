@@ -290,10 +290,14 @@ wormhole server -c server.yml
 | `--admin-port` | 管理 API 端口 | `7001` |
 | `--admin-host` | 管理 API 绑定地址（安全：默认仅监听本地） | `127.0.0.1` |
 | `--domain` | 隧道 URL 域名（环境变量：`WORMHOLE_DOMAIN`） | `localhost` |
+| `--max-clients` | 最大并发连接客户端数；超出后新连接在鉴权之前即被拒绝（0 = 不限制） | `1000` |
+| `--max-tunnels-per-client` | 单个客户端最多可注册的隧道数（0 = 不限制） | `0` |
 | `--max-concurrent-streams` | 所有客户端合计的最大并发数据流数；超出上限会拒绝新流而非排队等待（0 = 不限制） | `10000` |
 | `--max-streams-per-client` | 单个客户端的最大并发数据流数，独立于上面的全局上限（0 = 不限制） | `500` |
 | `--max-control-streams-per-client` | 单个客户端自身连接上的最大并发控制面流数（register/ping/stats/close/P2P-offer），保护控制面自身不被耗尽 goroutine（0 = 不限制） | `128` |
+| `--shutdown-timeout` | 优雅关闭时，等待进行中的 HTTP/管理请求完成的时长，超时后强制关闭 | `15s` |
 | `--min-client-version` | 拒绝声明版本低于此值的 client，例如 `0.6.0`；版本号不是标准 semver 的 client（如 dev 构建）永远不会被拒绝 | （禁用） |
+| `--reserved-subdomains` | 仅 `admin` 角色 token 可占用的子域名（需配合 `--require-auth`）；传空字符串可关闭该限制 | `admin,api,www,status,metrics,health` |
 | `--tls` | 启用 TLS（设置域名时自动申请证书） | false |
 | `--tunnel-tls` | 隧道控制链路 TLS（默认跟随 `--tls`；**当 `--require-auth` 且配置了真实 `--domain` 时也默认开启**，见 [安全](#安全)） | 见说明 |
 | `--cert` | TLS 证书文件路径 | 无 |

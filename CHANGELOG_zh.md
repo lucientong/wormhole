@@ -4,6 +4,14 @@
 
 **[English](CHANGELOG.md)**
 
+## v0.7.0
+
+文档与学习性：README 的 Quick Start 现在提供一份可直接照抄的三终端本地闭环流程（server → 本地服务 → client → `curl` 验证），全程在 `localhost` 上完成，无需域名也无需部署；同时补上了 `wormhole nat-check` 的专门用法说明。`docs/architecture.md` 新增"调试与运维手册"章节——日志级别调节、Admin API 导览、值得配置告警的 Prometheus 指标，以及常见故障特征及排查方向的对照表；其"测试策略"章节也同步更新，反映了 v0.6.13 新增的全链路端到端 / P2P 信令端到端 / fuzz 测试层次。`pkg/auth`、`pkg/client`、`pkg/server` 三个包都新增（`pkg/auth` 是大幅扩充）了包级 `doc.go`，覆盖各自的组合结构、请求生命周期与关键扩展点，现在对这三个包跑 `go doc` 能看到真正有用的总览，而不是一行占位说明。新增 `CONTRIBUTING.md`，为外部贡献者说明开发流程、代码风格与测试约定。此外：过去几个版本代码注释里散落的内部评审编号简写（如 `NS-04`、`NDP-06`）已全部扫描清理，改写为不依赖编号的自然语言描述——纯注释改动，无行为变化。
+
+## v0.6.13
+
+测试体系加固：新增全链路端到端测试，用真实 TCP 连接起一对真实的 server + client（鉴权、隧道注册、HTTP 代理、优雅关闭全流程），不再只靠组件级测试来兜底两者接线上的回归。配套新增 `wormhole connect` 集成测试，启动两个真实 client 对接一个真实 server，走完整的 P2P offer/answer 信令链路，断言的是（在当前沙箱化 CI 环境下会回退到 relay 的）最终结果和 `wormhole_p2p_connections_total` 指标，而不是内部状态。为两个直接解析攻击者可控字节流的解码器——隧道帧头与控制消息 envelope——新增 fuzz target，用已有的畸形输入回归用例做种子，现在每次 CI push 都会额外跑一小段限定时长的 fuzz（在 `go test` 本身覆盖种子语料库之外），持续寻找新的崩溃输入。`wormhole tunnels create/delete/list` 与 client 的 SIGHUP 配置热重载路径（此前只能手动验证）现在都有了直接的单元测试覆盖；热重载逻辑顺势从信号处理函数里拆成了独立、可测试的 `reloadClientConfig` 函数。
+
 ## v0.6.12
 
 HA 正确性与多租户：向集群状态存储注册路由时，若失败原因不是真正的冲突（例如 Redis 短暂不可用），该路由不再被静默丢弃——而是保留下来，在此后的每次心跳中持续重试直至成功，修复了此前 Redis 抖动后客户端可能永久对集群其它节点不可见的缺口（自愈机制同时配有 `wormhole_cluster_route_sync_failures_total`/`wormhole_cluster_route_conflicts_total` 两个指标用于可观测性，后者专门标记"重试后的注册其实撞上了真实冲突"这一更罕见的场景）。Redis 路由注册现在是单条原子 Lua 脚本，取代了此前 `SETNX` 再 `SET` 的两步操作，消除了并发查询或注册过程中崩溃时可能出现的"路由已保留但尚不可解析"的窗口。回收因会话异常退出（未走正常断连流程）而遗留的 subdomain/hostname/path 时，现在还要求回收方与原持有者属于同一个 team（或双方任一方没有 team），避免另一个 team 在原持有者重连的窗口期内抢先占用其路由。新增 `--reserved-subdomains`（默认含 `admin`/`api`/`www`/`status`/`metrics`/`health`），防止运营方自用的子域名被抢先注册的 team 占用；admin 角色 token 不受此限制。`wormhole connect` 的 P2P 信令若发现目标连接在*另一个*集群节点上，现在会返回明确的"目标在其他节点，回退至 relay"提示，而不是容易误导的"未找到"（真正的跨节点 P2P 信令仍不支持——对端的 NAT/地址/密钥信息只存在于其所在节点自己的内存中）。通过 Admin API 刷新/延长 token 现在会写入审计事件（`token_refreshed`）；`/audit/export` 的 `limit` 参数不再被 `/audit` 自身面向交互式分页的 1000 条上限静默截断，现在支持批量导出，上限提升至 100000 条（默认 10000）。
