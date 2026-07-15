@@ -68,6 +68,35 @@ git clone https://github.com/lucientong/wormhole.git
 cd wormhole && make build
 ```
 
+### 三步本地闭环体验（无需域名，无需部署）
+
+下面的操作全部在 `localhost` 上完成——不需要租服务器，也不需要配置 DNS。打开三个终端：
+
+```bash
+# 终端 1 —— 启动 server。--domain localhost 是默认值；用 --port 17000/
+# --http-port 8081 避开 7000（部分 Mac 上被 AirPlay Receiver 占用）和
+# 需要 root 权限的 80。
+wormhole server --port 17000 --http-port 8081
+
+# 终端 2 —— 启动任意一个本地服务用于暴露，这里用 Python 自带的文件服务器
+# 举例（换成你实际在开发的服务即可）。
+python3 -m http.server 9000
+
+# 终端 3 —— 启动 client，注意它打印出来的 "Forwarding" 那一行，例如
+# "Forwarding: http://a1b2c3d4e5f6.localhost -> http://127.0.0.1:9000"
+wormhole client --server localhost:17000 --local 9000
+```
+
+然后在任意终端用 curl 验证整条链路（把子域名换成 client 实际打印出来的那个——
+macOS/Linux 上 `*.localhost` 默认就能解析到 `127.0.0.1`）：
+
+```bash
+curl http://a1b2c3d4e5f6.localhost:8081/
+```
+
+返回 200 就说明流量刚才走了一圈 `curl → wormhole server → wormhole client → python3 http.server`
+再原路返回。把第 2 步换成你自己的应用（`--local <你的端口>`），就是在暴露它了。
+
 ### 使用
 
 ```bash
@@ -88,6 +117,9 @@ wormhole client --local 8080 --inspector 4040
 
 # 禁用 P2P 模式（仅使用中继）
 wormhole client --local 8080 --p2p=false
+
+# 在依赖 P2P 之前先诊断你的 NAT 类型（不需要连 server）
+wormhole nat-check
 
 # client 间直连（完全绕过中继）：peer A 正常暴露服务，peer B 通过对方的
 # 子域名直接打洞连过去，全程走加密 UDP 通道——server 只做信令，不转发流量
@@ -628,6 +660,13 @@ wormhole client --local 8080 --p2p=false
 wormhole connect <对方子域名> --local 9090
 ```
 
+**诊断 NAT 兼容性**：`wormhole nat-check` 独立运行 STUN 探测（不需要连 Wormhole server），打印你的 NAT 类型、是否可穿透，以及常见网络环境的速查表（家庭宽带、运营商级 NAT、企业网络、云 VPS 等）。当 `wormhole connect` 总是降级到中继时，先跑一下这个命令排查——只要有一端是 `Symmetric`，答案就在这里：
+
+```bash
+wormhole nat-check
+wormhole nat-check --timeout 15   # 网络较慢时，给 STUN 多留点时间
+```
+
 #### 流量检查器
 
 流量检查器会捕获并展示 HTTP 请求/响应数据。在生产环境中：
@@ -657,7 +696,7 @@ Admin API 默认绑定 `127.0.0.1`。如需远程访问，使用 `--admin-host 0
 
 ## 贡献
 
-欢迎贡献！
+欢迎贡献！开发流程、测试规范以及如何提交 PR，见 [CONTRIBUTING.md](CONTRIBUTING.md)（英文）。
 
 ## 许可证
 

@@ -243,7 +243,7 @@ func TestSessionCipher_EncryptInto_DoesNotCorruptCallerPrefix(t *testing.T) {
 // TestSessionCipher_Decrypt_RejectsExactReplay verifies that decrypting
 // the exact same ciphertext twice — an attacker capturing and replaying a
 // packet verbatim — succeeds the first time and is rejected the second
-// (NDP-02 anti-replay window).
+// by the anti-replay window.
 func TestSessionCipher_Decrypt_RejectsExactReplay(t *testing.T) {
 	kpA, _ := GenerateKeyPair()
 	kpB, _ := GenerateKeyPair()
@@ -830,7 +830,7 @@ func BenchmarkDecrypt(b *testing.B) {
 		plaintext := make([]byte, s.size)
 
 		b.Run(s.name, func(b *testing.B) {
-			// The anti-replay window (NDP-02) rejects a nonce counter it's
+			// The anti-replay window rejects a nonce counter it's
 			// already seen, so decrypting one fixed ciphertext b.N times
 			// would only measure the window's fast-reject path after the
 			// first iteration. Pre-encrypt one distinct ciphertext per

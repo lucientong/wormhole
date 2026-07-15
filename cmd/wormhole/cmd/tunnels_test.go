@@ -1,9 +1,9 @@
 package cmd
 
-// NT-04: `wormhole tunnels create/delete/list` had zero coverage — these
-// exercise the success path of each against a real httptest control
-// server (the same one *client.Client.StartControlServer exposes), the
-// way a real running client would answer them. The log.Fatal error
+// Tests here exercise the success path of `wormhole tunnels create/
+// delete/list` against a real httptest control server (the same one
+// *client.Client.StartControlServer exposes), the way a real running
+// client would answer them. The log.Fatal error
 // paths (control server unreachable, non-2xx status) are deliberately
 // left untested here: they call os.Exit via zerolog, which would abort
 // the test binary — not something worth restructuring runtime code to

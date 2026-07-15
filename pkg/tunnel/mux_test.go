@@ -1040,7 +1040,7 @@ func TestMux_SendWindowUpdate_ClosedMux(t *testing.T) {
 	_ = serverMux.Close()
 }
 
-// --- NDP-03: control/data frame queue separation ---
+// --- Control/data frame queue separation ---
 //
 // handlePing calls sendPong synchronously from within recvLoop. Before
 // control frames got their own queue, a sendCh backlogged with bulk DATA
@@ -1112,7 +1112,7 @@ func TestMux_SendPing_NotBlockedByFullSendCh(t *testing.T) {
 // and every byte still arrives. This is the end-to-end counterpart to
 // the unit tests above: it doesn't pin down the exact internal race, but
 // it's the shape of traffic that used to be able to starve control
-// frames before NDP-03 split the send queues.
+// frames before the send queues were split.
 func TestMux_Stress_BidirectionalSaturationDoesNotStallKeepAlive(t *testing.T) {
 	clientConn, serverConn := testConn()
 

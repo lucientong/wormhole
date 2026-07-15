@@ -804,8 +804,8 @@ func TestClient_SendPing_Success(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestClient_SendPing_RejectsMismatchedPingID verifies NDP-09: sendPing
-// must validate the echoed PingID rather than treating any successfully
+// TestClient_SendPing_RejectsMismatchedPingID verifies that sendPing
+// validates the echoed PingID rather than treating any successfully
 // read response as confirmation of this specific ping.
 func TestClient_SendPing_RejectsMismatchedPingID(t *testing.T) {
 	cfg := DefaultConfig()
@@ -1720,9 +1720,9 @@ func TestClient_ForwardToLocal_InspectorDisabled(t *testing.T) {
 
 	// Should use raw TCP path (dialAndProxy). Since nothing is listening,
 	// the dial fails immediately and dialAndProxy returns without writing
-	// anything to the stream — see NDP-08: no consumer on the other end
-	// decodes a StreamResponse from this path, so writing one would just
-	// leak protobuf bytes onto a wire the peer treats as raw HTTP/TCP data.
+	// anything to the stream: no consumer on the other end decodes a
+	// StreamResponse from this path, so writing one would just leak
+	// protobuf bytes onto a wire the peer treats as raw HTTP/TCP data.
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):
@@ -2070,9 +2070,9 @@ func TestClient_ForwardToLocal_TCPProtocol(t *testing.T) {
 	}()
 
 	// Raw TCP path: since no local service is listening, dialAndProxy
-	// returns without writing anything to the stream (see NDP-08 — the
-	// public side just proxies raw bytes, so writing an encoded
-	// StreamResponse here would leak protocol framing onto its socket).
+	// returns without writing anything to the stream — the public side
+	// just proxies raw bytes, so writing an encoded StreamResponse here
+	// would leak protocol framing onto its socket.
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):

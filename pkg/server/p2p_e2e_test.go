@@ -1,7 +1,7 @@
 package server
 
-// NT-06: an integration test for the `wormhole connect` P2P signaling
-// chain end to end — Client.MaybeSendOffer -> Server's
+// An integration test for the `wormhole connect` P2P signaling chain end
+// to end — Client.MaybeSendOffer -> Server's
 // P2PBroker.HandleOffer -> Server's notifyPeer -> the peer Client's
 // HandleNotification -> both sides attempt hole punching and report the
 // outcome back via P2PResult. Every other P2P-related test either drives
@@ -30,8 +30,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestP2P_ConnectSignalingChain_EstablishesDirectConnection is NT-06: it
-// starts a real Server plus two real Clients — B merely exposes a tunnel
+// TestP2P_ConnectSignalingChain_EstablishesDirectConnection starts a real
+// Server plus two real Clients — B merely exposes a tunnel
 // (P2P enabled), A runs in `wormhole connect` mode targeting B's
 // subdomain — and drives the full signaling chain end to end: A's
 // MaybeSendOffer reaches the server, P2PBroker.HandleOffer matches it
@@ -45,7 +45,7 @@ import (
 // The actual UDP hole punch is deliberately not required to succeed: real
 // NAT traversal depends on OS/network specifics this test doesn't control
 // (and is already covered in isolation by pkg/p2p's own
-// TestHolePuncher_LocalPunch); what NT-06 is after is proving every
+// TestHolePuncher_LocalPunch); what this test is after is proving every
 // component correctly wires into the next one, which is fully observable
 // whether or not the last hop's raw UDP connectivity happens to succeed.
 // HolePunchConfig.Timeout is shortened so a failed punch doesn't make

@@ -1,7 +1,7 @@
 package proto
 
-// NT-08: DecodeControlMessage is the entry point for every byte the
-// control plane reads off the wire — both the protobuf fast path and the
+// DecodeControlMessage is the entry point for every byte the control
+// plane reads off the wire — both the protobuf fast path and the
 // legacy-JSON fallback — before this build's own code ever sees a typed
 // message. Fuzzing it (see .github/workflows/ci.yml for the short CI
 // budget) guards against a future regression introducing a panic on

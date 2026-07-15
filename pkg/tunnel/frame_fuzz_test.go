@@ -1,6 +1,6 @@
 package tunnel
 
-// NT-08: DecodeFrame parses an attacker-controlled byte stream (whatever
+// DecodeFrame parses an attacker-controlled byte stream (whatever
 // arrives on the tunnel control/data connection) directly into header
 // fields via unchecked binary.BigEndian reads — exactly the kind of
 // parser fuzzing is best at hardening. This never found a crash during

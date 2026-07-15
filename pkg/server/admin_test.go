@@ -1261,9 +1261,9 @@ func TestAdminAPI_RefreshToken_InvalidDuration(t *testing.T) {
 	assert.Equal(t, "invalid extend_by duration", resp.Error)
 }
 
-// TestAdminAPI_RefreshToken_EmitsAuditEvent verifies NA-02: refreshing a
-// token via the admin API (in any of its three modes) now leaves an
-// audit trail, where previously it left none at all.
+// TestAdminAPI_RefreshToken_EmitsAuditEvent verifies that refreshing a
+// token via the admin API (in any of its three modes) leaves an audit
+// trail.
 func TestAdminAPI_RefreshToken_EmitsAuditEvent(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -1619,7 +1619,7 @@ func TestAdminAPI_LoopbackProtection_WithToken(t *testing.T) {
 
 // newTestServerWithAuditEvents builds a server with n stored audit events
 // (all EventClientConnected, for a trivially matchable type filter) and
-// its own AdminAPI handler, for the NA-03 limit tests below.
+// its own AdminAPI handler, for the audit limit tests below.
 func newTestServerWithAuditEvents(t *testing.T, n int) http.Handler {
 	t.Helper()
 	server := newTestServer()
@@ -1651,11 +1651,9 @@ func TestAdminAPI_Audit_LimitCappedAtListMax(t *testing.T) {
 	assert.Len(t, events, auditListMaxLimit)
 }
 
-// TestAdminAPI_AuditExport_LimitAboveListMax verifies NA-03's fix:
-// /audit/export honors an explicit `?limit=` above auditListMaxLimit
-// (previously parseAuditQuery's single hardcoded 1000 cap silently
-// truncated it down to /audit's own limit, contradicting the "export
-// endpoints default to a higher limit" intent).
+// TestAdminAPI_AuditExport_LimitAboveListMax verifies that /audit/export
+// honors an explicit `?limit=` above auditListMaxLimit — it has its own,
+// higher cap independent of /audit's interactive-listing limit.
 func TestAdminAPI_AuditExport_LimitAboveListMax(t *testing.T) {
 	wantLimit := auditListMaxLimit + 500
 	handler := newTestServerWithAuditEvents(t, wantLimit+500)

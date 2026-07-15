@@ -1,7 +1,7 @@
 package server
 
-// NT-03: a full-stack end-to-end test with a real Server, a real Client,
-// and a real local HTTP service — all three communicating over actual
+// A full-stack end-to-end test with a real Server, a real Client, and a
+// real local HTTP service — all three communicating over actual
 // `:0`-assigned TCP sockets, no mux-pair fakes. Every other test in this
 // package (and pkg/client's) drives one side of the protocol against a
 // scripted/fake peer; this is the one test that exercises the entire

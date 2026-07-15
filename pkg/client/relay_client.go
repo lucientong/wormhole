@@ -95,8 +95,8 @@ type relayClient struct {
 	activeTunnelsMu sync.RWMutex
 
 	// activeStreams counts inbound streams currently being serviced by
-	// handleStream, bounded by config.MaxConcurrentStreams (NDP-06/
-	// NA-01). Without this, a compromised or misbehaving server could
+	// handleStream, bounded by config.MaxConcurrentStreams. Without
+	// this, a compromised or misbehaving server could
 	// open unbounded streams on the relay Mux and exhaust this client's
 	// goroutines/memory.
 	activeStreams int32
@@ -857,8 +857,8 @@ func (r *relayClient) handleConnection(ctx context.Context) {
 // acceptStreams accepts incoming streams from the server.
 //
 // Each accepted stream is serviced by its own goroutine (handleStream),
-// bounded by config.MaxConcurrentStreams (NDP-06/NA-01): a compromised or
-// misbehaving server could otherwise open unbounded streams on this
+// bounded by config.MaxConcurrentStreams: a compromised or misbehaving
+// server could otherwise open unbounded streams on this
 // client's relay Mux and exhaust its goroutines/memory. A stream that
 // arrives while already at the limit is closed immediately rather than
 // queued, so the failure is fast and visible instead of adding unbounded
@@ -902,9 +902,8 @@ func (r *relayClient) acceptStreams(ctx context.Context) {
 // tryIncrementBounded32 atomically increments *counter and returns true,
 // unless it is already >= limit, in which case it leaves *counter
 // unchanged and returns false. Shared by relayClient.acceptStreams and
-// p2pSession.acceptP2PStreams to bound concurrent inbound streams
-// (NDP-06/NA-01); mirrors the server-side pattern in
-// pkg/server/proxy_service.go.
+// p2pSession.acceptP2PStreams to bound concurrent inbound streams;
+// mirrors the server-side pattern in pkg/server/proxy_service.go.
 func tryIncrementBounded32(counter *int32, limit int32) bool {
 	for {
 		cur := atomic.LoadInt32(counter)
@@ -1092,8 +1091,8 @@ func (r *relayClient) sendPing(ctx context.Context, pingID uint64) error {
 
 	// Read pong. The mux's own keep-alive already matches ping/pong IDs at
 	// the frame level; this application-level heartbeat must do the same
-	// (NDP-09) rather than treating any 256 bytes read as success — e.g. a
-	// stale response from an earlier, timed-out ping could otherwise be
+	// rather than treating any 256 bytes read as success — e.g. a stale
+	// response from an earlier, timed-out ping could otherwise be
 	// misread as confirming this one.
 	buf := make([]byte, 256)
 	n, err := stream.ReadContext(ctx, buf)

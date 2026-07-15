@@ -32,8 +32,8 @@ const (
 	errP2PTargetNotFound = "target not found: no client with that subdomain is currently connected"
 	// errP2PTargetOnOtherNode is returned instead of errP2PTargetNotFound
 	// when the target subdomain is connected, but to a different cluster
-	// node: `wormhole connect` P2P signaling is same-node only (NH-02),
-	// since the peer's NAT/address/ECDH info only ever lives in that
+	// node: `wormhole connect` P2P signaling is same-node only, since
+	// the peer's NAT/address/ECDH info only ever lives in that
 	// node's own in-memory ClientSession. The client treats this the
 	// same as any other P2P rejection reason and falls back to relay.
 	errP2PTargetOnOtherNode = "target is connected to a different cluster node; P2P connect is only supported within the same node — falling back to relay"

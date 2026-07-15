@@ -14,8 +14,8 @@ import (
 // TestP2PSession_InstallSession_TearsDownPreviousSession verifies that
 // installing a new P2P session always tears down whatever session was
 // previously active first, so its resources (signal channel, in this
-// case) can never be orphaned by the replacement — this is the fix for
-// NDP-01: attemptP2P used to blindly overwrite p.conn/p.udpMux/
+// case) can never be orphaned by the replacement — this is the fix for a
+// bug where attemptP2P used to blindly overwrite p.conn/p.udpMux/
 // p.sessionCloseCh, leaking the old session's UDPMux, socket, and
 // accept-loop goroutine whenever a session was replaced rather than
 // explicitly closed first.
@@ -80,8 +80,8 @@ func TestP2PSession_InstallSession_NoPreviousSession(t *testing.T) {
 }
 
 // TestP2PSession_AttemptP2P_SkipsWhenAlreadyAttempting verifies the
-// singleflight guard added for NDP-01: a second concurrent call to
-// attemptP2P (which can happen when an outgoing offer response and an
+// singleflight guard: a second concurrent call to attemptP2P (which can
+// happen when an outgoing offer response and an
 // inbound notification race each other) must return immediately without
 // touching any session state, rather than racing the in-flight attempt to
 // install its own session.
@@ -120,7 +120,7 @@ func TestP2PSession_AttemptP2P_ReleasesGuardOnCompletion(t *testing.T) {
 // TestP2PSession_FallbackFromStaleSession_IgnoresStaleGeneration verifies
 // that an accept-loop goroutine reporting an error for a session that has
 // already been replaced (sessionGen has moved on) does not tear down the
-// newer, currently-active session — the second half of the NDP-01 fix.
+// newer, currently-active session.
 func TestP2PSession_FallbackFromStaleSession_IgnoresStaleGeneration(t *testing.T) {
 	cfg := DefaultConfig()
 	c := NewClient(cfg)
@@ -164,9 +164,9 @@ func TestP2PSession_FallbackFromStaleSession_IgnoresStaleGeneration(t *testing.T
 }
 
 // TestP2PSession_Close_ResetsMode verifies Close() always resets the P2P
-// mode flag to relay (0), fixing NDP-05: Close() used to tear down
-// conn/udpMux/sessionCloseCh but never reset the atomic mode flag, so
-// IsP2PMode() could keep reporting true after shutdown.
+// mode flag to relay (0) — it used to tear down conn/udpMux/
+// sessionCloseCh but never reset the atomic mode flag, so IsP2PMode()
+// could keep reporting true after shutdown.
 func TestP2PSession_Close_ResetsMode(t *testing.T) {
 	cfg := DefaultConfig()
 	c := NewClient(cfg)

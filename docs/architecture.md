@@ -25,6 +25,7 @@
 - [Server & Client Composition](#server--client-composition)
 - [Reliability & Protocol Safeguards](#reliability--protocol-safeguards)
 - [Hot-Path Performance](#hot-path-performance)
+- [Debugging & Operations Runbook](#debugging--operations-runbook)
 - [Go Patterns Used in This Codebase](#go-patterns-used-in-this-codebase)
 - [Testing Strategy](#testing-strategy)
 - [Data Flow Summary](#data-flow-summary)
@@ -1429,6 +1430,58 @@ The tunnel multiplexer's data-send path and every bidirectional proxy loop reuse
 
 ---
 
+## Debugging & Operations Runbook
+
+This section is for the moment something doesn't work — either you're operating a server, or you're extending the code and need to see what's actually happening on the wire.
+
+### Turning up log verbosity
+
+Every command shares the same global flags (`cmd/wormhole/cmd/root.go`'s `configureLogging`): default is `zerolog.InfoLevel`, `-v`/`--verbose` drops to `DebugLevel`, `--debug` drops further to `TraceLevel`. There's no per-package log filtering — it's a single global level — so start with `-v` on both the server and client when chasing a connection issue; `--debug` is noisy (it also covers frame-level tunnel tracing) but is the level to reach for when a bug is timing- or ordering-sensitive.
+
+### Inspecting a running server without touching it
+
+The Admin API (loopback-only unless `--admin-token` is set) is the first stop, no log-grepping required:
+
+| Endpoint | What it tells you |
+|----------|--------------------|
+| `GET /health` | `status: "healthy"` or `"degraded"`; the latter means `cluster.state_store_healthy` is `false` — your Redis-backed `StateStore` is unreachable, not that the whole server is down |
+| `GET /stats` | Active/total clients, active tunnels & routes, aggregate bytes/requests, allocated TCP ports — the numbers behind any "is it actually handling traffic" question |
+| `GET /clients` | Every connected `ClientSession`: subdomain, role, team, connected-since, P2P public address if known |
+| `GET /tunnels` | Same idea, one row per registered tunnel across all clients (multi-tunnel-aware, unlike `/clients`) |
+| `GET /ratelimit` | Currently blocked IPs (`RateLimiter.GetBlockedIPs`); `POST /ratelimit/unblock {"ip":"..."}` lifts a block early if a real user tripped it (e.g. flaky client retrying with a stale token) |
+| `GET /audit?type=auth_failure&limit=50` | Recent security-relevant events — the fastest way to tell "auth is misconfigured" apart from "network is broken" |
+| `GET /metrics` | Prometheus exposition (same auth as the rest of the Admin API — see [Metrics Protection](../README.md#security-features)); see below for which series matter |
+
+On the client side, `--ctrl-port` exposes an analogous (much smaller) `/tunnels` endpoint for `wormhole tunnels list/create/delete` — useful for confirming a SIGHUP hot-reload actually applied the config you think it did.
+
+### Prometheus metrics worth alerting on
+
+Defined in `pkg/server/metrics.go` under the `wormhole_` namespace, alongside the standard Go runtime/process collectors:
+
+- `wormhole_active_clients` / `wormhole_active_tunnels` — steady-state gauges; a sudden drop to zero with no corresponding deploy is the first sign of a crash-loop.
+- `wormhole_auth_attempts_total{result="failure"}` climbing steadily (not just a burst) suggests a misconfigured client fleet (wrong secret/issuer) rather than an attack.
+- `wormhole_p2p_connections_total{result="fallback"}` vs `{result="success"}` — a healthy P2P deployment has a nonzero success rate; if fallback totally dominates, most of your client population is likely behind Symmetric NAT (confirm with `wormhole nat-check` on a sample) rather than something being broken in the P2P code.
+- `wormhole_cluster_route_sync_failures_total` — non-zero but *not growing* is a transient Redis blip that self-heals on the next heartbeat (routes are re-registered every cycle); a steadily growing rate means the state store is down or unreachable from this node specifically.
+- `wormhole_cluster_route_conflicts_total` — should be zero. Any increment means two nodes both believed they owned the same route during a state-store outage window; there's no automatic remediation, so this should page someone, not just log.
+
+### Common failure signatures
+
+| Symptom | Likely cause | Where to look |
+|---------|--------------|----------------|
+| Server exits immediately with `listen tunnel: ... bind: address already in use` on the default port 7000 | Something else already owns that port — on macOS this is very often the built-in AirPlay Receiver / ControlCenter, not a leftover Wormhole process | `lsof -i :7000`; pick a different `--port`, or disable AirPlay Receiver in System Settings |
+| Client registration fails with `subdomain "x" already in use` / `already registered` | Another live session already owns that subdomain (`ErrSubdomainConflict`, `router.go`'s registration checks) — this is enforced deliberately, see [Availability vs. Consistency Trade-off](#availability-vs-consistency-trade-off-on-route-registration) | `GET /clients` to see who currently owns it; a stale entry from a dead session should self-clear once that session's mux closes (or its cluster TTL expires under HA) |
+| Auth keeps failing right after it was working | Token expired (HMAC mode) or revoked; OIDC issuer/JWKS temporarily unreachable; source IP got rate-limited after unrelated failures | `GET /audit?type=auth_failure`, `GET /ratelimit` |
+| `wormhole connect` (or P2P-accelerated relay) always falls back, never goes direct | One or both peers are behind Symmetric NAT — this is an expected, not-a-bug outcome of [NAT Traversal Strategy](#nat-traversal-strategy) | `wormhole nat-check` on both ends; look for `p2p_connections_total{result="fallback"}` growth |
+| Server logs a loud startup warning about TLS but still starts | `--require-auth` + a real `--domain` implies `--tunnel-tls` by default, but no cert material could be sourced ([Tunnel Control-Channel TLS](../README.md#tunnel-control-channel-tls)) | Fix by providing `--cert`/`--key` or ensuring the ACME domain is actually reachable on 80/443 |
+| Client rejected with `client version "x" rejected: ...` | Server's `--min-client-version` is newer than the connecting client | Upgrade the client, or lower/unset `--min-client-version` |
+| `/health` reports `"degraded"` under HA | The Redis-backed `StateStore` is unreachable from this node | Check Redis connectivity from that specific node; other nodes may be healthy independently |
+
+### Reproducing wire-level behavior without a real network
+
+Most protocol-level bugs are easiest to chase in a unit test, not a live deployment — see the *mux-pair* pattern in [Testing Strategy](#testing-strategy): a real `tunnel.Mux` on one end of a `net.Pipe`, a hand-scripted fake peer on the other, so you can assert on the exact frames/messages that crossed the wire instead of inferring behavior from timing.
+
+---
+
 ## Go Patterns Used in This Codebase
 
 For readers using Wormhole to study Go, these are the recurring techniques and where to find a canonical example of each.
@@ -1470,14 +1523,17 @@ Unit tests are table-driven where inputs enumerate well (frame codec, config val
 
 ## Testing Strategy
 
-The test suite (roughly 25k lines, exceeding production code) is layered; knowing which layer a test belongs to tells you how to write new ones.
+The test suite (roughly 27k lines, exceeding production code) is layered; knowing which layer a test belongs to tells you how to write new ones.
 
 | Layer | Where | Technique |
 |-------|-------|-----------|
 | Unit | `pkg/tunnel`, `pkg/proto`, `pkg/auth` | Table-driven tests on codecs, validation, token logic; benchmarks alongside |
 | Component integration | `pkg/client/client_test.go`, `pkg/server/*_test.go` | Mux-pair over `net.Pipe`: a real mux on the side under test, a scripted fake peer on the other |
 | Cluster integration | `pkg/server/cluster_test.go` | Two full server instances sharing a `miniredis`, real HTTP round-trips across nodes |
+| Full-stack end-to-end | `pkg/server/e2e_test.go` | A real `Server` + real `Client` (actual TCP sockets, no fakes) proxying to a local `httptest`-style echo service — the top of the pyramid, exercising the entire dial→auth→register→proxy path at once |
+| P2P signaling end-to-end | `pkg/server/p2p_e2e_test.go` | Two real `Client`s + a real `Server`, with an in-process fake STUN server standing in for the public internet, verifying the full `wormhole connect` offer/match/notify chain and the fallback-to-relay path via the `p2p_connections_total` metric |
 | P2P stress | `pkg/p2p/stress_test.go` | Loopback UDP with simulated packet loss, exercising the ARQ retransmission path |
+| Fuzz | `pkg/tunnel/frame_fuzz_test.go`, `pkg/proto/messages_fuzz_test.go` | `go test -fuzz` against the frame and control-message decoders, so malformed/adversarial input can't panic or infinite-loop the parser; run as a short seeded pass in CI, deeper locally on demand |
 | Race detection | CI | The entire suite runs under `go test -race` on every push |
 
 Guidelines that keep the suite healthy:
@@ -1486,7 +1542,7 @@ Guidelines that keep the suite healthy:
 - **Every bug fix lands with a regression test** at the lowest layer that can reproduce it.
 - **Security-relevant code paths get explicit negative tests** — wrong HMAC, expired token, invalid cluster secret, oversized control message.
 
-Run locally with `go test -race ./...`; per-package coverage with `go test -cover ./pkg/...`. Lint and security gates mirror CI: `golangci-lint run ./...` and `gosec -exclude=G115 -exclude-dir=web -exclude-dir=pkg/proto/pb ./...`.
+Run locally with `go test -race ./...`; per-package coverage with `go test -cover ./pkg/...`; a short fuzz pass with `go test ./pkg/tunnel/ -run=^$ -fuzz=FuzzDecodeFrame -fuzztime=30s` (swap in `./pkg/proto/ -fuzz=FuzzDecodeControlMessage` for the other target — CI runs both for 20s on every push). Lint and security gates mirror CI: `golangci-lint run ./...` and `gosec -exclude=G115 -exclude-dir=web -exclude-dir=pkg/proto/pb ./...`.
 
 ---
 

@@ -68,6 +68,33 @@ git clone https://github.com/lucientong/wormhole.git
 cd wormhole && make build
 ```
 
+### Try It Locally (3 Steps, No Domain, No Deploy)
+
+Everything below runs on `localhost` — no server to rent, no DNS to configure. Open three terminals:
+
+```bash
+# Terminal 1 — start a server. --domain localhost is the default; --port
+# 17000/--http-port 8081 sidestep 7000/80, since 7000 is already taken by
+# macOS's AirPlay Receiver on some Macs and 80 needs root on most systems.
+wormhole server --port 17000 --http-port 8081
+
+# Terminal 2 — start literally any local service to expose, e.g. Python's
+# built-in file server (use whatever you're actually developing instead).
+python3 -m http.server 9000
+
+# Terminal 3 — start the client and note the "Forwarding" line it prints,
+# e.g. "Forwarding: http://a1b2c3d4e5f6.localhost -> http://127.0.0.1:9000"
+wormhole client --server localhost:17000 --local 9000
+```
+
+Then, from any terminal, verify the full loop with curl (swap in the subdomain the client printed — `*.localhost` resolves to `127.0.0.1` on macOS/Linux out of the box):
+
+```bash
+curl http://a1b2c3d4e5f6.localhost:8081/
+```
+
+A 200 response means traffic just went `curl → wormhole server → wormhole client → python3 http.server` and back. Swap step 2 for your real app (`--local <your-port>`) and you're exposing it.
+
 ### Usage
 
 ```bash
@@ -97,6 +124,9 @@ wormhole client --protocol http --hostname api.example.com --local 8080
 
 # Disable P2P mode (use relay only)
 wormhole client --local 8080 --p2p=false
+
+# Diagnose your NAT type before relying on P2P (no server needed)
+wormhole nat-check
 
 # Load multi-tunnel config from YAML file (hot-reload with SIGHUP)
 wormhole client --config ~/.wormhole/tunnels.yaml
@@ -663,6 +693,13 @@ wormhole client --local 8080 --p2p=false
 wormhole connect <peer-subdomain> --local 9090
 ```
 
+**Diagnosing NAT compatibility**: `wormhole nat-check` runs STUN discovery standalone (no Wormhole server needed) and prints your NAT type, whether it's traversable, and a quick reference table of typical environments (home broadband, carrier-grade NAT, corporate networks, cloud VPS, ...). Run it before troubleshooting a `wormhole connect` session that keeps falling back to relay — if either peer reports `Symmetric`, that's the answer:
+
+```bash
+wormhole nat-check
+wormhole nat-check --timeout 15   # slower network, give STUN more time
+```
+
 #### Inspector
 
 The traffic inspector captures and displays HTTP request/response data. In production:
@@ -692,7 +729,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ## Contributing
 
-Contributions are welcome!
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, testing guidelines, and how to submit a pull request.
 
 ## License
 

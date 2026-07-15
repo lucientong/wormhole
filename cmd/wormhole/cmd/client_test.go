@@ -155,7 +155,7 @@ func TestResolveClientCredentials_OnAuthFailure_NoCredentials_ReturnsFalse(t *te
 	assert.False(t, ok)
 }
 
-// NT-04: reloadClientConfig is what runClientFromConfig's SIGHUP handler
+// reloadClientConfig is what runClientFromConfig's SIGHUP handler
 // calls; testing it directly (rather than sending a real os.Signal to a
 // live client process) covers the same reload logic without needing a
 // running server connection — ReloadTunnels itself is a documented

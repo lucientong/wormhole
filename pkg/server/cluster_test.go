@@ -351,7 +351,7 @@ func newCapturingTunnelBackend(t *testing.T, sessionID, subdomain, body string, 
 
 // flakyStateStore wraps a StateStore and fails the first failAfter calls
 // to RegisterRoute with a non-conflict error, then delegates normally —
-// simulating a transient Redis outage for the NH-01 tests below.
+// simulating a transient Redis outage for the tests below.
 type flakyStateStore struct {
 	StateStore
 	remainingFailures int
@@ -365,12 +365,12 @@ func (f *flakyStateStore) RegisterRoute(entry RouteEntry) error {
 	return f.StateStore.RegisterRoute(entry)
 }
 
-// TestTunnelRegistry_RegisterClusterRoute_NH01RetriesAfterTransientFailure
-// verifies NH-01's core fix: a non-conflict RegisterRoute failure still
-// appends the route to client.clusterRoutes (instead of dropping it
-// forever), so the very next heartbeat's refreshClusterRoutes retries —
-// and eventually succeeds — it without requiring the client to reconnect.
-func TestTunnelRegistry_RegisterClusterRoute_NH01RetriesAfterTransientFailure(t *testing.T) {
+// TestTunnelRegistry_RegisterClusterRoute_RetriesAfterTransientFailure
+// verifies that a non-conflict RegisterRoute failure still appends the
+// route to client.clusterRoutes (instead of dropping it forever), so the
+// very next heartbeat's refreshClusterRoutes retries — and eventually
+// succeeds — it without requiring the client to reconnect.
+func TestTunnelRegistry_RegisterClusterRoute_RetriesAfterTransientFailure(t *testing.T) {
 	store := &flakyStateStore{StateStore: NewMemoryStateStore(), remainingFailures: 1}
 	s := newClusterTestServer("node-a", "node-a:7000", store)
 
@@ -384,7 +384,7 @@ func TestTunnelRegistry_RegisterClusterRoute_NH01RetriesAfterTransientFailure(t 
 	require.True(t, ok)
 
 	// The route must be tracked for retry even though the store call
-	// failed — this is the exact gap NH-01 closes.
+	// failed — this is the gap the fail-open-and-retry design closes.
 	client.mu.Lock()
 	require.Len(t, client.clusterRoutes, 1, "failed registration must still be tracked in clusterRoutes for retry")
 	client.mu.Unlock()
@@ -448,9 +448,10 @@ func TestTunnelRegistry_RefreshClusterRoutes_NH01DetectsSplitBrainConflict(t *te
 }
 
 // TestServer_RegisterClientRoute_CrossTeamCannotReclaimStaleSession is
-// NS-04's core regression test: a subdomain left behind by a dead-but-
-// not-yet-cleaned-up session must not be reclaimable by a *different*
-// team's client during the transient window before RemoveClient runs —
+// the core team-isolation regression test: a subdomain left behind by a
+// dead-but-not-yet-cleaned-up session must not be reclaimable by a
+// *different* team's client during the transient window before
+// RemoveClient runs —
 // only the stale owner's own team (or a deployment not using teams at
 // all) may reclaim it. Complements
 // TestServer_RegisterClientRoute_ReclaimsStaleLocalSession, which covers
@@ -477,7 +478,7 @@ func TestServer_RegisterClientRoute_CrossTeamCannotReclaimStaleSession(t *testin
 // TestServer_RegisterClientRoute_SameTeamCanReclaimStaleSession verifies
 // the positive counterpart: the *same* team reconnecting (e.g. a new
 // session replacing the dead one) can still reclaim immediately, exactly
-// as before NS-04.
+// as before team isolation was enforced.
 func TestServer_RegisterClientRoute_SameTeamCanReclaimStaleSession(t *testing.T) {
 	s := newClusterTestServer("node-a", "node-a:7000", nil)
 

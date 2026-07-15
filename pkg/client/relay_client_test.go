@@ -1,8 +1,8 @@
 package client
 
 // Tests in this file exercise RelayClient behavior directly against a
-// scripted fake server peer, independent of Client/P2PSession (NT-05):
-// unlike most of client_test.go (which drives everything through a
+// scripted fake server peer, independent of Client/P2PSession: unlike
+// most of client_test.go (which drives everything through a
 // *Client), these construct a *relayClient on its own via newRelayClient,
 // with nil localForwarder/statsRecorder — safe because none of the paths
 // under test (registration, reload, auth) touch either.
@@ -96,7 +96,7 @@ func serveFakeRegistryPeer(t *testing.T, serverMux *tunnel.Mux) (registered <-ch
 	return registeredCh, closedCh
 }
 
-// TestRelayClient_ReloadTunnels_AddsRemovesAndKeepsUnchanged is NT-01:
+// TestRelayClient_ReloadTunnels_AddsRemovesAndKeepsUnchanged verifies:
 // ReloadTunnels must register newly-added tunnels, close and drop
 // no-longer-configured ones, and leave unchanged ones alone (no spurious
 // close+re-register), which is what makes it a differential — not a
@@ -174,7 +174,7 @@ func TestRelayClient_ReloadTunnels_NotConnected(t *testing.T) {
 }
 
 // TestRelayClient_AuthenticateWithRefresh_RetriesWithNewTokenOnRejection
-// is NT-02's core case: a server rejecting the current token invokes
+// covers the core case: a server rejecting the current token invokes
 // Config.OnAuthFailure, and a successful refresh is retried exactly once
 // with the new token — the same code path Run's reconnect loop re-enters
 // on every reconnection attempt, so this is what actually exercises "an
@@ -317,7 +317,7 @@ func TestRelayClient_AuthenticateWithRefresh_HookDeclinesReturnsOriginalError(t 
 // TestRelayClient_Connect_RefreshesTokenOverRealReconnect drives
 // authenticateWithRefresh through relayClient.connect itself — the exact
 // method Run's reconnect loop calls on every attempt — over a real TCP
-// listener, so this is the "reconnect path" from NT-02 end to end: dial,
+// listener, so this is the token-refresh reconnect path end to end: dial,
 // get rejected, refresh, redial-free retry, then continue on to tunnel
 // registration exactly as a real reconnect after an OIDC token expiry
 // would.

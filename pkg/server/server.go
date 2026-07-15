@@ -209,7 +209,7 @@ func NewServer(config Config) *Server {
 	}
 
 	// Initialize Prometheus metrics first: TunnelRegistry optionally
-	// reports cluster route sync/conflict counters into it (NH-01).
+	// reports cluster route sync/conflict counters into it.
 	if config.EnableMetrics {
 		s.metrics = NewMetrics()
 		log.Info().Msg("Prometheus metrics enabled")
@@ -921,8 +921,8 @@ func (s *Server) capabilities() []string {
 // control-plane requests — register/ping/stats/close/P2P-offer — over its
 // own relay Mux. Without a cap here, a compromised or buggy client could
 // open unbounded control streams on its own connection and exhaust server
-// goroutines/memory without ever touching the data-plane limits (NDP-06/
-// NA-01). A saturated client just has this stream dropped immediately
+// goroutines/memory without ever touching the data-plane limits. A
+// saturated client just has this stream dropped immediately
 // rather than queued, so the client sees a fast failure instead of
 // unbounded added latency.
 func (s *Server) handleClientStreams(client *ClientSession) {
@@ -1517,11 +1517,11 @@ func isValidSubdomainLabel(s string) bool {
 }
 
 // isReservedSubdomain reports whether subdomain is blocked for role by
-// Config.ReservedSubdomains (NS-04) — e.g. "admin"/"api"/"www" staying
-// available for the operator's own use regardless of which team's client
-// registers first. Only enforced when RequireAuth is on (role is
-// otherwise always "" and meaningless); auth.RoleAdmin always bypasses
-// it, matching the "admin 保留字" carve-out.
+// Config.ReservedSubdomains — e.g. "admin"/"api"/"www" staying available
+// for the operator's own use regardless of which team's client registers
+// first. Only enforced when RequireAuth is on (role is otherwise always
+// "" and meaningless); auth.RoleAdmin always bypasses this reserved-word
+// carve-out.
 func (s *Server) isReservedSubdomain(subdomain string, role auth.Role) bool {
 	if !s.config.RequireAuth || role == auth.RoleAdmin {
 		return false

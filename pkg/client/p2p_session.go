@@ -414,9 +414,9 @@ func (p *p2pSession) installSession(conn net.PacketConn, peer *net.UDPAddr, mux 
 // session that has since been replaced or explicitly closed.
 //
 // Each accepted stream is serviced by its own goroutine, bounded by
-// config.MaxConcurrentStreams (NDP-06/NA-01) exactly like
-// relayClient.acceptStreams — a P2P peer is just as capable of opening
-// unbounded streams as a compromised relay server would be.
+// config.MaxConcurrentStreams exactly like relayClient.acceptStreams — a
+// P2P peer is just as capable of opening unbounded streams as a
+// compromised relay server would be.
 func (p *p2pSession) acceptP2PStreams(ctx context.Context, mux *p2p.UDPMux, closeSig chan struct{}, gen uint64) {
 	log.Info().Msg("P2P accept loop started")
 	defer log.Info().Msg("P2P accept loop stopped")

@@ -327,7 +327,7 @@ func TestServer_FindPeerBySubdomain_MissingTunnelMetadata(t *testing.T) {
 	assert.Equal(t, errP2PTargetTunnelMeta, reason)
 }
 
-// TestServer_FindPeerBySubdomain_OnOtherNode verifies NH-02: when the
+// TestServer_FindPeerBySubdomain_OnOtherNode verifies that when the
 // target subdomain has no local ClientSession but the cluster state store
 // shows it's owned by a *different* node, FindPeerBySubdomain returns the
 // honest errP2PTargetOnOtherNode reason (P2P is same-node only) instead of
@@ -4071,7 +4071,7 @@ func TestIsValidSubdomainLabel(t *testing.T) {
 	}
 }
 
-// TestServer_IsReservedSubdomain covers NS-04's reserved-word mechanism:
+// TestServer_IsReservedSubdomain covers the reserved-word mechanism:
 // regular roles are blocked from claiming a reserved subdomain,
 // auth.RoleAdmin always bypasses it, and the whole check is a no-op when
 // RequireAuth is off (role is meaningless then).

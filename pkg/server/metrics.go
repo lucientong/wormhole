@@ -41,8 +41,8 @@ type Metrics struct {
 	// ClusterRouteSyncFailuresTotal counts state-store RegisterRoute
 	// calls (initial registration or heartbeat refresh) that failed for
 	// a reason other than a genuine conflict — e.g. Redis unreachable.
-	// These self-heal on a later heartbeat (NH-01) but a sustained
-	// non-zero rate indicates the cluster state store is degraded.
+	// These self-heal on a later heartbeat but a sustained non-zero
+	// rate indicates the cluster state store is degraded.
 	ClusterRouteSyncFailuresTotal prometheus.Counter
 
 	// ClusterRouteConflictsTotal counts routes this node believed it

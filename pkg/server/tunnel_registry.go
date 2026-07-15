@@ -134,7 +134,7 @@ type tunnelRegistry struct {
 	stateStoreHealthy atomic.Bool
 
 	// metrics is nil when Config.EnableMetrics is false. Used only to
-	// surface cluster route sync/conflict counters (NH-01); every other
+	// surface cluster route sync/conflict counters; every other
 	// registry operation is metrics-agnostic.
 	metrics *Metrics
 
@@ -257,7 +257,7 @@ func (tr *tunnelRegistry) registerClientRoute(client *ClientSession) (ok bool, r
 // logged and treated as non-fatal (losing cluster visibility temporarily
 // is preferable to rejecting every connection whenever Redis hiccups).
 //
-// NH-01: a non-conflict failure still appends entry to client.clusterRoutes
+// A non-conflict failure still appends entry to client.clusterRoutes
 // (marked unsynced), instead of silently dropping it. That's what makes
 // the "availability over strict consistency" trade-off self-healing
 // rather than a permanent gap: refreshClusterRoutes retries every route in
@@ -479,7 +479,7 @@ func (tr *tunnelRegistry) IsLocalNode(nodeID string) bool {
 func (tr *tunnelRegistry) FindPeerBySubdomain(targetSubdomain string, initiator *ClientSession) (peer *ClientSession, tunnelID, reason string) {
 	peer = tr.router.LookupSubdomain(targetSubdomain)
 	if peer == nil {
-		// NH-02: `wormhole connect` P2P signaling only works between two
+		// `wormhole connect` P2P signaling only works between two
 		// clients on the *same* node — this node has no ClientSession
 		// (Mux, NAT/address info, ECDH key) for a peer connected
 		// elsewhere, and the cluster state store only knows routing
@@ -592,7 +592,7 @@ func (tr *tunnelRegistry) sendHeartbeat() {
 // an idempotent TTL refresh, so calling it again on every heartbeat is
 // enough to keep a long-lived connection's routes alive indefinitely
 // without ever needing a dedicated "just bump the TTL" store method. It's
-// also NH-01's retry mechanism for routes that failed to sync at
+// also the retry mechanism for routes that failed to sync at
 // registration time (see registerClusterRoute) — those keep being retried
 // here, indistinguishable from an ordinary refresh, until they succeed.
 func (tr *tunnelRegistry) refreshClusterRoutes() {
@@ -617,8 +617,8 @@ func (tr *tunnelRegistry) refreshClusterRoutes() {
 				// This node believed it owned this route (it's in
 				// clusterRoutes) but the cluster now disagrees — the
 				// route was registered locally during a Redis outage
-				// (NH-01) and another node has since claimed the same
-				// key for real. This node's copy is split-brained:
+				// and another node has since claimed the same key for
+				// real. This node's copy is split-brained:
 				// it will keep serving local traffic for it, but the
 				// rest of the cluster now routes elsewhere. Logged at
 				// Error (not Warn) and counted so it's impossible to

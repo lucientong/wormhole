@@ -782,11 +782,10 @@ func (a *AdminAPI) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 
 	// Export endpoints default to (and allow up to) a higher limit than
 	// /audit's paginated list view, matching this handler's stated intent
-	// to support bulk export — NA-03: parseAuditQuery previously always
-	// capped 'limit' at 1000 regardless of caller, so an explicit
-	// `?limit=10000` on /audit/export was silently truncated back down
-	// to 1000, contradicting the "export endpoints default to a higher
-	// limit" comment that only covered the *unset* case.
+	// to support bulk export: parseAuditQuery is called with its own
+	// higher cap here rather than sharing /audit's conservative one, so
+	// an explicit `?limit=10000` on /audit/export isn't silently
+	// truncated back down.
 	q, err := parseAuditQuery(r, auditExportMaxLimit, auditExportDefaultLimit)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error()})
@@ -817,10 +816,8 @@ func (a *AdminAPI) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 
 // Audit query 'limit' bounds. /audit is a paginated list view meant for
 // interactive browsing, so it keeps a conservative cap; /audit/export is
-// explicitly for bulk export and gets a much higher one (NA-03 — these
-// used to share a single hardcoded 1000 cap that silently truncated any
-// /audit/export?limit=... above it, contradicting the higher default
-// export claims to use).
+// explicitly for bulk export and gets a much higher one, independent of
+// /audit's own cap.
 const (
 	auditListDefaultLimit   = 100
 	auditListMaxLimit       = 1000
@@ -998,9 +995,9 @@ func (a *AdminAPI) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 	}
 	logEvent.Msg("Token refreshed via admin API")
 
-	// NA-02: token refresh/extension previously had no audit trail at
-	// all — an admin-API caller could mint a renewed credential for any
-	// team without leaving any record queryable via /audit.
+	// Record an audit trail for the refresh/extension: without this, an
+	// admin-API caller could mint a renewed credential for any team
+	// without leaving any record queryable via /audit.
 	if a.server.auditLogger != nil {
 		a.server.auditLogger.LogTokenRefreshed(claims.TeamName, claims.Role, mode)
 	}

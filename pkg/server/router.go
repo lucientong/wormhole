@@ -46,7 +46,7 @@ func NewRouter(domain string) *Router {
 // racing to claim the exact subdomain team A's client just dropped (e.g.
 // a network blip mid-reconnect) could transiently steal a route that
 // legitimately belongs to team A, before team A's own reconnect attempt
-// lands. NS-04 (see docs/architecture.md "Multi-tenancy").
+// lands (see docs/architecture.md "Multi-tenancy").
 func isStaleOwner(existing, incoming *ClientSession) bool {
 	if existing == incoming || existing.Mux == nil || !existing.Mux.IsClosed() {
 		return false

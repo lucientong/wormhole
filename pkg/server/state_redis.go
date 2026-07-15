@@ -108,7 +108,7 @@ func indexKey(entry RouteEntry) (key, desc string) {
 
 // registerRouteScript atomically reserves entry's routing index key,
 // writes its JSON record, and (when ClientID is set) tracks it in the
-// client's route-ID set, all as one Redis-side transaction (NH-04).
+// client's route-ID set, all as one Redis-side transaction.
 //
 // A previous implementation did this as SETNX(idx) + pipeline SET(route
 // data), which left a window — between the two round trips — where the
@@ -116,9 +116,9 @@ func indexKey(entry RouteEntry) (key, desc string) {
 // lookup landing in that window would see the route as "not found" even
 // though the reservation had technically succeeded, and if the process
 // crashed or lost its connection between the two calls, that broken state
-// could persist until routeID re-registered (which NH-01's heartbeat
-// retry now makes likely, but isn't a substitute for closing the race
-// itself). Running the whole thing as one EVAL removes the window
+// could persist until routeID re-registered (which the heartbeat retry
+// mechanism now makes likely, but isn't a substitute for closing the
+// race itself). Running the whole thing as one EVAL removes the window
 // entirely: a lookup interleaved with a RegisterRoute call now always
 // finds a fully-formed reservation or none.
 //
