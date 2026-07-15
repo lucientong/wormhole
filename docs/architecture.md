@@ -307,6 +307,10 @@ Fixed header size: 10 bytes (HeaderSize)
 - After consuming data, receiver notifies sender via `WINDOW_UPDATE` frames
 - Prevents fast senders from overwhelming slow receivers
 
+### Control/Data Frame Prioritization
+
+`Mux` queues outgoing frames on two channels instead of one: `ctrlCh` for `WINDOW_UPDATE`/`PING`/`PONG`/`HANDSHAKE`/`ERROR`, and `sendCh` for `DATA` and `CLOSE`. `sendLoop` always drains `ctrlCh` first. This matters because `WINDOW_UPDATE`/`PONG` are what unblock a stalled peer: on a connection saturated with data in both directions, `recvLoop` answers a `PING` by calling `sendPong` synchronously — if that send shared a queue with a deep backlog of `DATA` frames, it would block, `recvLoop` would stop draining the socket, and TCP backpressure would stall the peer's writes the same way, which is a classic single-queue mux deadlock. `CLOSE` deliberately stays on `sendCh` with `DATA` rather than joining the fast lane: it marks the end of a stream's data, so it must never be delivered ahead of that same stream's own still-queued bytes — jumping the queue would let the peer see EOF before all data arrived.
+
 ### Encoding
 
 - Uses `sync.Pool` for buffer reuse to reduce GC pressure
@@ -1068,6 +1072,7 @@ Key components:
 | **Key Exchange** | X25519 ECDH — each peer generates an ephemeral keypair per session |
 | **Key Derivation** | HKDF-SHA256 with separate info labels: `"wormhole-p2p-encryption"` for AES key, `"wormhole-p2p-punch-hmac"` for probe HMAC key |
 | **Data Encryption** | AES-256-GCM with monotonic nonce counter (8-byte counter + 4 zero bytes) |
+| **Anti-Replay** | `SessionCipher` tracks the highest counter seen plus a 1024-slot sliding-window bitmap; `Decrypt` rejects a counter that's already been seen or has fallen outside the window before attempting decryption. Out-of-order delivery within the window (normal on UDP) is still accepted. A forged packet (bad GCM tag) never marks its counter as seen, so it can't be used to burn a legitimate sender's slot |
 | **Probe Authentication** | HMAC-SHA256 on hole-punch probe payloads, preventing injection of spoofed probes |
 | **Forward Secrecy** | Ephemeral keys per session — compromising one session does not affect others |
 | **Server Blindness** | Server relays only public keys; it cannot derive the shared secret or decrypt data |
@@ -1362,6 +1367,8 @@ NewClient(config)
 
 Both components depend on `Client` only through two small consumer-side interfaces it implements — `localForwarder` (hand a stream off to be proxied to the local service) and `statsRecorder` (report bytes/connections into the aggregate `Stats`) — so neither `RelayClient` nor `P2PSession` needs to know `Client` exists as a concrete type. `P2PSession` talks back to `RelayClient` only through the minimal `RelayChannel` interface (send a P2P result over the control connection), not the full `RelayClient` surface. `Client` retains its own mutex only for state it still owns directly (the local control/inspector HTTP servers); connection state lives behind `RelayClient`'s own lock, and P2P session state behind `P2PSession`'s.
 
+**Session replacement and singleflight.** A P2P offer/notification can legitimately fire more than once for the same peer (retries, a racing offer from each side), and each successful hole-punch replaces `P2PSession`'s live `conn`/`udpMux`/`sessionCloseCh`. Two things guard this under `P2PSession.mu`: an `attempting atomic.Bool` makes `attemptP2P` a singleflight — a second concurrent attempt observes the flag already set and returns immediately instead of racing the first — and a `sessionGen` counter tags every installed session. `installSession` always tears down whatever session it's replacing (closing the old `conn`/`udpMux`, signaling the old accept loop to exit) before installing the new one, so a superseded session never lingers as an orphaned goroutine + UDP socket. Because `acceptP2PStreams` runs in its own goroutine per session, an error on a *stale* session's accept loop must not be allowed to tear down whatever newer session has since replaced it — it captures the `sessionGen` it was started with and compares against the current generation before acting, via `fallbackFromStaleSession`.
+
 ---
 
 ## Reliability & Protocol Safeguards
@@ -1379,6 +1386,8 @@ The WebSocket and TCP tunnel proxy paths pump two directions concurrently (clien
 ### Concurrent Stream Limits
 
 Two server flags cap how many data-plane streams (HTTP/WebSocket/TCP proxy streams, not control-channel streams) can be open at once: `--max-concurrent-streams` (default 10000, a global process-wide cap) and `--max-streams-per-client` (default 500, scoped to a single client connection so one busy tenant can't starve everyone else's share). Both are non-blocking `atomic.Int64` counters — a stream request over the limit is rejected outright rather than queued, so a traffic spike degrades as predictable fast rejections instead of unboundedly growing goroutines/memory.
+
+The server's control plane and the client have matching limits of their own, since either side can be handed an unbounded number of inbound streams by its peer: `Server.Config.MaxControlStreamsPerClient` (default 128, `--max-control-streams-per-client`) bounds how many control-channel streams (register/ping/stats/close/P2P-offer, not data-plane traffic) one client connection may have in flight; `client.Config.MaxConcurrentStreams` (default 1000) bounds how many inbound streams `RelayClient.acceptStreams` and `P2PSession.acceptP2PStreams` will service concurrently — relevant because a compromised or misbehaving server could otherwise open unbounded streams against the client. All four limits share the same lock-free pattern: `tryIncrementBounded32`/`64` does a CAS loop that increments a counter only while it's below the limit, and a deferred decrement on stream completion releases the slot.
 
 ### Control-Frame Validation
 

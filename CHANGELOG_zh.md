@@ -4,6 +4,10 @@
 
 **[English](CHANGELOG.md)**
 
+## v0.6.11
+
+数据面韧性加固：P2P 会话建立时会先关闭旧的连接/UDP socket/accept 循环再安装新会话，并防止并发打洞尝试互相竞争——此前重试或竞态的 offer 可能留下孤儿会话继续运行，造成资源泄漏。P2P 加密层新增滑动窗口反重放校验（在解密前拒绝重复或过旧的包，窗口内的乱序包仍会被接受）——此前仅靠 GCM tag 校验无法防御无连接传输上的重放攻击。TCP mux 现在将控制帧（`WINDOW_UPDATE`/`PING`/`PONG`/`HANDSHAKE`）放入独立通道并优先于批量 `DATA` 帧发送，双向打满的连接不会再因数据积压而饿死本应解除阻塞的心跳/流控消息（`CLOSE` 帧仍与 `DATA` 共用队列，保证它永远不会抢在该流自己尚未发出的数据前被投递）。客户端（relay 与 P2P 两条路径）与服务端控制面现在都对并发入站 stream 数设置了可配置上限，防止突发的 stream 开启耗尽 goroutine。此外：删除了从未被读取的死配置项 `EnableFlowControl`；客户端本地拨号失败时不再向对端当作纯 HTTP/TCP 字节流处理的 stream 里写入裸 protobuf 响应；客户端应用层心跳现在会校验回显的 ping ID，而不是把任何读到的响应都当作成功。
+
 ## v0.6.10
 
 安全加固：集群节点间的密钥头（`X-Wormhole-Cluster-Secret`）在请求转发给隧道客户端的本地服务之前会被剥离，共享密钥不再可能泄露进用户内网或应用日志。Token 吊销检查改为 fail-closed——校验期间 Redis/SQLite 故障会拒绝该 token，而不是在无法确认吊销状态时静默放行。认证失败对客户端统一返回笼统的 "authentication failed"（具体原因只写入服务端日志），避免被用来枚举 token 状态。客户端自选的子域名在路由/存储前会按 DNS label 规则校验，拒绝可能产生异常路由或向日志注入控制字符的非法值。启动 Redis 集群时，缺少 `--cluster-node-addr` 会直接快速失败，未设置 `--cluster-secret` 会发出显著告警（否则节点间代理是未认证的）。

@@ -213,9 +213,14 @@ func (c *Client) dialAndProxy(ctx context.Context, inReader io.Reader, outWriter
 	localConn, err := dialer.DialContext(ctx, protocolTCP, localAddr)
 	if err != nil {
 		log.Error().Err(err).Str("addr", localAddr).Msg("Connect to local failed")
-		resp := proto.NewStreamResponse(sreq.RequestID, false, "Local service unavailable")
-		data, _ := resp.Encode()
-		_, _ = outWriter.Write(data)
+		// Nothing reads a StreamResponse on this path: for HTTP, the
+		// caller (proxy_service.forwardHTTP) expects raw HTTP response
+		// bytes and turns a read failure into its own 502; for raw
+		// TCP/WS/gRPC, outWriter is copied byte-for-byte to the public
+		// client's socket, so writing an encoded protobuf message here
+		// would leak framing garbage onto the wire instead of a normal
+		// half-open/closed connection. Just close and let the peer see
+		// EOF, exactly like any other upstream-unavailable failure.
 		return
 	}
 	defer localConn.Close()

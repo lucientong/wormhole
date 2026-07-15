@@ -766,6 +766,49 @@ func TestClient_SendPing_Success(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// TestClient_SendPing_RejectsMismatchedPingID verifies NDP-09: sendPing
+// must validate the echoed PingID rather than treating any successfully
+// read response as confirmation of this specific ping.
+func TestClient_SendPing_RejectsMismatchedPingID(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.HeartbeatTimeout = 5 * time.Second
+	c := NewClient(cfg)
+
+	clientMux, serverMux := newClientMuxPair(t)
+	c.relay.mu.Lock()
+	c.relay.mux = clientMux
+	c.relay.mu.Unlock()
+
+	go func() {
+		stream, err := serverMux.AcceptStream()
+		if err != nil {
+			return
+		}
+		defer stream.Close()
+
+		buf := make([]byte, 4096)
+		n, err := stream.Read(buf)
+		if err != nil {
+			return
+		}
+
+		msg, err := proto.DecodeControlMessage(buf[:n])
+		if err != nil || msg.PingRequest == nil {
+			return
+		}
+
+		// Respond with a stale/mismatched PingID, as could happen if a
+		// response to an earlier timed-out ping arrived late.
+		resp := proto.NewPingResponse(msg.PingRequest.PingID + 1)
+		data, _ := resp.Encode()
+		_, _ = stream.Write(data)
+	}()
+
+	err := c.relay.sendPing(context.Background(), 42)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "pong ID mismatch")
+}
+
 func TestClient_SendPing_NilMux(t *testing.T) {
 	cfg := DefaultConfig()
 	c := NewClient(cfg)
@@ -1637,23 +1680,23 @@ func TestClient_ForwardToLocal_InspectorDisabled(t *testing.T) {
 		c.forwardToLocal(context.Background(), clientStream, sreq)
 	}()
 
-	// Should use raw TCP path. Since nothing is listening, it should get
-	// an error response.
-	buf := make([]byte, 4096)
-	_ = serverStream.SetReadDeadline(time.Now().Add(3 * time.Second))
-	n, _ := serverStream.Read(buf)
-
-	if n > 0 {
-		// Should get a StreamResponse with failure.
-		msg, decErr := proto.DecodeControlMessage(buf[:n])
-		if decErr == nil && msg.StreamResponse != nil {
-			assert.False(t, msg.StreamResponse.Accepted)
-			assert.Contains(t, msg.StreamResponse.Error, "Local service unavailable")
-		}
+	// Should use raw TCP path (dialAndProxy). Since nothing is listening,
+	// the dial fails immediately and dialAndProxy returns without writing
+	// anything to the stream — see NDP-08: no consumer on the other end
+	// decodes a StreamResponse from this path, so writing one would just
+	// leak protobuf bytes onto a wire the peer treats as raw HTTP/TCP data.
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("forwardToLocal did not return after local dial failure")
 	}
 
+	buf := make([]byte, 4096)
+	_ = serverStream.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	n, _ := serverStream.Read(buf)
+	assert.Zero(t, n, "expected no data written to the stream on local dial failure")
+
 	_ = serverStream.Close()
-	<-done
 }
 
 // --- resolveLocalAddr tests (multi-tunnel local dispatch) ---
@@ -1988,20 +2031,22 @@ func TestClient_ForwardToLocal_TCPProtocol(t *testing.T) {
 		c.forwardToLocal(context.Background(), clientStream, sreq)
 	}()
 
-	// Raw TCP path: since no local service is listening, should get error response.
-	buf := make([]byte, 4096)
-	_ = serverStream.SetReadDeadline(time.Now().Add(3 * time.Second))
-	n, _ := serverStream.Read(buf)
-	if n > 0 {
-		msg, decErr := proto.DecodeControlMessage(buf[:n])
-		if decErr == nil && msg.StreamResponse != nil {
-			assert.False(t, msg.StreamResponse.Accepted)
-			assert.Contains(t, msg.StreamResponse.Error, "Local service unavailable")
-		}
+	// Raw TCP path: since no local service is listening, dialAndProxy
+	// returns without writing anything to the stream (see NDP-08 — the
+	// public side just proxies raw bytes, so writing an encoded
+	// StreamResponse here would leak protocol framing onto its socket).
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("forwardToLocal did not return after local dial failure")
 	}
 
+	buf := make([]byte, 4096)
+	_ = serverStream.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	n, _ := serverStream.Read(buf)
+	assert.Zero(t, n, "expected no data written to the stream on local dial failure")
+
 	_ = serverStream.Close()
-	<-done
 }
 
 // TestClient_HandleStream_P2POfferResponse exercises the P2POfferResponse branch.
@@ -2151,7 +2196,7 @@ func TestClient_AcceptP2PStreams_ForwardsRequest(t *testing.T) {
 	clientMux := p2p.NewUDPMux(conn2, peer1Addr, p2p.DefaultTransportConfig(), nil, false)
 
 	closeCh := make(chan struct{})
-	go c.p2p.acceptP2PStreams(context.Background(), clientMux, closeCh)
+	go c.p2p.acceptP2PStreams(context.Background(), clientMux, closeCh, c.p2p.sessionGen)
 
 	// Server opens a stream and sends a StreamRequest.
 	stream, err := serverMux.OpenStream()
@@ -2188,7 +2233,7 @@ func TestClient_AcceptP2PStreams_FallbackOnClose(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		c.p2p.acceptP2PStreams(context.Background(), clientMux, closeCh)
+		c.p2p.acceptP2PStreams(context.Background(), clientMux, closeCh, c.p2p.sessionGen)
 	}()
 
 	// Close the mux to trigger fallback.

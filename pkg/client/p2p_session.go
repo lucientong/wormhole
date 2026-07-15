@@ -95,6 +95,24 @@ type p2pSession struct {
 	keyPair        *p2p.KeyPair       // ECDH key pair for this session
 	cipher         *p2p.SessionCipher // Derived session cipher for E2E encryption
 	mode           uint32             // 1 if using P2P, 0 for relay (atomic)
+	// sessionGen is bumped every time the active session is installed or
+	// torn down. A session-scoped goroutine (acceptP2PStreams) captures the
+	// generation it belongs to and compares before falling back on error,
+	// so an error from an already-replaced/closed session can never tear
+	// down a newer one it doesn't actually own.
+	sessionGen uint64
+
+	// attempting is a singleflight guard: only one hole-punch attempt runs
+	// at a time. Both an outgoing offer response and an inbound
+	// notification can call attemptP2P concurrently; without this guard,
+	// two simultaneously successful attempts would race to install their
+	// session state, orphaning whichever one loses (leaked UDPMux, socket,
+	// and accept-loop goroutine).
+	attempting atomic.Bool
+
+	// activeStreams counts inbound P2P streams currently being serviced,
+	// bounded by config.MaxConcurrentStreams — see acceptP2PStreams.
+	activeStreams int32
 }
 
 // newP2PSession creates a new P2P session. forwarder is used to hand off
@@ -301,6 +319,17 @@ func (p *p2pSession) deriveP2PCipher(peerPubKeyB64 string) error {
 // peerTunnelID is the peer's tunnel ID to address outgoing stream requests
 // to in "connect" mode (see startConnectListener); it's ignored otherwise.
 func (p *p2pSession) attemptP2P(ctx context.Context, relay RelayChannel, peerAddr, peerTunnelID string, isInitiator bool) {
+	// Singleflight: an outgoing offer response and an inbound notification
+	// can both trigger a hole-punch attempt concurrently. Only let one run
+	// at a time — a second concurrent attempt is skipped outright rather
+	// than racing the first to install its session (see the attempting
+	// field doc comment).
+	if !p.attempting.CompareAndSwap(false, true) {
+		log.Debug().Str("peer_addr", peerAddr).Msg("P2P hole-punch attempt already in progress, skipping duplicate attempt")
+		return
+	}
+	defer p.attempting.Store(false)
+
 	peerEndpoint, err := parseP2PEndpoint(peerAddr)
 	if err != nil {
 		log.Error().Err(err).Str("peer_addr", peerAddr).Msg("Failed to parse peer address")
@@ -325,13 +354,7 @@ func (p *p2pSession) attemptP2P(ctx context.Context, relay RelayChannel, peerAdd
 	mux := p2p.NewUDPMux(conn, confirmedPeer, p2p.DefaultTransportConfig(), cipher, isInitiator)
 	closeSig := make(chan struct{})
 
-	p.mu.Lock()
-	p.conn = conn
-	p.peer = confirmedPeer
-	p.udpMux = mux
-	p.sessionCloseCh = closeSig
-	atomic.StoreUint32(&p.mode, 1)
-	p.mu.Unlock()
+	gen := p.installSession(conn, confirmedPeer, mux, closeSig)
 
 	peerAddrStr := confirmedPeer.String()
 	encrypted := cipher != nil
@@ -344,7 +367,7 @@ func (p *p2pSession) attemptP2P(ctx context.Context, relay RelayChannel, peerAdd
 
 	p.sendP2PResult(ctx, relay, true, peerAddrStr, "")
 
-	go p.acceptP2PStreams(ctx, mux, closeSig)
+	go p.acceptP2PStreams(ctx, mux, closeSig, gen)
 
 	if encrypted {
 		fmt.Printf("  🎉 P2P Mode: Direct connection to %s (encrypted)\n", peerAddrStr)
@@ -360,9 +383,41 @@ func (p *p2pSession) attemptP2P(ctx context.Context, relay RelayChannel, peerAdd
 	}
 }
 
+// installSession replaces the currently active P2P session (if any) with a
+// newly established one and returns the new session's generation number
+// for the caller to hand to its accept-loop goroutine (see sessionGen).
+// A previous session may still be active — e.g. a slow-to-unwind accept
+// loop from an earlier attempt, or a deliberate re-punch after the peer's
+// address changed — so this always tears it down first via teardownLocked,
+// which is what guarantees its UDPMux/socket/accept-loop goroutine is never
+// orphaned by the replacement. Split out from attemptP2P so the
+// teardown-then-install behavior is unit-testable without a real hole punch.
+func (p *p2pSession) installSession(conn net.PacketConn, peer *net.UDPAddr, mux *p2p.UDPMux, closeSig chan struct{}) uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// teardownLocked already bumps sessionGen, which is all the "new
+	// generation" a freshly installed session needs — no other live
+	// goroutine can be holding that value yet.
+	p.teardownLocked()
+	p.conn = conn
+	p.peer = peer
+	p.udpMux = mux
+	p.sessionCloseCh = closeSig
+	atomic.StoreUint32(&p.mode, 1)
+	return p.sessionGen
+}
+
 // acceptP2PStreams accepts incoming multiplexed P2P streams and proxies each
 // one to the local service — exactly like the relay path but over P2P UDP.
-func (p *p2pSession) acceptP2PStreams(ctx context.Context, mux *p2p.UDPMux, closeSig chan struct{}) {
+// gen is the session generation this loop was spawned for (see
+// p2pSession.sessionGen); it's used to avoid falling back on behalf of a
+// session that has since been replaced or explicitly closed.
+//
+// Each accepted stream is serviced by its own goroutine, bounded by
+// config.MaxConcurrentStreams (NDP-06/NA-01) exactly like
+// relayClient.acceptStreams — a P2P peer is just as capable of opening
+// unbounded streams as a compromised relay server would be.
+func (p *p2pSession) acceptP2PStreams(ctx context.Context, mux *p2p.UDPMux, closeSig chan struct{}, gen uint64) {
 	log.Info().Msg("P2P accept loop started")
 	defer log.Info().Msg("P2P accept loop stopped")
 
@@ -380,18 +435,29 @@ func (p *p2pSession) acceptP2PStreams(ctx context.Context, mux *p2p.UDPMux, clos
 		stream, err := mux.AcceptStream()
 		if err != nil {
 			if mux.IsClosed() {
-				p.fallbackToRelay("P2P mux closed")
+				p.fallbackFromStaleSession(gen, "P2P mux closed")
 				return
 			}
 			log.Warn().Err(err).Msg("P2P accept stream error, falling back to relay")
-			p.fallbackToRelay("P2P accept error")
+			p.fallbackFromStaleSession(gen, "P2P accept error")
 			return
+		}
+
+		if p.config.MaxConcurrentStreams > 0 &&
+			!tryIncrementBounded32(&p.activeStreams, int32(p.config.MaxConcurrentStreams)) {
+			log.Warn().Int("limit", p.config.MaxConcurrentStreams).
+				Msg("Concurrent stream limit reached, dropping inbound P2P stream")
+			_ = stream.Close()
+			continue
 		}
 
 		// Each stream carries one logical request: read the StreamRequest
 		// header (length-prefixed protobuf) then proxy to local service.
 		go func(s *p2p.UDPStream) {
-			defer s.Close()
+			defer func() {
+				_ = s.Close()
+				atomic.AddInt32(&p.activeStreams, -1)
+			}()
 
 			msg, readErr := proto.ReadControlMessage(s)
 			if readErr != nil {
@@ -619,11 +685,63 @@ func (p *p2pSession) HandleNotification(ctx context.Context, relay RelayChannel,
 	go p.attemptP2P(ctx, relay, resp.PeerAddr, "", false)
 }
 
-// fallbackToRelay switches from P2P back to relay mode.
+// teardownLocked closes every resource belonging to the currently active
+// P2P session (signal channel first so accept loops unblock, then the mux,
+// then the raw connection) and bumps sessionGen so any goroutine still
+// holding the old generation number knows its session is gone. Callers
+// must hold p.mu. It's deliberately idempotent (safe to call on an already-
+// torn-down session) so both fallbackToRelayLocked and attemptP2P's
+// teardown-before-install can share it unconditionally.
+func (p *p2pSession) teardownLocked() {
+	if p.sessionCloseCh != nil {
+		close(p.sessionCloseCh)
+		p.sessionCloseCh = nil
+	}
+	if p.udpMux != nil {
+		_ = p.udpMux.Close()
+		p.udpMux = nil
+	}
+	if p.conn != nil {
+		_ = p.conn.Close()
+		p.conn = nil
+	}
+	p.peer = nil
+	atomic.StoreUint32(&p.mode, 0)
+	p.sessionGen++
+}
+
+// fallbackToRelay switches from P2P back to relay mode unconditionally.
+// Use this for callers that want to abandon P2P regardless of which
+// session generation is currently active (explicit shutdown paths, tests).
+// A session-scoped goroutine (the P2P accept loop) should instead use
+// fallbackFromStaleSession, which checks it still owns the active session
+// before tearing anything down.
 func (p *p2pSession) fallbackToRelay(reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.fallbackToRelayLocked(reason)
+}
 
+// fallbackFromStaleSession is fallbackToRelay's session-aware counterpart,
+// called by acceptP2PStreams when its mux errors. Because attemptP2P tears
+// down and replaces the active session before installing a new one (see
+// its doc comment), and a concurrent notification/offer can trigger a
+// fresh attempt while an old accept loop is still unwinding, gen guards
+// against tearing down a session this goroutine doesn't actually own
+// anymore: if sessionGen has moved on, the error is stale and ignored.
+func (p *p2pSession) fallbackFromStaleSession(gen uint64, reason string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.sessionGen != gen {
+		log.Debug().Str("reason", reason).Msg("P2P session already replaced or closed, ignoring stale accept-loop error")
+		return
+	}
+	p.fallbackToRelayLocked(reason)
+}
+
+// fallbackToRelayLocked is the shared implementation behind fallbackToRelay
+// and fallbackFromStaleSession. Callers must hold p.mu.
+func (p *p2pSession) fallbackToRelayLocked(reason string) {
 	// Only fallback if currently in P2P mode.
 	if atomic.LoadUint32(&p.mode) != 1 {
 		return
@@ -631,48 +749,19 @@ func (p *p2pSession) fallbackToRelay(reason string) {
 
 	log.Info().Str("reason", reason).Msg("Falling back to relay mode")
 
-	if p.udpMux != nil {
-		_ = p.udpMux.Close()
-		p.udpMux = nil
-	}
-	if p.conn != nil {
-		_ = p.conn.Close()
-		p.conn = nil
-	}
-	p.peer = nil
-	if p.sessionCloseCh != nil {
-		close(p.sessionCloseCh)
-		p.sessionCloseCh = nil
-	}
+	p.teardownLocked()
 	// Clear crypto state so a fresh key pair is generated on next attempt.
 	p.keyPair = nil
 	p.cipher = nil
-
-	atomic.StoreUint32(&p.mode, 0)
 
 	p.manager.FallbackToRelay(reason)
 
 	fmt.Printf("  ⚠️  Switched to Relay mode: %s\n", reason)
 }
 
-// Close tears down any active P2P transport/connection, in the same order
-// as fallbackToRelay (signal channel first so accept loops unblock, then
-// the mux, then the raw connection).
+// Close tears down any active P2P transport/connection.
 func (p *p2pSession) Close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
-	if p.sessionCloseCh != nil {
-		close(p.sessionCloseCh)
-		p.sessionCloseCh = nil
-	}
-	if p.udpMux != nil {
-		_ = p.udpMux.Close()
-		p.udpMux = nil
-	}
-	if p.conn != nil {
-		_ = p.conn.Close()
-		p.conn = nil
-	}
-	p.peer = nil
+	p.teardownLocked()
 }

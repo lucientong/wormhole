@@ -93,6 +93,13 @@ type relayClient struct {
 	// this map.
 	activeTunnels   map[string]*ActiveTunnel // name → active tunnel
 	activeTunnelsMu sync.RWMutex
+
+	// activeStreams counts inbound streams currently being serviced by
+	// handleStream, bounded by config.MaxConcurrentStreams (NDP-06/
+	// NA-01). Without this, a compromised or misbehaving server could
+	// open unbounded streams on the relay Mux and exhaust this client's
+	// goroutines/memory.
+	activeStreams int32
 }
 
 // newRelayClient creates a new relay client. forwarder hands off accepted
@@ -848,6 +855,14 @@ func (r *relayClient) handleConnection(ctx context.Context) {
 }
 
 // acceptStreams accepts incoming streams from the server.
+//
+// Each accepted stream is serviced by its own goroutine (handleStream),
+// bounded by config.MaxConcurrentStreams (NDP-06/NA-01): a compromised or
+// misbehaving server could otherwise open unbounded streams on this
+// client's relay Mux and exhaust its goroutines/memory. A stream that
+// arrives while already at the limit is closed immediately rather than
+// queued, so the failure is fast and visible instead of adding unbounded
+// latency.
 func (r *relayClient) acceptStreams(ctx context.Context) {
 	defer r.wg.Done()
 
@@ -869,7 +884,36 @@ func (r *relayClient) acceptStreams(ctx context.Context) {
 			continue
 		}
 
-		go r.handleStream(ctx, stream)
+		if r.config.MaxConcurrentStreams > 0 &&
+			!tryIncrementBounded32(&r.activeStreams, int32(r.config.MaxConcurrentStreams)) {
+			log.Warn().Int("limit", r.config.MaxConcurrentStreams).
+				Msg("Concurrent stream limit reached, dropping inbound relay stream")
+			_ = stream.Close()
+			continue
+		}
+
+		go func() {
+			defer atomic.AddInt32(&r.activeStreams, -1)
+			r.handleStream(ctx, stream)
+		}()
+	}
+}
+
+// tryIncrementBounded32 atomically increments *counter and returns true,
+// unless it is already >= limit, in which case it leaves *counter
+// unchanged and returns false. Shared by relayClient.acceptStreams and
+// p2pSession.acceptP2PStreams to bound concurrent inbound streams
+// (NDP-06/NA-01); mirrors the server-side pattern in
+// pkg/server/proxy_service.go.
+func tryIncrementBounded32(counter *int32, limit int32) bool {
+	for {
+		cur := atomic.LoadInt32(counter)
+		if cur >= limit {
+			return false
+		}
+		if atomic.CompareAndSwapInt32(counter, cur, cur+1) {
+			return true
+		}
 	}
 }
 
@@ -1038,18 +1082,34 @@ func (r *relayClient) sendPing(ctx context.Context, pingID uint64) error {
 		return fmt.Errorf("encode ping: %w", err)
 	}
 
-	if err := stream.SetDeadline(time.Now().Add(r.config.HeartbeatTimeout)); err != nil {
-		return fmt.Errorf("set deadline: %w", err)
+	if deadlineErr := stream.SetDeadline(time.Now().Add(r.config.HeartbeatTimeout)); deadlineErr != nil {
+		return fmt.Errorf("set deadline: %w", deadlineErr)
 	}
 
-	if _, err := stream.WriteContext(ctx, data); err != nil {
-		return fmt.Errorf("write ping: %w", err)
+	if _, writeErr := stream.WriteContext(ctx, data); writeErr != nil {
+		return fmt.Errorf("write ping: %w", writeErr)
 	}
 
-	// Read pong
+	// Read pong. The mux's own keep-alive already matches ping/pong IDs at
+	// the frame level; this application-level heartbeat must do the same
+	// (NDP-09) rather than treating any 256 bytes read as success — e.g. a
+	// stale response from an earlier, timed-out ping could otherwise be
+	// misread as confirming this one.
 	buf := make([]byte, 256)
-	if _, err := stream.ReadContext(ctx, buf); err != nil {
+	n, err := stream.ReadContext(ctx, buf)
+	if err != nil {
 		return fmt.Errorf("read pong: %w", err)
+	}
+
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	if err != nil {
+		return fmt.Errorf("decode pong: %w", err)
+	}
+	if msg.PingResponse == nil {
+		return fmt.Errorf("unexpected pong message type: %d", msg.Type)
+	}
+	if msg.PingResponse.PingID != pingID {
+		return fmt.Errorf("pong ID mismatch: sent %d, got %d", pingID, msg.PingResponse.PingID)
 	}
 
 	return nil

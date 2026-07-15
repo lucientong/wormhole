@@ -118,6 +118,16 @@ type Config struct {
 	// 0 means unlimited.
 	MaxStreamsPerClient int
 
+	// MaxControlStreamsPerClient bounds concurrent *control-plane*
+	// streams (register/ping/stats/close/P2P-offer requests) a single
+	// client's own relay Mux will service at once. This is independent
+	// of MaxStreamsPerClient, which only governs data-plane (HTTP/TCP)
+	// streams — without a separate cap here, a compromised or buggy
+	// client could open unbounded control streams on its own connection
+	// and exhaust server goroutines/memory without ever touching the
+	// data-plane limits. 0 means unlimited.
+	MaxControlStreamsPerClient int
+
 	// RequireAuth requires authentication for connections.
 	RequireAuth bool
 
@@ -259,32 +269,33 @@ type Config struct {
 // DefaultConfig returns the default server configuration.
 func DefaultConfig() Config {
 	return Config{
-		ListenAddr:             ":7000",
-		HTTPAddr:               ":80",
-		AdminAddr:              ":7001",
-		Domain:                 defaultDomain,
-		TLSEnabled:             false,
-		TCPPortRangeStart:      10000,
-		TCPPortRangeEnd:        20000,
-		MuxConfig:              tunnel.DefaultMuxConfig(),
-		ReadTimeout:            30 * time.Second,
-		WriteTimeout:           30 * time.Second,
-		IdleTimeout:            5 * time.Minute,
-		ShutdownTimeout:        15 * time.Second,
-		MaxClients:             1000,
-		MaxTunnelsPerClient:    0,     // Unlimited by default.
-		MaxConcurrentStreams:   10000, // Global data-plane stream cap.
-		MaxStreamsPerClient:    500,   // Per-client data-plane stream cap.
-		RequireAuth:            false,
-		AuthTimeout:            10 * time.Second,
-		RateLimitEnabled:       true,
-		RateLimitMaxFailures:   5,
-		RateLimitWindow:        5 * time.Minute,
-		RateLimitBlockDuration: 15 * time.Minute,
-		Persistence:            PersistenceMemory,
-		EnableMetrics:          true,
-		AuditEnabled:           false,
-		AuditPersistence:       PersistenceMemory,
-		AuditBufferSize:        10_000,
+		ListenAddr:                 ":7000",
+		HTTPAddr:                   ":80",
+		AdminAddr:                  ":7001",
+		Domain:                     defaultDomain,
+		TLSEnabled:                 false,
+		TCPPortRangeStart:          10000,
+		TCPPortRangeEnd:            20000,
+		MuxConfig:                  tunnel.DefaultMuxConfig(),
+		ReadTimeout:                30 * time.Second,
+		WriteTimeout:               30 * time.Second,
+		IdleTimeout:                5 * time.Minute,
+		ShutdownTimeout:            15 * time.Second,
+		MaxClients:                 1000,
+		MaxTunnelsPerClient:        0,     // Unlimited by default.
+		MaxConcurrentStreams:       10000, // Global data-plane stream cap.
+		MaxStreamsPerClient:        500,   // Per-client data-plane stream cap.
+		MaxControlStreamsPerClient: 128,   // Per-client control-plane stream cap.
+		RequireAuth:                false,
+		AuthTimeout:                10 * time.Second,
+		RateLimitEnabled:           true,
+		RateLimitMaxFailures:       5,
+		RateLimitWindow:            5 * time.Minute,
+		RateLimitBlockDuration:     15 * time.Minute,
+		Persistence:                PersistenceMemory,
+		EnableMetrics:              true,
+		AuditEnabled:               false,
+		AuditPersistence:           PersistenceMemory,
+		AuditBufferSize:            10_000,
 	}
 }

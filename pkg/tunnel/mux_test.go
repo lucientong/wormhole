@@ -345,7 +345,6 @@ func TestDefaultMuxConfig(t *testing.T) {
 	assert.Equal(t, 30*time.Second, config.KeepAliveInterval)
 	assert.Equal(t, 10*time.Second, config.KeepAliveTimeout)
 	assert.Equal(t, uint32(DefaultFramePayloadSize), config.MaxFrameSize)
-	assert.True(t, config.EnableFlowControl)
 }
 
 func TestMux_LargeData(t *testing.T) {
@@ -1039,4 +1038,163 @@ func TestMux_SendWindowUpdate_ClosedMux(t *testing.T) {
 	assert.ErrorIs(t, err, ErrMuxClosed)
 
 	_ = serverMux.Close()
+}
+
+// --- NDP-03: control/data frame queue separation ---
+//
+// handlePing calls sendPong synchronously from within recvLoop. Before
+// control frames got their own queue, a sendCh backlogged with bulk DATA
+// frames could make that call block, which stalls recvLoop, which stops
+// draining the socket, which can cascade into a full deadlock against a
+// peer in the same state (see sendLoop's doc comment in mux.go). These
+// tests fill sendCh to capacity with nothing draining it (a bare,
+// unstarted mux) and verify the control-frame senders still return
+// immediately.
+
+func TestMux_SendPong_NotBlockedByFullSendCh(t *testing.T) {
+	mux := newBareTestMux()
+	for range cap(mux.sendCh) {
+		mux.sendCh <- NewDataFrame(1, []byte("x"))
+	}
+	require.Len(t, mux.sendCh, cap(mux.sendCh))
+
+	done := make(chan error, 1)
+	go func() { done <- mux.sendPong(42) }()
+
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("sendPong blocked on a full sendCh — control frames must use their own queue")
+	}
+}
+
+func TestMux_SendWindowUpdate_NotBlockedByFullSendCh(t *testing.T) {
+	mux := newBareTestMux()
+	for range cap(mux.sendCh) {
+		mux.sendCh <- NewDataFrame(1, []byte("x"))
+	}
+	require.Len(t, mux.sendCh, cap(mux.sendCh))
+
+	done := make(chan error, 1)
+	go func() { done <- mux.sendWindowUpdate(1, 4096) }()
+
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("sendWindowUpdate blocked on a full sendCh — control frames must use their own queue")
+	}
+}
+
+func TestMux_SendPing_NotBlockedByFullSendCh(t *testing.T) {
+	mux := newBareTestMux()
+	for range cap(mux.sendCh) {
+		mux.sendCh <- NewDataFrame(1, []byte("x"))
+	}
+	require.Len(t, mux.sendCh, cap(mux.sendCh))
+
+	done := make(chan error, 1)
+	go func() { done <- mux.sendPing() }()
+
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("sendPing blocked on a full sendCh — control frames must use their own queue")
+	}
+}
+
+// TestMux_Stress_BidirectionalSaturationDoesNotStallKeepAlive exercises
+// realistic load in both directions — many streams, aggressive
+// keep-alive, and a deliberately slow reader on half the streams — and
+// verifies neither side is ever killed by a spurious keep-alive timeout
+// and every byte still arrives. This is the end-to-end counterpart to
+// the unit tests above: it doesn't pin down the exact internal race, but
+// it's the shape of traffic that used to be able to starve control
+// frames before NDP-03 split the send queues.
+func TestMux_Stress_BidirectionalSaturationDoesNotStallKeepAlive(t *testing.T) {
+	clientConn, serverConn := testConn()
+
+	cfg := DefaultMuxConfig()
+	cfg.KeepAliveInterval = 20 * time.Millisecond
+	cfg.KeepAliveTimeout = 3 * time.Second // generous: only fails if truly stuck
+
+	serverMux, err := Server(serverConn, cfg)
+	require.NoError(t, err)
+	defer serverMux.Close()
+
+	clientMux, err := Client(clientConn, cfg)
+	require.NoError(t, err)
+	defer clientMux.Close()
+
+	const numStreams = 12
+	const payloadPerStream = 512 * 1024 // 512KB per stream
+
+	payload := bytes.Repeat([]byte("S"), payloadPerStream)
+
+	clientStreams := make([]*Stream, numStreams)
+	for i := range numStreams {
+		s, openErr := clientMux.OpenStream()
+		require.NoError(t, openErr)
+		clientStreams[i] = s
+	}
+
+	var wg sync.WaitGroup
+
+	for i := range numStreams {
+		idx := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sStream, acceptErr := serverMux.AcceptStream()
+			require.NoError(t, acceptErr)
+			defer sStream.Close()
+
+			// Half the streams delay before reading at all, so their
+			// peer's writes sit backlogged on send-window exhaustion for
+			// a while — real (not manually forced) queuing pressure.
+			if idx%2 == 0 {
+				time.Sleep(150 * time.Millisecond)
+			}
+
+			received := make([]byte, 0, payloadPerStream)
+			buf := make([]byte, 32*1024)
+			for len(received) < payloadPerStream {
+				n, readErr := sStream.Read(buf)
+				if n > 0 {
+					received = append(received, buf[:n]...)
+				}
+				if readErr != nil {
+					break
+				}
+			}
+			assert.Equal(t, payload, received, "stream %d must receive its full payload", idx)
+		}()
+	}
+
+	for i := range numStreams {
+		idx := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, writeErr := clientStreams[idx].Write(payload)
+			assert.NoError(t, writeErr, "stream %d write must eventually succeed", idx)
+		}()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("bidirectional saturation stress test did not complete — possible deadlock")
+	}
+
+	assert.False(t, clientMux.IsClosed(), "client mux must not have been killed by a spurious keep-alive timeout under load")
+	assert.False(t, serverMux.IsClosed(), "server mux must not have been killed by a spurious keep-alive timeout under load")
 }

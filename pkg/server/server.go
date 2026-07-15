@@ -143,6 +143,13 @@ type ClientSession struct {
 	// of the global activeDataStreams cap on ProxyService.
 	activeDataStreams int32
 
+	// activeControlStreams counts this client's own in-flight
+	// control-plane streams (register/ping/stats/close/P2P-offer),
+	// bounded by config.MaxControlStreamsPerClient — see
+	// Server.handleClientStreams. Independent of activeDataStreams,
+	// which only tracks data-plane traffic.
+	activeControlStreams int32
+
 	mu sync.Mutex
 }
 
@@ -902,6 +909,16 @@ func (s *Server) capabilities() []string {
 }
 
 // handleClientStreams handles streams from a client.
+//
+// Unlike data-plane streams (bounded by MaxConcurrentStreams/
+// MaxStreamsPerClient in proxyService), these are the client's own
+// control-plane requests — register/ping/stats/close/P2P-offer — over its
+// own relay Mux. Without a cap here, a compromised or buggy client could
+// open unbounded control streams on its own connection and exhaust server
+// goroutines/memory without ever touching the data-plane limits (NDP-06/
+// NA-01). A saturated client just has this stream dropped immediately
+// rather than queued, so the client sees a fast failure instead of
+// unbounded added latency.
 func (s *Server) handleClientStreams(client *ClientSession) {
 	for {
 		stream, err := client.Mux.AcceptStream()
@@ -912,7 +929,19 @@ func (s *Server) handleClientStreams(client *ClientSession) {
 			return
 		}
 
-		go s.handleClientStream(client, stream)
+		if s.config.MaxControlStreamsPerClient > 0 &&
+			!tryIncrementBounded32(&client.activeControlStreams, int32(s.config.MaxControlStreamsPerClient)) {
+			log.Warn().Str("client", client.ID).
+				Int("limit", s.config.MaxControlStreamsPerClient).
+				Msg("Control-plane stream limit reached for client, dropping stream")
+			_ = stream.Close()
+			continue
+		}
+
+		go func() {
+			defer atomic.AddInt32(&client.activeControlStreams, -1)
+			s.handleClientStream(client, stream)
+		}()
 	}
 }
 

@@ -8,8 +8,10 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"sync/atomic"
 
 	"golang.org/x/crypto/hkdf"
@@ -22,6 +24,23 @@ const (
 	// hkdfPunchInfo is the context string for hole-punch HMAC key derivation.
 	hkdfPunchInfo = "wormhole-punch-v1"
 )
+
+// replayWindowSize is the number of distinct nonce counters tracked for
+// anti-replay detection, i.e. how far behind the highest counter seen so
+// far a packet can still arrive and be accepted (as long as it wasn't
+// already seen). UDP delivery can reorder packets, and the ARQ layer above
+// this one retransmits, so the window is generous rather than tight —
+// 1024 comfortably covers realistic reordering/retransmission horizons
+// without meaningfully weakening replay protection (an attacker still
+// cannot replay anything more than 1024 sequence numbers old, or anything
+// already seen within that range).
+const replayWindowSize = 1024
+
+// ErrReplay is returned by Decrypt when the packet's nonce counter is a
+// replay: either an exact duplicate of one already accepted, or old enough
+// to fall outside the anti-replay window entirely. Either way the packet
+// is rejected without attempting authentication.
+var ErrReplay = errors.New("p2p: replayed or expired nonce counter")
 
 // KeyPair holds an ECDH X25519 key pair for key exchange.
 type KeyPair struct {
@@ -52,6 +71,21 @@ type SessionCipher struct {
 	punchKey []byte
 	// sendNonce is a monotonically increasing counter for nonce generation.
 	sendNonce uint64
+
+	// recvMu guards the anti-replay state below. Decrypt is called from a
+	// single reader goroutine per UDPMux in practice, but the lock makes
+	// that an implementation detail rather than a correctness requirement.
+	recvMu sync.Mutex
+	// recvHighest is the highest nonce counter successfully authenticated
+	// so far; 0 means no packet has been accepted yet (sendNonce/counters
+	// always start at 1, so 0 is a safe "unset" sentinel).
+	recvHighest uint64
+	// recvSlots[counter % replayWindowSize] == counter records that
+	// counter has already been accepted. Because the valid window is
+	// exactly replayWindowSize wide, every counter within it maps to a
+	// distinct slot, so a stale value left over from many cycles ago can
+	// never be mistaken for a real duplicate — see checkReplay.
+	recvSlots [replayWindowSize]uint64
 }
 
 // DeriveSession performs ECDH key agreement and derives session keys.
@@ -133,6 +167,15 @@ func (sc *SessionCipher) EncryptInto(dst, plaintext []byte) ([]byte, error) {
 
 // Decrypt decrypts data produced by Encrypt.
 // Input format: [8-byte nonce counter][GCM ciphertext+tag].
+//
+// Before attempting authentication, the nonce counter is checked against
+// the anti-replay window (see checkReplay): a counter that's either an
+// exact duplicate of one already accepted, or too old to be within the
+// window at all, is rejected immediately with ErrReplay. The counter is
+// only recorded as seen (markReceived) *after* GCM authentication
+// succeeds — checking first but marking last means a spoofed packet with
+// a garbage tag can never "burn" a legitimate counter's slot and cause a
+// genuine retransmission of that packet to be dropped as a false replay.
 func (sc *SessionCipher) Decrypt(data []byte) ([]byte, error) {
 	if len(data) < 8+sc.aead.Overhead() {
 		return nil, fmt.Errorf("ciphertext too short")
@@ -140,6 +183,13 @@ func (sc *SessionCipher) Decrypt(data []byte) ([]byte, error) {
 
 	// Extract counter and reconstruct nonce.
 	counter := binary.BigEndian.Uint64(data[:8])
+	if counter == 0 {
+		return nil, fmt.Errorf("%w: zero counter is never valid", ErrReplay)
+	}
+	if !sc.checkReplay(counter) {
+		return nil, ErrReplay
+	}
+
 	nonce := buildNonce(sc.aead.NonceSize(), counter)
 
 	// Decrypt and authenticate.
@@ -148,7 +198,35 @@ func (sc *SessionCipher) Decrypt(data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("GCM decrypt: %w", err)
 	}
 
+	sc.markReceived(counter)
+
 	return plaintext, nil
+}
+
+// checkReplay reports whether counter is acceptable: not older than the
+// anti-replay window relative to the highest counter accepted so far, and
+// not an exact duplicate of one already accepted within that window.
+func (sc *SessionCipher) checkReplay(counter uint64) bool {
+	sc.recvMu.Lock()
+	defer sc.recvMu.Unlock()
+
+	if sc.recvHighest >= replayWindowSize && counter+replayWindowSize <= sc.recvHighest {
+		return false // too far behind the window
+	}
+	return sc.recvSlots[counter%replayWindowSize] != counter
+}
+
+// markReceived records counter as accepted and advances recvHighest if it
+// is the new high-water mark. Callers must only call this after the
+// packet carrying counter has been successfully authenticated.
+func (sc *SessionCipher) markReceived(counter uint64) {
+	sc.recvMu.Lock()
+	defer sc.recvMu.Unlock()
+
+	sc.recvSlots[counter%replayWindowSize] = counter
+	if counter > sc.recvHighest {
+		sc.recvHighest = counter
+	}
 }
 
 // Overhead returns the total byte overhead added by encryption.

@@ -240,6 +240,114 @@ func TestSessionCipher_EncryptInto_DoesNotCorruptCallerPrefix(t *testing.T) {
 	assert.Equal(t, []byte{0xDE, 0xAD, 0xBE, 0xEF}, out[:4])
 }
 
+// TestSessionCipher_Decrypt_RejectsExactReplay verifies that decrypting
+// the exact same ciphertext twice — an attacker capturing and replaying a
+// packet verbatim — succeeds the first time and is rejected the second
+// (NDP-02 anti-replay window).
+func TestSessionCipher_Decrypt_RejectsExactReplay(t *testing.T) {
+	kpA, _ := GenerateKeyPair()
+	kpB, _ := GenerateKeyPair()
+	cipherA, _ := DeriveSession(kpA.Private, kpB.Public)
+	cipherB, _ := DeriveSession(kpB.Private, kpA.Public)
+
+	ciphertext, err := cipherA.Encrypt([]byte("replay me if you can"))
+	require.NoError(t, err)
+
+	_, err = cipherB.Decrypt(ciphertext)
+	require.NoError(t, err, "first decrypt of a fresh packet must succeed")
+
+	_, err = cipherB.Decrypt(ciphertext)
+	assert.ErrorIs(t, err, ErrReplay, "replaying the exact same packet must be rejected")
+}
+
+// TestSessionCipher_Decrypt_AllowsOutOfOrderWithinWindow verifies that
+// packets arriving out of order (a common UDP occurrence) are still
+// accepted as long as they're within the anti-replay window and haven't
+// been seen before — the window must not require strictly increasing
+// counters.
+func TestSessionCipher_Decrypt_AllowsOutOfOrderWithinWindow(t *testing.T) {
+	kpA, _ := GenerateKeyPair()
+	kpB, _ := GenerateKeyPair()
+	cipherA, _ := DeriveSession(kpA.Private, kpB.Public)
+	cipherB, _ := DeriveSession(kpB.Private, kpA.Public)
+
+	var cts [][]byte
+	for i := 0; i < 5; i++ {
+		ct, encErr := cipherA.Encrypt([]byte("packet"))
+		require.NoError(t, encErr)
+		cts = append(cts, ct)
+	}
+
+	// Deliver out of order: 3, 1, 2, 5, 4 (1-indexed).
+	order := []int{2, 0, 1, 4, 3}
+	for _, idx := range order {
+		_, decErr := cipherB.Decrypt(cts[idx])
+		assert.NoError(t, decErr, "out-of-order packet %d within window must be accepted", idx)
+	}
+
+	// Now replaying any of them must fail.
+	for _, idx := range order {
+		_, decErr := cipherB.Decrypt(cts[idx])
+		assert.ErrorIs(t, decErr, ErrReplay)
+	}
+}
+
+// TestSessionCipher_Decrypt_RejectsTooOld verifies that a packet whose
+// counter falls further behind the highest counter accepted so far than
+// replayWindowSize is rejected outright, even if it was never actually
+// seen before — protecting against an attacker who captured a very old
+// packet and replays it long after the window has moved on.
+func TestSessionCipher_Decrypt_RejectsTooOld(t *testing.T) {
+	kpA, _ := GenerateKeyPair()
+	kpB, _ := GenerateKeyPair()
+	cipherA, _ := DeriveSession(kpA.Private, kpB.Public)
+	cipherB, _ := DeriveSession(kpB.Private, kpA.Public)
+
+	// The very first packet ever sent (counter 1).
+	firstCt, err := cipherA.Encrypt([]byte("ancient packet"))
+	require.NoError(t, err)
+
+	// Advance far past the window so counter 1 falls out of range.
+	for i := 0; i < replayWindowSize+10; i++ {
+		ct, encErr := cipherA.Encrypt([]byte("filler"))
+		require.NoError(t, encErr)
+		_, decErr := cipherB.Decrypt(ct)
+		require.NoError(t, decErr)
+	}
+
+	_, err = cipherB.Decrypt(firstCt)
+	assert.ErrorIs(t, err, ErrReplay, "a packet older than the anti-replay window must be rejected")
+}
+
+// TestSessionCipher_Decrypt_ForgedTagNeverBurnsSlot verifies that a
+// tampered packet — one that passes the replay pre-check (fresh counter)
+// but fails GCM authentication — never marks its counter as seen. This
+// matters because otherwise an attacker could forge packets with the
+// counters of not-yet-delivered legitimate packets to make the receiver
+// discard the real retransmission as a false replay.
+func TestSessionCipher_Decrypt_ForgedTagNeverBurnsSlot(t *testing.T) {
+	kpA, _ := GenerateKeyPair()
+	kpB, _ := GenerateKeyPair()
+	cipherA, _ := DeriveSession(kpA.Private, kpB.Public)
+	cipherB, _ := DeriveSession(kpB.Private, kpA.Public)
+
+	ciphertext, err := cipherA.Encrypt([]byte("legitimate payload"))
+	require.NoError(t, err)
+
+	// Forge a packet with the same counter prefix but a corrupted tag.
+	forged := make([]byte, len(ciphertext))
+	copy(forged, ciphertext)
+	forged[len(forged)-1] ^= 0xFF
+
+	_, err = cipherB.Decrypt(forged)
+	require.Error(t, err, "forged tag must fail authentication")
+	assert.NotErrorIs(t, err, ErrReplay, "a forged packet fails auth, not the replay check")
+
+	// The genuine packet with the same counter must still be accepted.
+	_, err = cipherB.Decrypt(ciphertext)
+	assert.NoError(t, err, "a forged packet must not have burned the legitimate packet's counter slot")
+}
+
 func TestDeriveSession_InvalidPublicKey(t *testing.T) {
 	kpA, _ := GenerateKeyPair()
 
@@ -708,7 +816,6 @@ func BenchmarkDecrypt(b *testing.B) {
 	kpA, _ := GenerateKeyPair()
 	kpB, _ := GenerateKeyPair()
 	cipherA, _ := DeriveSession(kpA.Private, kpB.Public)
-	cipherB, _ := DeriveSession(kpB.Private, kpA.Public)
 
 	sizes := []struct {
 		name string
@@ -721,13 +828,26 @@ func BenchmarkDecrypt(b *testing.B) {
 
 	for _, s := range sizes {
 		plaintext := make([]byte, s.size)
-		ct, _ := cipherA.Encrypt(plaintext)
 
 		b.Run(s.name, func(b *testing.B) {
+			// The anti-replay window (NDP-02) rejects a nonce counter it's
+			// already seen, so decrypting one fixed ciphertext b.N times
+			// would only measure the window's fast-reject path after the
+			// first iteration. Pre-encrypt one distinct ciphertext per
+			// iteration instead, so every decrypt does real GCM
+			// authentication work — matching realistic traffic where each
+			// packet carries its own counter.
+			cipherB, _ := DeriveSession(kpB.Private, kpA.Public)
+			cts := make([][]byte, b.N)
+			for i := 0; i < b.N; i++ {
+				cts[i], _ = cipherA.Encrypt(plaintext)
+			}
+
 			b.SetBytes(int64(s.size))
 			b.ReportAllocs()
+			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				_, _ = cipherB.Decrypt(ct)
+				_, _ = cipherB.Decrypt(cts[i])
 			}
 		})
 	}

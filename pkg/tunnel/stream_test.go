@@ -12,6 +12,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// newBareTestMux builds a minimal, unstarted Mux for stream-level unit
+// tests that talk to it directly (no real conn, no recvLoop/sendLoop
+// goroutines). It must initialize every channel a Stream method might
+// send on — ctrlCh in particular, since sendWindowUpdate/sendPing/
+// sendPong/sendHandshake/sendClose/sendError all target it (see mux.go's
+// sendLoop doc comment) — otherwise a send on a nil channel blocks
+// forever with nothing draining it in these unstarted-mux tests.
+func newBareTestMux() *Mux {
+	return &Mux{
+		streams:    make(map[uint32]*Stream),
+		closeCh:    make(chan struct{}),
+		sendCh:     make(chan *Frame, 64),
+		ctrlCh:     make(chan *Frame, 64),
+		config:     DefaultMuxConfig(),
+		codec:      NewFrameCodec(),
+		streamLock: sync.RWMutex{},
+	}
+}
+
 func TestRingBuffer_Basic(t *testing.T) {
 	rb := newRingBuffer(10)
 
@@ -157,28 +176,14 @@ func TestRemoteError(t *testing.T) {
 
 func TestStream_ID(t *testing.T) {
 	// Create a mock mux
-	mux := &Mux{
-		streams:    make(map[uint32]*Stream),
-		closeCh:    make(chan struct{}),
-		sendCh:     make(chan *Frame, 64),
-		config:     DefaultMuxConfig(),
-		codec:      NewFrameCodec(),
-		streamLock: sync.RWMutex{},
-	}
+	mux := newBareTestMux()
 
 	s := newStream(42, DefaultStreamConfig(), mux)
 	assert.Equal(t, uint32(42), s.ID())
 }
 
 func TestStream_IsClosed(t *testing.T) {
-	mux := &Mux{
-		streams:    make(map[uint32]*Stream),
-		closeCh:    make(chan struct{}),
-		sendCh:     make(chan *Frame, 64),
-		config:     DefaultMuxConfig(),
-		codec:      NewFrameCodec(),
-		streamLock: sync.RWMutex{},
-	}
+	mux := newBareTestMux()
 	mux.streams[1] = nil // Prevent nil pointer
 
 	s := newStream(1, DefaultStreamConfig(), mux)
@@ -190,14 +195,7 @@ func TestStream_IsClosed(t *testing.T) {
 }
 
 func TestStream_SetDeadline(t *testing.T) {
-	mux := &Mux{
-		streams:    make(map[uint32]*Stream),
-		closeCh:    make(chan struct{}),
-		sendCh:     make(chan *Frame, 64),
-		config:     DefaultMuxConfig(),
-		codec:      NewFrameCodec(),
-		streamLock: sync.RWMutex{},
-	}
+	mux := newBareTestMux()
 
 	s := newStream(1, DefaultStreamConfig(), mux)
 	deadline := time.Now().Add(1 * time.Second)
@@ -210,14 +208,7 @@ func TestStream_SetDeadline(t *testing.T) {
 }
 
 func TestStream_ReceiveData(t *testing.T) {
-	mux := &Mux{
-		streams:    make(map[uint32]*Stream),
-		closeCh:    make(chan struct{}),
-		sendCh:     make(chan *Frame, 64),
-		config:     DefaultMuxConfig(),
-		codec:      NewFrameCodec(),
-		streamLock: sync.RWMutex{},
-	}
+	mux := newBareTestMux()
 
 	s := newStream(1, DefaultStreamConfig(), mux)
 
@@ -243,14 +234,7 @@ func TestStream_ReceiveData(t *testing.T) {
 }
 
 func TestStream_ReceiveClose(t *testing.T) {
-	mux := &Mux{
-		streams:    make(map[uint32]*Stream),
-		closeCh:    make(chan struct{}),
-		sendCh:     make(chan *Frame, 64),
-		config:     DefaultMuxConfig(),
-		codec:      NewFrameCodec(),
-		streamLock: sync.RWMutex{},
-	}
+	mux := newBareTestMux()
 
 	s := newStream(1, DefaultStreamConfig(), mux)
 
@@ -278,14 +262,7 @@ func TestStream_ReceiveClose(t *testing.T) {
 }
 
 func TestStream_ReceiveError(t *testing.T) {
-	mux := &Mux{
-		streams:    make(map[uint32]*Stream),
-		closeCh:    make(chan struct{}),
-		sendCh:     make(chan *Frame, 64),
-		config:     DefaultMuxConfig(),
-		codec:      NewFrameCodec(),
-		streamLock: sync.RWMutex{},
-	}
+	mux := newBareTestMux()
 
 	s := newStream(1, DefaultStreamConfig(), mux)
 
@@ -315,14 +292,7 @@ func TestStream_ReceiveError(t *testing.T) {
 }
 
 func TestStream_ReceiveWindowUpdate(t *testing.T) {
-	mux := &Mux{
-		streams:    make(map[uint32]*Stream),
-		closeCh:    make(chan struct{}),
-		sendCh:     make(chan *Frame, 64),
-		config:     DefaultMuxConfig(),
-		codec:      NewFrameCodec(),
-		streamLock: sync.RWMutex{},
-	}
+	mux := newBareTestMux()
 
 	s := newStream(1, DefaultStreamConfig(), mux)
 	initialWindow := s.sendWindow
@@ -332,14 +302,7 @@ func TestStream_ReceiveWindowUpdate(t *testing.T) {
 }
 
 func TestStream_Done(t *testing.T) {
-	mux := &Mux{
-		streams:    make(map[uint32]*Stream),
-		closeCh:    make(chan struct{}),
-		sendCh:     make(chan *Frame, 64),
-		config:     DefaultMuxConfig(),
-		codec:      NewFrameCodec(),
-		streamLock: sync.RWMutex{},
-	}
+	mux := newBareTestMux()
 	mux.streams[1] = nil
 
 	s := newStream(1, DefaultStreamConfig(), mux)
@@ -365,14 +328,7 @@ func TestStream_Done(t *testing.T) {
 }
 
 func TestStream_ReadEmptyBuffer(t *testing.T) {
-	mux := &Mux{
-		streams:    make(map[uint32]*Stream),
-		closeCh:    make(chan struct{}),
-		sendCh:     make(chan *Frame, 64),
-		config:     DefaultMuxConfig(),
-		codec:      NewFrameCodec(),
-		streamLock: sync.RWMutex{},
-	}
+	mux := newBareTestMux()
 
 	s := newStream(1, DefaultStreamConfig(), mux)
 
@@ -387,14 +343,7 @@ func TestStream_ReadEmptyBuffer(t *testing.T) {
 }
 
 func TestStream_WriteEmptyBuffer(t *testing.T) {
-	mux := &Mux{
-		streams:    make(map[uint32]*Stream),
-		closeCh:    make(chan struct{}),
-		sendCh:     make(chan *Frame, 64),
-		config:     DefaultMuxConfig(),
-		codec:      NewFrameCodec(),
-		streamLock: sync.RWMutex{},
-	}
+	mux := newBareTestMux()
 
 	s := newStream(1, DefaultStreamConfig(), mux)
 
@@ -409,14 +358,7 @@ func TestStream_WriteEmptyBuffer(t *testing.T) {
 }
 
 func TestStream_ReadTimeout(t *testing.T) {
-	mux := &Mux{
-		streams:    make(map[uint32]*Stream),
-		closeCh:    make(chan struct{}),
-		sendCh:     make(chan *Frame, 64),
-		config:     DefaultMuxConfig(),
-		codec:      NewFrameCodec(),
-		streamLock: sync.RWMutex{},
-	}
+	mux := newBareTestMux()
 
 	s := newStream(1, DefaultStreamConfig(), mux)
 	s.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
@@ -436,14 +378,7 @@ func TestStream_ReadTimeout(t *testing.T) {
 // for data, instead of only being interruptible via SetReadDeadline or
 // closing the stream/mux.
 func TestStream_ReadContext_CancelUnblocks(t *testing.T) {
-	mux := &Mux{
-		streams:    make(map[uint32]*Stream),
-		closeCh:    make(chan struct{}),
-		sendCh:     make(chan *Frame, 64),
-		config:     DefaultMuxConfig(),
-		codec:      NewFrameCodec(),
-		streamLock: sync.RWMutex{},
-	}
+	mux := newBareTestMux()
 
 	s := newStream(1, DefaultStreamConfig(), mux)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -472,14 +407,7 @@ func TestStream_ReadContext_CancelUnblocks(t *testing.T) {
 // TestStream_ReadContext_AlreadyCanceled verifies that ReadContext returns
 // immediately without blocking when ctx is canceled up front.
 func TestStream_ReadContext_AlreadyCanceled(t *testing.T) {
-	mux := &Mux{
-		streams:    make(map[uint32]*Stream),
-		closeCh:    make(chan struct{}),
-		sendCh:     make(chan *Frame, 64),
-		config:     DefaultMuxConfig(),
-		codec:      NewFrameCodec(),
-		streamLock: sync.RWMutex{},
-	}
+	mux := newBareTestMux()
 
 	s := newStream(1, DefaultStreamConfig(), mux)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -496,14 +424,7 @@ func TestStream_ReadContext_AlreadyCanceled(t *testing.T) {
 // no watcher goroutine is spawned (Done() is nil) and
 // data already in the buffer is returned normally.
 func TestStream_ReadContext_BackgroundStillWorks(t *testing.T) {
-	mux := &Mux{
-		streams:    make(map[uint32]*Stream),
-		closeCh:    make(chan struct{}),
-		sendCh:     make(chan *Frame, 64),
-		config:     DefaultMuxConfig(),
-		codec:      NewFrameCodec(),
-		streamLock: sync.RWMutex{},
-	}
+	mux := newBareTestMux()
 
 	s := newStream(1, DefaultStreamConfig(), mux)
 	require.NoError(t, s.receiveData([]byte("hello")))
@@ -518,14 +439,7 @@ func TestStream_ReadContext_BackgroundStillWorks(t *testing.T) {
 // returns ctx.Err() promptly when ctx is canceled while blocked
 // waiting for send-window space to free up.
 func TestStream_WriteContext_CancelUnblocks(t *testing.T) {
-	mux := &Mux{
-		streams:    make(map[uint32]*Stream),
-		closeCh:    make(chan struct{}),
-		sendCh:     make(chan *Frame, 64),
-		config:     DefaultMuxConfig(),
-		codec:      NewFrameCodec(),
-		streamLock: sync.RWMutex{},
-	}
+	mux := newBareTestMux()
 
 	// Zero-size window: Write blocks immediately waiting for space, and
 	// nothing here ever grants any, so mux.sendData is never invoked.
@@ -561,7 +475,6 @@ func TestStream_WriteTimeout(t *testing.T) {
 	cfg.KeepAliveInterval = 0
 	// Use a very small window so it drains quickly.
 	cfg.StreamConfig.WindowSize = 64
-	cfg.EnableFlowControl = true
 
 	serverMux, err := Server(serverConn, cfg)
 	require.NoError(t, err)
@@ -669,14 +582,7 @@ func TestStream_WriteAfterMuxClose(t *testing.T) {
 // TestStream_ReceiveClose_AlreadyClosed verifies that receiveClose
 // is a no-op when the stream is already in streamStateClosed.
 func TestStream_ReceiveClose_AlreadyClosed(t *testing.T) {
-	mux := &Mux{
-		streams:    make(map[uint32]*Stream),
-		closeCh:    make(chan struct{}),
-		sendCh:     make(chan *Frame, 64),
-		config:     DefaultMuxConfig(),
-		codec:      NewFrameCodec(),
-		streamLock: sync.RWMutex{},
-	}
+	mux := newBareTestMux()
 	mux.streams[1] = nil
 
 	s := newStream(1, DefaultStreamConfig(), mux)
@@ -692,14 +598,7 @@ func TestStream_ReceiveClose_AlreadyClosed(t *testing.T) {
 // TestStream_ReceiveClose_FromLocalClose verifies that receiveClose
 // transitions from streamStateLocalClose to streamStateClosed.
 func TestStream_ReceiveClose_FromLocalClose(t *testing.T) {
-	mux := &Mux{
-		streams:    make(map[uint32]*Stream),
-		closeCh:    make(chan struct{}),
-		sendCh:     make(chan *Frame, 64),
-		config:     DefaultMuxConfig(),
-		codec:      NewFrameCodec(),
-		streamLock: sync.RWMutex{},
-	}
+	mux := newBareTestMux()
 	mux.streams[1] = nil
 
 	s := newStream(1, DefaultStreamConfig(), mux)
@@ -715,14 +614,7 @@ func TestStream_ReceiveClose_FromLocalClose(t *testing.T) {
 // TestStream_ReceiveData_ClosedStream verifies that receiveData returns
 // ErrStreamClosed when the stream is already closed.
 func TestStream_ReceiveData_ClosedStream(t *testing.T) {
-	mux := &Mux{
-		streams:    make(map[uint32]*Stream),
-		closeCh:    make(chan struct{}),
-		sendCh:     make(chan *Frame, 64),
-		config:     DefaultMuxConfig(),
-		codec:      NewFrameCodec(),
-		streamLock: sync.RWMutex{},
-	}
+	mux := newBareTestMux()
 
 	s := newStream(1, DefaultStreamConfig(), mux)
 	s.state = streamStateClosed
@@ -733,14 +625,7 @@ func TestStream_ReceiveData_ClosedStream(t *testing.T) {
 
 // TestStream_ReceiveData_Empty verifies that empty data is a no-op.
 func TestStream_ReceiveData_Empty(t *testing.T) {
-	mux := &Mux{
-		streams:    make(map[uint32]*Stream),
-		closeCh:    make(chan struct{}),
-		sendCh:     make(chan *Frame, 64),
-		config:     DefaultMuxConfig(),
-		codec:      NewFrameCodec(),
-		streamLock: sync.RWMutex{},
-	}
+	mux := newBareTestMux()
 
 	s := newStream(1, DefaultStreamConfig(), mux)
 

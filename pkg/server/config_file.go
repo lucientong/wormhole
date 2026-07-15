@@ -57,10 +57,11 @@ type FileConfig struct {
 		Auth     string `yaml:"auth"`
 	} `yaml:"timeouts"`
 
-	MaxClients           int `yaml:"max_clients"`
-	MaxTunnelsPerClient  int `yaml:"max_tunnels_per_client"`
-	MaxConcurrentStreams int `yaml:"max_concurrent_streams"`
-	MaxStreamsPerClient  int `yaml:"max_streams_per_client"`
+	MaxClients                 int `yaml:"max_clients"`
+	MaxTunnelsPerClient        int `yaml:"max_tunnels_per_client"`
+	MaxConcurrentStreams       int `yaml:"max_concurrent_streams"`
+	MaxStreamsPerClient        int `yaml:"max_streams_per_client"`
+	MaxControlStreamsPerClient int `yaml:"max_control_streams_per_client"`
 
 	RequireAuth bool     `yaml:"require_auth"`
 	AuthTokens  []string `yaml:"auth_tokens"`
@@ -238,6 +239,7 @@ func (fc *FileConfig) applyLimitsAndAuth(cfg *Config) {
 	overrideInt(&cfg.MaxTunnelsPerClient, fc.MaxTunnelsPerClient)
 	overrideInt(&cfg.MaxConcurrentStreams, fc.MaxConcurrentStreams)
 	overrideInt(&cfg.MaxStreamsPerClient, fc.MaxStreamsPerClient)
+	overrideInt(&cfg.MaxControlStreamsPerClient, fc.MaxControlStreamsPerClient)
 
 	if fc.RequireAuth {
 		cfg.RequireAuth = true

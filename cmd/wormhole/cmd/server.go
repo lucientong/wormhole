@@ -18,38 +18,39 @@ import (
 const defaultDomain = "localhost"
 
 var (
-	serverPort               int
-	serverHost               string
-	serverDomain             string
-	serverTLSEnabled         bool
-	serverTLSCert            string
-	serverTLSKey             string
-	serverHTTPPort           int
-	serverAdminPort          int
-	serverRequireAuth        bool
-	serverAuthTokens         []string
-	serverAuthSecret         string
-	serverAdminToken         string
-	serverPersistence        string
-	serverPersistencePath    string
-	serverTunnelTLS          bool
-	serverAdminHost          string
-	serverMaxClients         int
-	serverMaxTunnelsPerCli   int
-	serverMaxConcurrentStrms int
-	serverMaxStreamsPerCli   int
-	serverShutdownTimeout    time.Duration
-	serverMinClientVersion   string
-	serverConfigFile         string
-	serverAuditEnabled       bool
-	serverAuditPersistence   string
-	serverAuditPath          string
-	serverAuditBufferSize    int
-	serverAuditRetentionDays int
-	serverOIDCIssuer         string
-	serverOIDCClientID       string
-	serverOIDCTeamClaim      string
-	serverOIDCRoleClaim      string
+	serverPort                 int
+	serverHost                 string
+	serverDomain               string
+	serverTLSEnabled           bool
+	serverTLSCert              string
+	serverTLSKey               string
+	serverHTTPPort             int
+	serverAdminPort            int
+	serverRequireAuth          bool
+	serverAuthTokens           []string
+	serverAuthSecret           string
+	serverAdminToken           string
+	serverPersistence          string
+	serverPersistencePath      string
+	serverTunnelTLS            bool
+	serverAdminHost            string
+	serverMaxClients           int
+	serverMaxTunnelsPerCli     int
+	serverMaxConcurrentStrms   int
+	serverMaxStreamsPerCli     int
+	serverMaxCtrlStreamsPerCli int
+	serverShutdownTimeout      time.Duration
+	serverMinClientVersion     string
+	serverConfigFile           string
+	serverAuditEnabled         bool
+	serverAuditPersistence     string
+	serverAuditPath            string
+	serverAuditBufferSize      int
+	serverAuditRetentionDays   int
+	serverOIDCIssuer           string
+	serverOIDCClientID         string
+	serverOIDCTeamClaim        string
+	serverOIDCRoleClaim        string
 
 	// Cluster / HA flags.
 	serverClusterNodeID        string
@@ -129,6 +130,7 @@ func init() {
 	serverCmd.Flags().IntVar(&serverMaxTunnelsPerCli, "max-tunnels-per-client", 0, "Maximum tunnels per client (0 = unlimited)")
 	serverCmd.Flags().IntVar(&serverMaxConcurrentStrms, "max-concurrent-streams", 10000, "Maximum concurrent data-plane streams (HTTP/WebSocket/TCP) across all clients; saturating returns 503/drops the connection instead of queuing (0 = unlimited)")
 	serverCmd.Flags().IntVar(&serverMaxStreamsPerCli, "max-streams-per-client", 500, "Maximum concurrent data-plane streams for a single client, independent of --max-concurrent-streams (0 = unlimited)")
+	serverCmd.Flags().IntVar(&serverMaxCtrlStreamsPerCli, "max-control-streams-per-client", 128, "Maximum concurrent control-plane streams (register/ping/stats/close/P2P-offer) for a single client's own connection (0 = unlimited)")
 	serverCmd.Flags().DurationVar(&serverShutdownTimeout, "shutdown-timeout", 15*time.Second, "How long to wait for in-flight HTTP/admin requests to finish on shutdown before forcing them closed")
 	serverCmd.Flags().StringVar(&serverMinClientVersion, "min-client-version", "", "Reject clients reporting an older semantic version, e.g. 0.6.0 (default: disabled). Clients with a non-semver version (e.g. dev builds) are never rejected")
 	serverCmd.Flags().BoolVar(&serverAuditEnabled, "audit", false, "Enable structured audit logging")
@@ -229,6 +231,7 @@ func buildServerConfig(cmd *cobra.Command) server.Config {
 	config.MaxTunnelsPerClient = serverMaxTunnelsPerCli
 	config.MaxConcurrentStreams = serverMaxConcurrentStrms
 	config.MaxStreamsPerClient = serverMaxStreamsPerCli
+	config.MaxControlStreamsPerClient = serverMaxCtrlStreamsPerCli
 	config.ShutdownTimeout = serverShutdownTimeout
 	config.MinClientVersion = serverMinClientVersion
 

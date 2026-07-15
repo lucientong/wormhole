@@ -28,9 +28,6 @@ type MuxConfig struct {
 
 	// MaxFrameSize is the maximum frame size.
 	MaxFrameSize uint32
-
-	// EnableFlowControl enables flow control.
-	EnableFlowControl bool
 }
 
 // DefaultMuxConfig returns the default multiplexer configuration.
@@ -41,7 +38,6 @@ func DefaultMuxConfig() MuxConfig {
 		KeepAliveInterval: 30 * time.Second,
 		KeepAliveTimeout:  10 * time.Second,
 		MaxFrameSize:      DefaultFramePayloadSize,
-		EnableFlowControl: true,
 	}
 }
 
@@ -64,8 +60,14 @@ type Mux struct {
 	closeErr error
 	closeMu  sync.Mutex
 
-	// Send queue
-	sendCh   chan *Frame
+	// Send queues. DATA frames (bulk, potentially large volume) and
+	// control frames (WINDOW_UPDATE/PING/PONG/HANDSHAKE/ERROR, small and
+	// latency-sensitive) are kept in a separate channel — see sendLoop for
+	// why sharing one queue between them is a deadlock risk. CLOSE stays on
+	// sendCh (with DATA) because it must never overtake a stream's own
+	// still-queued data frames — see sendClose.
+	sendCh   chan *Frame // DATA and CLOSE frames, per-stream order matters
+	ctrlCh   chan *Frame // WINDOW_UPDATE/PING/PONG/HANDSHAKE/ERROR
 	sendLock sync.Mutex
 
 	// Keep-alive
@@ -111,6 +113,7 @@ func newMux(conn net.Conn, config MuxConfig, isClient bool) (*Mux, error) {
 		isClient: isClient,
 		closeCh:  make(chan struct{}),
 		sendCh:   make(chan *Frame, 64),
+		ctrlCh:   make(chan *Frame, 64),
 		pongCh:   make(chan uint32, 4),
 	}
 	m.dataBufPool.New = func() any {
@@ -432,9 +435,44 @@ func (m *Mux) handleError(f *Frame) error {
 }
 
 // sendLoop handles outgoing frames.
+//
+// Control frames (ctrlCh) are always drained ahead of data frames
+// (sendCh): a WINDOW_UPDATE that unblocks the peer's flow control, or a
+// PONG that answers a keep-alive PING, must never sit queued behind a
+// backlog of bulk DATA frames. Without this priority, a connection
+// saturated with data in both directions could deadlock — this side's
+// recvLoop calls sendPong synchronously from handlePing, and if that send
+// blocked on a full shared queue, recvLoop would stop draining the
+// socket, which stalls the peer's writes via TCP backpressure, which
+// stalls the peer's own recvLoop the same way, and so on. Giving control
+// frames their own queue (checked first, and never so backlogged that
+// sendPong/sendWindowUpdate block for long) keeps recvLoop always able to
+// make progress regardless of how much data is queued.
 func (m *Mux) sendLoop() {
 	for {
+		// Opportunistically drain any already-queued control frames
+		// before considering data frames, so a control frame enqueued
+		// while sendCh was being serviced doesn't wait behind it.
 		select {
+		case frame := <-m.ctrlCh:
+			if err := m.writeFrame(frame); err != nil {
+				if !m.IsClosed() {
+					_ = m.closeWithError(fmt.Errorf("write frame: %w", err))
+				}
+				return
+			}
+			continue
+		default:
+		}
+
+		select {
+		case frame := <-m.ctrlCh:
+			if err := m.writeFrame(frame); err != nil {
+				if !m.IsClosed() {
+					_ = m.closeWithError(fmt.Errorf("write frame: %w", err))
+				}
+				return
+			}
 		case frame := <-m.sendCh:
 			if err := m.writeFrame(frame); err != nil {
 				if !m.IsClosed() {
@@ -564,7 +602,10 @@ func (m *Mux) sendData(streamID uint32, data []byte) error {
 	}
 }
 
-// sendWindowUpdate sends a window update frame.
+// sendWindowUpdate sends a window update frame. Routed through ctrlCh (see
+// sendLoop) so it's never stuck behind a backlog of bulk DATA frames —
+// this is what actually unblocks the peer's Stream.WriteContext, so a
+// delay here directly delays the peer's throughput.
 func (m *Mux) sendWindowUpdate(streamID uint32, increment uint32) error {
 	if m.IsClosed() {
 		return ErrMuxClosed
@@ -572,7 +613,7 @@ func (m *Mux) sendWindowUpdate(streamID uint32, increment uint32) error {
 
 	frame := NewWindowUpdateFrame(streamID, increment)
 	select {
-	case m.sendCh <- frame:
+	case m.ctrlCh <- frame:
 		return nil
 	case <-m.closeCh:
 		return m.getCloseErr()
@@ -580,6 +621,12 @@ func (m *Mux) sendWindowUpdate(streamID uint32, increment uint32) error {
 }
 
 // sendClose sends a close frame.
+//
+// This intentionally goes on sendCh, not ctrlCh: CLOSE marks the end of a
+// stream's data, so it must be delivered after every DATA frame already
+// queued for that stream. Sending it on the prioritized ctrlCh would let it
+// overtake still-buffered DATA frames and the peer would see EOF before all
+// bytes arrived.
 func (m *Mux) sendClose(streamID uint32) error { //nolint:unparam // error return reserved for future use
 	if m.IsClosed() {
 		return nil
@@ -613,7 +660,7 @@ func (m *Mux) sendHandshake(streamID uint32) error {
 
 	frame := NewFrame(FrameHandshake, streamID, nil)
 	select {
-	case m.sendCh <- frame:
+	case m.ctrlCh <- frame:
 		return nil
 	case <-m.closeCh:
 		return m.getCloseErr()
@@ -630,14 +677,18 @@ func (m *Mux) sendPing() error {
 
 	frame := NewPingFrame(pingID)
 	select {
-	case m.sendCh <- frame:
+	case m.ctrlCh <- frame:
 		return nil
 	case <-m.closeCh:
 		return m.getCloseErr()
 	}
 }
 
-// sendPong sends a pong (ping response) frame.
+// sendPong sends a pong (ping response) frame. This is called
+// synchronously from recvLoop's handlePing, so it's routed through ctrlCh
+// (small, kept well-drained by sendLoop's priority) rather than sendCh —
+// see sendLoop's doc comment for why a shared queue here is a deadlock
+// risk: if this blocked, recvLoop would stop draining the socket.
 func (m *Mux) sendPong(pingID uint32) error {
 	if m.IsClosed() {
 		return nil
@@ -645,7 +696,7 @@ func (m *Mux) sendPong(pingID uint32) error {
 
 	frame := NewPongFrame(pingID)
 	select {
-	case m.sendCh <- frame:
+	case m.ctrlCh <- frame:
 		return nil
 	case <-m.closeCh:
 		return nil
@@ -660,7 +711,7 @@ func (m *Mux) sendError(streamID uint32, code uint32, message string) error {
 
 	frame := NewErrorFrame(streamID, code, message)
 	select {
-	case m.sendCh <- frame:
+	case m.ctrlCh <- frame:
 		return nil
 	case <-m.closeCh:
 		return nil

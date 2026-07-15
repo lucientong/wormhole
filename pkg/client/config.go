@@ -135,6 +135,15 @@ type Config struct {
 	// to the peer's exposed service over the P2P channel (server relay
 	// bypassed entirely). Empty (the default) means normal "expose" mode.
 	ConnectTarget string
+
+	// MaxConcurrentStreams bounds the number of inbound streams this
+	// client services concurrently, checked independently on each
+	// transport (relay and, once negotiated, P2P): a compromised or
+	// misbehaving server/peer could otherwise open unbounded streams and
+	// exhaust this client's goroutines/memory. 0 means unlimited. A
+	// stream received while already at the limit is closed immediately
+	// rather than queued.
+	MaxConcurrentStreams int
 }
 
 // DefaultConfig returns the default client configuration.
@@ -152,5 +161,6 @@ func DefaultConfig() Config {
 		HeartbeatTimeout:     10 * time.Second,
 		P2PEnabled:           true,
 		P2PConfig:            p2p.DefaultManagerConfig(),
+		MaxConcurrentStreams: 1000,
 	}
 }

@@ -281,6 +281,7 @@ Only fields present in the file override the defaults — anything omitted keeps
 | `--domain` | Domain for tunnel URLs (env: `WORMHOLE_DOMAIN`) | `localhost` |
 | `--max-concurrent-streams` | Max concurrent data-plane streams across all clients; saturating rejects new streams instead of queuing (0 = unlimited) | `10000` |
 | `--max-streams-per-client` | Max concurrent data-plane streams for a single client, independent of the global limit above (0 = unlimited) | `500` |
+| `--max-control-streams-per-client` | Max concurrent control-plane streams (register/ping/stats/close/P2P-offer) for a single client's own connection; protects the control plane itself from goroutine exhaustion (0 = unlimited) | `128` |
 | `--min-client-version` | Reject clients reporting an older semantic version, e.g. `0.6.0`; clients with a non-semver version (e.g. dev builds) are never rejected | (disabled) |
 | `--tls` | Enable TLS (auto-cert if domain is set) | false |
 | `--tunnel-tls` | Enable TLS for tunnel control listener (defaults to `--tls`, and also defaults to `true` when `--require-auth` is set with a real `--domain` — see [Security](#security)) | see description |
