@@ -523,8 +523,19 @@ func (ps *proxyService) proxyToNode(nodeAddr string, w http.ResponseWriter, r *h
 // external traffic and is unaffected (most requests never carry it).
 // Returns false (having already written a response) if the request should
 // be rejected.
+//
+// On every accepting path the header is stripped from r before returning
+// true, so the cluster secret can never leak downstream: forwardHTTP writes
+// the raw request into the tunnel with r.Write, which would otherwise hand
+// the secret to the tunnel client's local service (and its logs). proxyToNode
+// re-injects a fresh header on its own outbound clone, so cross-node
+// forwarding is unaffected. An external attacker cannot smuggle the header
+// in either, since it is always removed regardless of value.
 func (ps *proxyService) verifyClusterSecret(w http.ResponseWriter, r *http.Request) bool {
 	if ps.cfg.ClusterSecret == "" {
+		// Even with the feature disabled, never forward an attacker-supplied
+		// copy of this header on to the tunnel client.
+		r.Header.Del(clusterSecretHeader)
 		return true
 	}
 	got := r.Header.Get(clusterSecretHeader)
@@ -536,6 +547,9 @@ func (ps *proxyService) verifyClusterSecret(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "invalid cluster credentials", http.StatusForbidden)
 		return false
 	}
+	// Verified genuine peer hop: strip the secret so it is not relayed
+	// further into the tunnel client's local service.
+	r.Header.Del(clusterSecretHeader)
 	return true
 }
 

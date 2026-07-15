@@ -802,10 +802,15 @@ func (s *Server) authenticateClient(mux *tunnel.Mux, sessionID string) (*auth.Cl
 		return nil, "", fmt.Errorf("client version %q rejected: %s", authReq.Version, rejectMsg)
 	}
 
-	// Validate token.
+	// Validate token. The specific reason (expired / revoked / malformed /
+	// revocation-store outage) is kept server-side only: returning it to the
+	// client would let an attacker enumerate token state. The client always
+	// sees a generic "authentication failed" and the detail is logged and
+	// carried in the returned error for the caller's own logging/audit.
 	claims, err := s.authenticator.ValidateToken(authReq.Token)
 	if err != nil {
-		s.sendAuthFailure(stream, "authentication failed: "+err.Error())
+		log.Warn().Err(err).Msg("Authentication failed: token validation rejected")
+		s.sendAuthFailure(stream, "authentication failed")
 		return nil, "", fmt.Errorf("validate token: %w", err)
 	}
 
@@ -816,9 +821,15 @@ func (s *Server) authenticateClient(mux *tunnel.Mux, sessionID string) (*auth.Cl
 	}
 
 	// Generate subdomain from auth request (or assign a random one).
+	// A client-supplied subdomain must be a valid DNS label; reject
+	// malformed values rather than letting them reach the router/state
+	// store or logs.
 	subdomain := authReq.Subdomain
 	if subdomain == "" {
 		subdomain = generateSubdomain()
+	} else if !isValidSubdomainLabel(subdomain) {
+		s.sendAuthFailure(stream, "invalid subdomain")
+		return nil, "", fmt.Errorf("invalid subdomain requested: %q", subdomain)
 	}
 
 	// Send success response with the pre-generated session ID and this
@@ -1021,6 +1032,13 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 	subdomain := req.Subdomain
 	if subdomain == "" {
 		subdomain = client.Subdomain
+	} else if !isValidSubdomainLabel(subdomain) {
+		log.Warn().Str("client", client.ID).Msg("Tunnel registration rejected: invalid subdomain")
+		resp := proto.NewRegisterResponse(false, "invalid subdomain", "", "", 0)
+		if data, encErr := resp.Encode(); encErr == nil {
+			_, _ = stream.Write(data)
+		}
+		return
 	}
 
 	// Determine public URL: prefer a custom hostname when the tunnel
@@ -1423,6 +1441,38 @@ func generateSubdomain() string {
 	return hex.EncodeToString(b)
 }
 
+// maxSubdomainLabelLen is the RFC 1035 DNS label length limit.
+const maxSubdomainLabelLen = 63
+
+// isValidSubdomainLabel reports whether s is a syntactically valid DNS
+// label usable as a subdomain: 1–63 characters, letters, digits and
+// hyphens only, not starting or ending with a hyphen. Client-supplied
+// subdomains are validated against this before being routed or stored, so a
+// malformed value cannot produce a bogus Host route, corrupt a state-store
+// key, or smuggle control characters (newlines, path separators, "..")
+// into logs. Case is accepted here since the router lowercases subdomains
+// on registration and lookup.
+func isValidSubdomainLabel(s string) bool {
+	if len(s) == 0 || len(s) > maxSubdomainLabelLen {
+		return false
+	}
+	if s[0] == '-' || s[len(s)-1] == '-' {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // extractIP extracts the IP address from a remote address string.
 // It handles both IPv4 (host:port) and IPv6 ([host]:port) formats.
 func extractIP(remoteAddr string) string {
@@ -1441,6 +1491,19 @@ func initStateStore(config Config) StateStore {
 	case ClusterBackendRedis:
 		if config.ClusterRedisAddr == "" {
 			log.Fatal().Msg("Cluster: ClusterRedisAddr must be set when using redis state backend")
+		}
+		// Cross-node routing rewrites requests to a peer's ClusterNodeAddr;
+		// without it, routes this node registers are unreachable from other
+		// nodes, so clustering silently half-works. Fail fast instead.
+		if config.ClusterNodeAddr == "" {
+			log.Fatal().Msg("Cluster: ClusterNodeAddr must be set when using redis state backend (peers use it to reach this node)")
+		}
+		// Node-to-node proxied requests are only authenticated when a
+		// shared ClusterSecret is configured. Running a multi-node cluster
+		// without one means any caller that can reach a node's
+		// ClusterNodeAddr can impersonate a peer hop — warn loudly.
+		if config.ClusterSecret == "" {
+			log.Warn().Msg("Cluster: ClusterSecret is not set — inter-node proxied requests are UNAUTHENTICATED; set a shared secret in production")
 		}
 		store, err := NewRedisStateStore(RedisStateStoreConfig{
 			Addr:     config.ClusterRedisAddr,

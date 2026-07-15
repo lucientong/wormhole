@@ -1,13 +1,15 @@
 # Wormhole Architecture Guide
 
-> This document describes the system architecture, network protocol design, and data flow of Wormhole in detail.
+> This document describes the system architecture, network protocol design, and data flow of Wormhole in detail. It doubles as a learning guide: start with [How to Read This Document & the Code](#how-to-read-this-document--the-code) if you are new to the project.
 
 **[中文版](architecture_zh.md)**
 
 ## Table of Contents
 
+- [How to Read This Document & the Code](#how-to-read-this-document--the-code)
 - [System Overview](#system-overview)
 - [Component Architecture](#component-architecture)
+- [Design Decisions & Trade-offs](#design-decisions--trade-offs)
 - [Tunnel Multiplexing Protocol](#tunnel-multiplexing-protocol)
 - [Frame Protocol](#frame-protocol)
 - [Control Protocol](#control-protocol)
@@ -23,7 +25,42 @@
 - [Server & Client Composition](#server--client-composition)
 - [Reliability & Protocol Safeguards](#reliability--protocol-safeguards)
 - [Hot-Path Performance](#hot-path-performance)
+- [Go Patterns Used in This Codebase](#go-patterns-used-in-this-codebase)
+- [Testing Strategy](#testing-strategy)
 - [Data Flow Summary](#data-flow-summary)
+
+---
+
+## How to Read This Document & the Code
+
+Wormhole is deliberately built with a small dependency footprint — the multiplexer, the reliable-UDP transport, and the control protocol are all implemented in this repository rather than pulled in as libraries. That makes it a good codebase for studying how a tunneling system works end to end. Below are three suggested paths, depending on how much time you have.
+
+### 30 minutes — run it and see the moving parts
+
+1. Build and run the three-terminal demo: `wormhole server` in one terminal, a local HTTP service (`python3 -m http.server 8080`) in another, `wormhole 8080` in a third, then `curl` the public URL.
+2. Read [System Overview](#system-overview) and [Component Architecture](#component-architecture) to map what you just ran onto the boxes in the diagrams.
+3. Open the Inspector UI (printed on client startup) and watch a request flow through.
+
+### 2 hours — understand the relay path
+
+Read the code in this order; each step builds on the previous one:
+
+1. `pkg/tunnel/frame.go` — the 9-byte frame header. Everything on the wire is one of these frames.
+2. `pkg/tunnel/mux.go` and `pkg/tunnel/stream.go` — how many logical streams share one TCP connection, and how flow control keeps one stream from starving the rest. Read [Tunnel Multiplexing Protocol](#tunnel-multiplexing-protocol) alongside.
+3. `pkg/proto/messages.go` — the control messages (register, auth, heartbeat) that ride on stream 1. Read [Control Protocol](#control-protocol) alongside.
+4. `pkg/server/server.go` (composition root) → `pkg/server/proxy_service.go` (`ServeHTTP` is where a public request meets a tunnel stream).
+5. `pkg/client/relay_client.go` — the mirror image on the client: dial, authenticate, register, accept streams, reconnect.
+
+Useful companion commands: `go test -run TestMux ./pkg/tunnel/...`, `go test -run TestHandler ./pkg/server/...`.
+
+### 1 day — P2P, HA, and the security layer
+
+6. `pkg/p2p/nat.go` → `hole_punch.go` → `stream.go` → `crypto.go` — NAT discovery, hole punching, the custom reliable-UDP ARQ, and end-to-end encryption. Read [P2P Direct Connection](#p2p-direct-connection) alongside; the ARQ section is the densest part of the codebase.
+7. `pkg/client/p2p_session.go` and `pkg/server/p2p_broker.go` — how `wormhole connect` signaling flows through the relay before the direct link exists.
+8. `pkg/server/state_redis.go` and `pkg/server/tunnel_registry.go` — cluster routing, TTL heartbeats, cross-node proxying. Read [HA / Multi-Node Control Plane](#ha--multi-node-control-plane) alongside.
+9. `pkg/auth/` — HMAC tokens, OIDC validation, OAuth Device Flow, RBAC, audit logging.
+
+Two sections then tie the design together: [Design Decisions & Trade-offs](#design-decisions--trade-offs) explains *why* the major components are built the way they are, and [Go Patterns Used in This Codebase](#go-patterns-used-in-this-codebase) catalogs the language techniques worth stealing.
 
 ---
 
@@ -128,6 +165,45 @@ Wormhole is a Client-Server architecture tunneling tool. The core idea is:
 | `auth` | `pkg/auth/` | HMAC tokens, OIDC/JWT, OAuth Device Flow, credentials, RBAC, rate limiting, audit logging + store |
 | `p2p` | `pkg/p2p/` | STUN (IPv4/IPv6), NAT discovery, UDP hole punching, port prediction, reliable UDP (UDPMux + UDPStream + ARQ), E2E encryption (X25519 + AES-256-GCM) |
 | `version` | `pkg/version/` | Build version information |
+
+---
+
+## Design Decisions & Trade-offs
+
+This section records the rationale behind the major build-vs-buy and design choices, so readers can evaluate them rather than take them as given.
+
+### Custom multiplexer instead of yamux / QUIC
+
+The tunnel mux (`pkg/tunnel`) is written from scratch rather than using `hashicorp/yamux` or a QUIC library.
+
+- **Why**: full control over the frame format lets the control channel (stream 1), protocol-version negotiation, and capability exchange live inside the same connection without adapter layers; the Inspector can observe stream boundaries natively; and the frame codec doubles as the P2P framing layer. QUIC would bring streams and flow control for free, but adds a large dependency, UDP-only transport (a problem for restrictive networks where TCP:443 is the whole point of a relay), and far less pedagogical value.
+- **Cost**: the flow-control and keep-alive logic must be maintained and tested here (which is why `pkg/tunnel` has the highest test coverage in the repo, >90%).
+- **Design mirror**: the API deliberately mirrors `net.Listener`/`net.Conn` (`mux.Accept()`, `stream.Read/Write/Close`), so code that consumes streams doesn't know it isn't talking to a plain TCP connection.
+
+### Custom reliable UDP instead of KCP / QUIC for P2P
+
+The P2P data plane (`pkg/p2p/stream.go`) implements its own ARQ: sliding window, RFC 6298 RTO estimation (SRTT/RTTVAR + Karn's algorithm), fast retransmit, and ACK-withholding for backpressure.
+
+- **Why**: hole-punched UDP paths need a session that starts from a simultaneous-open handshake and layers end-to-end encryption (X25519 + AES-256-GCM) directly above the datagrams. KCP optimizes for latency at the cost of bandwidth (aggressive retransmission), which is the wrong trade-off for bulk tunnel traffic. QUIC again would work but hides exactly the mechanisms this project sets out to demonstrate.
+- **Cost**: no congestion control beyond the ARQ window; a well-tested library would perform better on lossy long-fat networks.
+
+### Protobuf with a JSON fallback
+
+Control messages are encoded as Protobuf, but every decoder first tries Protobuf and falls back to JSON (`pkg/proto/messages.go`).
+
+- **Why**: the project started with JSON; the Protobuf migration preserved wire compatibility with older clients during rollout. The dual decode also makes hand-testing with scripts easy.
+- **Guard rails**: length-prefixed messages with a hard `maxControlMessageSize`, and empty/unknown payloads are rejected rather than silently zero-valued.
+
+### Redis as the only distributed state store
+
+HA mode (`pkg/server/state_redis.go`) uses Redis with TTL-refreshed route keys; there is no etcd/consensus option.
+
+- **Why**: routes are soft state — every entry is re-announced by the owning node's heartbeat, so the store only needs fast lookups + TTL expiry, not consensus. Losing Redis degrades to single-node behavior instead of taking the data plane down.
+- **Trade-off**: no linearizable registration (see the [HA chapter](#ha--multi-node-control-plane) for the conflict-handling rules), and Redis itself becomes the availability bottleneck for *new* cross-node routes.
+
+### Everything else: boring on purpose
+
+CLI is Cobra, logging is zerolog, tests use testify + miniredis, the web UI is embedded with `go:embed`. These are deliberately mainstream choices so the interesting code stays in the protocol layers.
 
 ---
 
@@ -1006,6 +1082,8 @@ Key components:
 - Mandatory authentication on connection handshake (`--require-auth`); viewer role cannot establish tunnels — enforced server-side at the point of use (`handleRegister`/`handleClose` call `requireWritePermission`), not just hidden from a client-side menu
 - Admin API protected by separate token using `crypto/subtle.ConstantTimeCompare`
 - Token revocation support with persistent blacklist (SQLite backend)
+- **Fail-closed revocation checks**: if the backing store can't be consulted during validation (e.g. Redis/SQLite outage), `validatePayload` returns `ErrRevocationCheckUnavailable` and the token is rejected rather than accepted with an unverifiable revocation status — a store hiccup can never resurrect an already-revoked credential. A genuinely absent team record (`ErrTeamNotFound`) is still treated as "no revocation applies" and validates normally
+- **No auth-state leakage**: the handshake returns a generic `authentication failed` to the client regardless of the underlying reason (expired / revoked / malformed / store-unavailable). The specific reason is logged server-side only, so an attacker can't probe a token's exact state
 
 #### OIDC / SSO Integration
 
@@ -1064,7 +1142,7 @@ wormhole login --issuer <url> --client-id <id>
 ### Input Validation
 
 - HTML escaping on Host header routing (XSS prevention)
-- Subdomain restricted to single-level labels (no dots)
+- Client-supplied subdomains are validated as DNS labels (`isValidSubdomainLabel`: 1–63 chars, letters/digits/hyphen only, no leading/trailing hyphen) at both the auth handshake and dynamic tunnel registration, before the value reaches the router, the cluster state store, or any log line — rejecting dots, path separators, `..`, and control-character injection
 - Path prefix normalization (leading/trailing `/`)
 
 ### Subdomain Reservation Semantics
@@ -1196,7 +1274,8 @@ TunnelRegistry.StartHeartbeat(ctx)
 
 ```
 ProxyService.ServeHTTP(r)
-  ├── verifyClusterSecret(r) → reject if --cluster-secret set and header missing/mismatched
+  ├── verifyClusterSecret(r) → reject if --cluster-secret set and header present-but-wrong;
+  │                            always strip the header on accept (external traffic has none)
   ├── router.Route(host, path) → local ClientSession?
   │     └── Yes → forwardHTTP / handleWebSocket (normal path)
   └── No → registry.ResolveRemote(host, path)   [hostname → longest path-prefix → subdomain]
@@ -1218,7 +1297,7 @@ Hostname and path-prefix routes are indexed into Redis exactly like subdomains, 
 
 ### Inter-Node Authentication
 
-`--cluster-secret` is a shared secret across all nodes in a cluster. `proxyToNode` (`pkg/server/proxy_service.go`) attaches it as `X-Wormhole-Cluster-Secret` on every proxied request; `verifyClusterSecret` (called first in `ProxyService.ServeHTTP`) rejects requests where the header is missing or doesn't match, and strips the header before continuing so it's never forwarded to the local tunnel client. Without a configured secret, no check is performed (backward-compatible with single-node/unsecured deployments) — operators running a real cluster should always set it, since without it a network peer could forge `X-Wormhole-*` proxy headers.
+`--cluster-secret` is a shared secret across all nodes in a cluster. `proxyToNode` (`pkg/server/proxy_service.go`) attaches it as `X-Wormhole-Cluster-Secret` on every proxied request via its own outbound clone; `verifyClusterSecret` (called first in `ProxyService.ServeHTTP`) rejects requests where the header is *present but doesn't match*, and **always strips the header on every accepting path** — whether the feature is on or off, and whether the request is a genuine peer hop or ordinary external traffic — so the secret can never be relayed into the tunnel client's local service (and its logs). A request that simply omits the header is ordinary external traffic and passes through normally. Starting a Redis-backed cluster without a secret is allowed but logs a loud warning, since inter-node proxied requests would then be unauthenticated; `--cluster-node-addr` is *required* in that mode (startup fails fast without it, since peers use it to reach this node).
 
 Before building the outbound proxy request, `proxyToNode` also runs the target through `validateClusterNodeAddr`, which rejects anything that isn't a clean `host:port` pair. This is defense in depth against a corrupted or tampered `StateStore` entry smuggling a scheme, userinfo, path, or query component into the proxy target — the request is always rebuilt from validated `host`/`port` components (`net.JoinHostPort`), never from the raw string.
 
@@ -1321,6 +1400,67 @@ The tunnel multiplexer's data-send path and every bidirectional proxy loop reuse
 - `copyWithPooledBuffer(dst, src)` is a drop-in `io.Copy` replacement (via `io.CopyBuffer`) backed by a package-level pool (`pkg/server` and `pkg/client` each keep their own), used by every forwarding loop: the server's HTTP response body copy, WebSocket proxy, and TCP tunnel proxy, and the client's relay-mode `dialAndProxy` and `wormhole connect`'s `proxyConnectConn`.
 
 `forwardHTTPWithInspect` bounds its request/response body reads with `io.LimitReader(body, MaxBodySize+1)` — enabling `--inspector` never buffers an unbounded body in memory regardless of upload/download size. `Inspector.MaxBodySize()` exposes the configured limit so callers outside the `inspector` package can size their own reads consistently with what `Capture` stores. This only applies to the inspector code path; relay/P2P forwarding without inspection remains fully unbounded, since the inspector is a debugging aid rather than something enabled for large-payload production traffic.
+
+---
+
+## Go Patterns Used in This Codebase
+
+For readers using Wormhole to study Go, these are the recurring techniques and where to find a canonical example of each.
+
+### Composition root + narrow consumer-side interfaces
+
+`Server` and `Client` are composition roots: they construct their components and wire them together, but delegate all real work (see [Server & Client Composition](#server--client-composition)). The interfaces between components are defined on the *consumer* side and kept minimal — `P2PSession` sees `RelayClient` only as `RelayChannel` (one method group for sending signaling messages), and both client components see `Client` only as `localForwarder` + `statsRecorder`. This is the Go interface idiom ("accept interfaces, return structs") applied at the architecture level: components can be unit-tested with tiny fakes, and dependency direction is visible in the type system.
+
+### One writer goroutine per connection
+
+`tunnel.Mux` funnels all outbound frames through a single writer path guarded by `sendLock`, so frame writes are never interleaved mid-frame regardless of how many streams write concurrently. The same pattern appears in the P2P `UDPMux`. This is the standard Go answer to "many producers, one ordered sink" — serialize at the boundary instead of locking inside every producer.
+
+### Lock granularity follows ownership
+
+There is no global lock. Each component guards exactly the state it owns: `RelayClient.mu` for connection/tunnel state, `P2PSession.mu` for session state, `Stream.mu` for per-stream buffers, and the registry/router each have their own. Simple flags that are checked on hot paths (`connected`, P2P `mode`) use `sync/atomic` instead of mutexes. When reading the code, the reliable rule is: find the struct that owns the field, and its mutex is the one protecting it.
+
+### `context.Context` for cancellation, but not on the data path
+
+Control-plane RPCs (auth, register, heartbeat, P2P signaling) all take contexts and use `Stream.ReadContext`/`WriteContext`, so shutdown or a caller deadline interrupts them immediately. The data path (`io.CopyBuffer` loops) deliberately does *not* use context-aware reads — the plain `Read`/`Write` delegate with `context.Background()` and spawn no watcher goroutine, keeping the hot path allocation-free. Cancellation there is handled by closing the underlying stream instead. This split — contexts where responsiveness matters, connection-close where throughput matters — is worth internalizing.
+
+### `sync.Pool` for hot-path buffers
+
+`dataBufPool` in the mux and the `copyWithPooledBuffer` pools in `pkg/server`/`pkg/client` (see [Hot-Path Performance](#hot-path-performance)) show the standard pattern: pool the buffer, not the object graph; return it in a `defer`; never let a pooled buffer escape past the return.
+
+### Channel-based lifecycle: `closeCh` + `sync.WaitGroup` + `sync.Once`
+
+Long-lived goroutines (heartbeat loops, accept loops, TTL refreshers) follow the same shape everywhere: a `closeCh` channel closed exactly once (guarded by `sync.Once` or an atomic CAS) signals shutdown, `select` statements race work against `<-closeCh`, and a `WaitGroup` lets `Close()` block until every goroutine has actually exited. `Mux.CloseNotify()` extends the pattern across component boundaries — the client's reconnect loop just waits on the channel rather than polling connection health.
+
+### Table-driven tests and behavior-level integration tests
+
+Unit tests are table-driven where inputs enumerate well (frame codec, config validation). The more interesting pattern is the *mux-pair* test used throughout `pkg/client` and `pkg/server`: create two ends of a `net.Pipe`, wrap each in a real `tunnel.Mux`, and drive one side as a scripted fake peer. This tests actual wire behavior (framing, flow control, message ordering) without sockets, and it is the main reason refactors like the composition-root split could lean on the test suite to catch real bugs. See [Testing Strategy](#testing-strategy).
+
+### Others worth noticing
+
+- `go:embed` serves the entire Inspector web UI from the binary (`pkg/web`), keeping single-binary deployment.
+- `crypto/subtle.ConstantTimeCompare` / `hmac.Equal` for every secret comparison — never `==` on credentials.
+- Bounded atomic counters via CAS loops (`tryIncrementBounded`) implement limit-checked increments without locks.
+- The custom errors follow `errors.Is`/`errors.As` conventions with sentinel values (`ErrSubdomainConflict`, `ErrTokenExpired`) wrapped with `%w`.
+
+## Testing Strategy
+
+The test suite (roughly 25k lines, exceeding production code) is layered; knowing which layer a test belongs to tells you how to write new ones.
+
+| Layer | Where | Technique |
+|-------|-------|-----------|
+| Unit | `pkg/tunnel`, `pkg/proto`, `pkg/auth` | Table-driven tests on codecs, validation, token logic; benchmarks alongside |
+| Component integration | `pkg/client/client_test.go`, `pkg/server/*_test.go` | Mux-pair over `net.Pipe`: a real mux on the side under test, a scripted fake peer on the other |
+| Cluster integration | `pkg/server/cluster_test.go` | Two full server instances sharing a `miniredis`, real HTTP round-trips across nodes |
+| P2P stress | `pkg/p2p/stress_test.go` | Loopback UDP with simulated packet loss, exercising the ARQ retransmission path |
+| Race detection | CI | The entire suite runs under `go test -race` on every push |
+
+Guidelines that keep the suite healthy:
+
+- **Test behavior, not fields.** Prefer driving the public API and asserting on observable protocol effects (what frames the fake peer received) over reaching into unexported state.
+- **Every bug fix lands with a regression test** at the lowest layer that can reproduce it.
+- **Security-relevant code paths get explicit negative tests** — wrong HMAC, expired token, invalid cluster secret, oversized control message.
+
+Run locally with `go test -race ./...`; per-package coverage with `go test -cover ./pkg/...`. Lint and security gates mirror CI: `golangci-lint run ./...` and `gosec -exclude=G115 -exclude-dir=web -exclude-dir=pkg/proto/pb ./...`.
 
 ---
 

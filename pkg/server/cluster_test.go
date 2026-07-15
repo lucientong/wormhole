@@ -244,6 +244,109 @@ func TestCrossNodeRouting_ClusterSecretAllowsGenuinePeer(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
+// TestForwardHTTP_StripsClusterSecretHeader verifies the cluster secret is
+// never relayed into the tunnel client's local service. A genuine peer hop
+// carries the header to pass verification, but the raw request written to
+// the client (via forwardHTTP's r.Write) must have it removed so it cannot
+// leak into the user's internal network or application logs.
+func TestForwardHTTP_StripsClusterSecretHeader(t *testing.T) {
+	server := newClusterTestServer("node-a", "", nil)
+	server.config.ClusterSecret = "correct-secret"
+	handler := newProxyService(server.registry.router, server.registry, server.config, server.metrics, &server.stats, server.serverCtx)
+
+	// Capture the headers the tunnel client actually receives.
+	gotHeaders := make(chan http.Header, 1)
+	tb := newCapturingTunnelBackend(t, "session-strip", "myapp", "ok", gotHeaders)
+	require.NoError(t, server.registry.router.RegisterSubdomain("myapp", tb.session))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "myapp.test.example.com"
+	req.Header.Set(clusterSecretHeader, "correct-secret")
+	req.Header.Set("X-Custom", "keepme")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	select {
+	case h := <-gotHeaders:
+		assert.Empty(t, h.Get(clusterSecretHeader), "cluster secret header must be stripped before reaching the tunnel client")
+		assert.Equal(t, "keepme", h.Get("X-Custom"), "unrelated headers must be preserved")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for tunnel client to receive the forwarded request")
+	}
+}
+
+// newCapturingTunnelBackend behaves like newTunnelBackend but reports the
+// headers of the first request it receives on gotHeaders, so tests can
+// assert on exactly what the tunnel client sees.
+func newCapturingTunnelBackend(t *testing.T, sessionID, subdomain, body string, gotHeaders chan<- http.Header) *tunnelBackend {
+	t.Helper()
+
+	clientConn, serverConn := net.Pipe()
+	muxCfg := tunnel.DefaultMuxConfig()
+	muxCfg.KeepAliveInterval = 0
+
+	serverMux, err := tunnel.Server(serverConn, muxCfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = serverMux.Close() })
+
+	clientMux, err := tunnel.Client(clientConn, muxCfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = clientMux.Close() })
+
+	tb := &tunnelBackend{
+		session: &ClientSession{
+			ID:        sessionID,
+			Subdomain: subdomain,
+			Mux:       serverMux,
+			CreatedAt: time.Now(),
+			LastSeen:  time.Now(),
+		},
+		clientMux: clientMux,
+		serverMux: serverMux,
+	}
+
+	go func() {
+		for {
+			stream, acceptErr := clientMux.AcceptStream()
+			if acceptErr != nil {
+				return
+			}
+			go func() {
+				defer stream.Close()
+				br := bufio.NewReader(stream)
+				msg, decErr := proto.ReadControlMessage(br)
+				if decErr != nil || msg.StreamRequest == nil {
+					return
+				}
+				httpReq, parseErr := http.ReadRequest(br)
+				if parseErr != nil {
+					return
+				}
+				select {
+				case gotHeaders <- httpReq.Header.Clone():
+				default:
+				}
+				_ = httpReq.Body.Close()
+
+				resp := &http.Response{
+					StatusCode:    http.StatusOK,
+					Proto:         "HTTP/1.1",
+					ProtoMajor:    1,
+					ProtoMinor:    1,
+					Header:        http.Header{"Content-Type": {"text/plain"}},
+					Body:          io.NopCloser(strings.NewReader(body)),
+					ContentLength: int64(len(body)),
+				}
+				_ = resp.Write(stream)
+			}()
+		}
+	}()
+
+	return tb
+}
+
 // TestServer_RefreshClusterRoutes verifies a connected client's
 // registered cluster routes are re-registered (TTL-refreshed) by
 // refreshClusterRoutes without needing the client to do anything, and a

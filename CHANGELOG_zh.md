@@ -4,6 +4,10 @@
 
 **[English](CHANGELOG.md)**
 
+## v0.6.10
+
+安全加固：集群节点间的密钥头（`X-Wormhole-Cluster-Secret`）在请求转发给隧道客户端的本地服务之前会被剥离，共享密钥不再可能泄露进用户内网或应用日志。Token 吊销检查改为 fail-closed——校验期间 Redis/SQLite 故障会拒绝该 token，而不是在无法确认吊销状态时静默放行。认证失败对客户端统一返回笼统的 "authentication failed"（具体原因只写入服务端日志），避免被用来枚举 token 状态。客户端自选的子域名在路由/存储前会按 DNS label 规则校验，拒绝可能产生异常路由或向日志注入控制字符的非法值。启动 Redis 集群时，缺少 `--cluster-node-addr` 会直接快速失败，未设置 `--cluster-secret` 会发出显著告警（否则节点间代理是未认证的）。
+
 ## v0.6.9
 
 Client 侧重构：此前 ~2100 行的 `Client` 现在降级为组合根，由 `RelayClient`（控制面连接、含 token 刷新的鉴权、单/多隧道注册、心跳、重连循环）与 `P2PSession`（`wormhole connect` 的 NAT 探测、ECDH 密钥交换、打洞、P2P 数据面）承接。两者都只通过 `Client` 实现的两个小型接口（`localForwarder`/`statsRecorder`）依赖它，`P2PSession` 回调 `RelayClient` 也只经过最小化的 `RelayChannel` 接口——三者互不知道对方的具体类型。原来同时保护两个子系统的一把锁，现在拆成各自精确对应保护范围的两把锁。这与下方 v0.6.8 的 server 侧重构相呼应，也是同一次重构的收尾。

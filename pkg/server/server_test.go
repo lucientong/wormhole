@@ -4000,3 +4000,34 @@ func TestServer_Shutdown_DrainsInFlightHTTPRequest(t *testing.T) {
 	// in-flight request instead of yanking the listener out from under it.
 	assert.GreaterOrEqual(t, shutdownElapsed, backendDelay/2)
 }
+
+func TestIsValidSubdomainLabel(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		{"simple", "myapp", true},
+		{"generated hex", "a1b2c3d4e5f60718", true},
+		{"with hyphen", "my-app-1", true},
+		{"uppercase accepted", "MyApp", true},
+		{"single char", "a", true},
+		{"max length 63", strings.Repeat("a", 63), true},
+		{"empty", "", false},
+		{"too long 64", strings.Repeat("a", 64), false},
+		{"leading hyphen", "-app", false},
+		{"trailing hyphen", "app-", false},
+		{"dot", "a.b", false},
+		{"path traversal", "..", false},
+		{"slash", "a/b", false},
+		{"underscore", "a_b", false},
+		{"space", "a b", false},
+		{"newline injection", "app\nEVIL", false},
+		{"wildcard", "*", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isValidSubdomainLabel(tt.input))
+		})
+	}
+}

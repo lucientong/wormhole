@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -249,6 +250,68 @@ func TestGetTeam_NotFound(t *testing.T) {
 	a := newTestAuth(t)
 	_, err := a.GetTeam("nonexistent")
 	assert.ErrorIs(t, err, ErrTeamNotFound)
+}
+
+// failingStore wraps a real Store but can be told to return an error from
+// the revocation-lookup methods, simulating a Redis/SQLite outage.
+type failingStore struct {
+	Store
+	failRevoked bool
+	failTeam    bool
+}
+
+func (f *failingStore) IsTokenRevoked(tokenID string) (bool, error) {
+	if f.failRevoked {
+		return false, errors.New("store unavailable")
+	}
+	return f.Store.IsTokenRevoked(tokenID)
+}
+
+func (f *failingStore) GetTeam(name string) (*TeamInfo, error) {
+	if f.failTeam {
+		return nil, errors.New("store unavailable")
+	}
+	return f.Store.GetTeam(name)
+}
+
+// TestValidateToken_FailsClosedOnStoreError verifies that a store outage
+// during revocation checks rejects the token (fail closed) instead of
+// silently accepting it, so a Redis/SQLite hiccup cannot resurrect an
+// already-revoked credential.
+func TestValidateToken_FailsClosedOnStoreError(t *testing.T) {
+	issuer := newTestAuth(t)
+	token, err := issuer.GenerateTeamToken("team-a", RoleMember)
+	require.NoError(t, err)
+
+	// Sanity: the token validates cleanly against a healthy store.
+	_, err = issuer.ValidateToken(token)
+	require.NoError(t, err)
+
+	newAuthWithStore := func(s Store) *Auth {
+		a, newErr := New(Config{Secret: testSecret, TokenExpiry: time.Hour, Store: s})
+		require.NoError(t, newErr)
+		return a
+	}
+
+	t.Run("individual revocation store down", func(t *testing.T) {
+		a := newAuthWithStore(&failingStore{Store: NewMemoryStore(), failRevoked: true})
+		_, err := a.ValidateToken(token)
+		assert.ErrorIs(t, err, ErrRevocationCheckUnavailable)
+	})
+
+	t.Run("team revocation store down", func(t *testing.T) {
+		a := newAuthWithStore(&failingStore{Store: NewMemoryStore(), failTeam: true})
+		_, err := a.ValidateToken(token)
+		assert.ErrorIs(t, err, ErrRevocationCheckUnavailable)
+	})
+
+	t.Run("team not found still validates", func(t *testing.T) {
+		// A missing team record is a legitimate "no revocation applies"
+		// outcome, not an outage, so validation must still succeed.
+		a := newAuthWithStore(NewMemoryStore())
+		_, err := a.ValidateToken(token)
+		assert.NoError(t, err)
+	})
 }
 
 func TestListTeams(t *testing.T) {

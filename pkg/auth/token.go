@@ -24,6 +24,12 @@ var (
 	ErrInvalidSecret   = errors.New("secret must be at least 16 bytes")
 	ErrDuplicateTeam   = errors.New("team already exists")
 	ErrInvalidTeamName = errors.New("invalid team name")
+	// ErrRevocationCheckUnavailable is returned when the backing store
+	// cannot be consulted to confirm a token's revocation status. Rather
+	// than fail open (accepting a token whose revocation state is unknown),
+	// validation rejects the token so a store outage cannot resurrect
+	// already-revoked credentials.
+	ErrRevocationCheckUnavailable = errors.New("token revocation status unavailable")
 )
 
 // Role represents a user role in the system.
@@ -362,20 +368,34 @@ func (a *Auth) validatePayload(payload *tokenPayload) error {
 		return ErrTokenExpired
 	}
 
-	// Check if token is individually revoked.
+	// Check if token is individually revoked. A store error here means we
+	// cannot confirm the token is still valid, so we fail closed rather
+	// than accept a token whose revocation status is unknown.
 	if payload.TokenID != "" {
 		revoked, err := a.store.IsTokenRevoked(payload.TokenID)
-		if err == nil && revoked {
+		if err != nil {
+			return ErrRevocationCheckUnavailable
+		}
+		if revoked {
 			return ErrTokenRevoked
 		}
 	}
 
-	// Check team-level revocation version.
+	// Check team-level revocation version. ErrTeamNotFound is a legitimate
+	// "no revocation record for this team" outcome (no version check
+	// applies); any other store error is an outage and fails closed for
+	// the same reason as the individual-revocation check above.
 	if payload.TeamName != "" && payload.Version > 0 {
-		if info, err := a.store.GetTeam(payload.TeamName); err == nil {
+		info, err := a.store.GetTeam(payload.TeamName)
+		switch {
+		case err == nil:
 			if payload.Version <= info.RevokedVersion {
 				return ErrTokenRevoked
 			}
+		case errors.Is(err, ErrTeamNotFound):
+			// No team record: nothing to check against, treat as valid.
+		default:
+			return ErrRevocationCheckUnavailable
 		}
 	}
 

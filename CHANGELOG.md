@@ -4,6 +4,10 @@ All notable changes to Wormhole are documented here. See [README.md](README.md) 
 
 **[中文版](CHANGELOG_zh.md)**
 
+## v0.6.10
+
+Security hardening: the cluster-peer secret header (`X-Wormhole-Cluster-Secret`) is now stripped from every request before it is forwarded into a tunnel client's local service, so the shared secret can no longer leak into a user's internal network or application logs. Token revocation checks now fail closed — a Redis/SQLite outage during validation rejects the token instead of silently accepting one whose revocation status can't be confirmed. Authentication failures return a generic "authentication failed" to the client (the specific reason is logged server-side only) so token state can't be enumerated. Client-supplied subdomains are validated as DNS labels before routing or storage, rejecting malformed values that could produce bogus routes or inject control characters into logs. Starting a Redis-backed cluster now fails fast if `--cluster-node-addr` is missing and warns loudly if no `--cluster-secret` is set (inter-node proxying would otherwise be unauthenticated).
+
 ## v0.6.9
 
 Client-side refactor: the ~2,100-line `Client` is now a composition root over `RelayClient` (control-plane connection, auth with token refresh, single/multi-tunnel registration, heartbeat, reconnect loop) and `P2PSession` (`wormhole connect`'s NAT discovery, ECDH key exchange, hole punching, and P2P data plane). Both depend on `Client` only through two small interfaces (`localForwarder`, `statsRecorder`), and `P2PSession` talks back to `RelayClient` through a minimal `RelayChannel` interface — none of the three needs to know the others' concrete types. The single lock that used to guard both subsystems is now two separate locks, each scoped to what it actually protects. This mirrors the v0.6.8 server-side refactor below and completes it.
