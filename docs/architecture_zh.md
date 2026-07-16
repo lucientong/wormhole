@@ -1129,7 +1129,7 @@ wormhole login --issuer <url> --client-id <id>
 
 - Host header 路由时做 HTML 转义（防 XSS）
 - 客户端自选的子域名会按 DNS label 规则校验（`isValidSubdomainLabel`：1–63 字符，仅字母/数字/连字符，不以连字符开头或结尾），在鉴权握手和动态隧道注册两处都会校验，早于该值到达路由表、集群状态存储或任何日志行——拒绝点号、路径分隔符、`..` 以及控制字符注入
-- 自定义 hostname 会按点分 DNS label 校验（不接受端口、通配符、尾随点、空 label 或控制字符），通过后才进入路由表/状态存储
+- 自定义 hostname 会按点分 DNS label 校验（不接受端口、通配符、尾随点、空 label 或控制字符），通过后才进入路由表/状态存储；同时会直接拒绝落在服务器自身基础域名内的 hostname（等于该域名，或形如 `"<label>.<域名>"`）——`Router.Route` 匹配顺序是 hostname 表优先于 subdomain 表，若不做这层拒绝，任何客户端都能靠注册一个落在基础域名内的自定义 hostname 劫持别的租户的子域名（甚至是保留字子域名），完全绕过 `RegisterSubdomain` 的归属校验和 `isReservedSubdomain` 的保护
 - path-prefix 路由必须是以 `/` 开头的纯 URL path；拒绝遍历片段（`..`）、query/fragment 分隔符、反斜杠与控制字符
 
 ### 子域名申请语义
@@ -1224,7 +1224,7 @@ type StateStore interface {
 
 这个权衡之所以成立，前提是失败不能是"静默"的。一条注册失败的路由仍会被追加进 `client.clusterRoutes`（此前的实现会直接丢弃它，这意味着客户端会对集群其余部分永久不可见，即便 Redis 后来恢复了，也得等客户端自己重连才能补上）。既有的 30 秒心跳周期驱动的 `refreshClusterRoutes` 会无条件重试 `clusterRoutes` 里的每一条——于是注册时失败的路由，会被并入原本只是"续期 TTL"的同一条重试循环里，不需要额外的"待注册队列"或重试策略。最终效果是：一次短暂的状态存储中断，会在 Redis 恢复后的一个心跳周期内自愈，客户端完全不需要任何动作。
 
-这确实打开了一个较窄的裂脑窗口：当本节点认为自己拥有某条路由时（它正待在 `clusterRoutes` 里，尚未同步成功），*另一个*节点可能已经真的抢到了同一个 key。下一次 `refreshClusterRoutes` 重试会在这一刻立即发现——`RegisterRoute` 对一条本节点自认为已经拥有的条目返回 `ErrSubdomainConflict`，说明集群的共享状态已经和本节点的认知不一致了。这会以 `Error` 级别记录（而不是常规同步失败用的 `Warn`），并计入 `ClusterRouteConflictsTotal`；从机制上看是另一个节点的注册获胜，本节点会立即从本地内存 `Router` 和 `client.clusterRoutes` 中摘除这条陈旧路由，停止继续为一个集群其余部分已经路由到别处的 key 提供流量服务。`ClusterRouteSyncFailuresTotal` 单独统计更常见、能自行恢复的那类情况——任何非冲突的注册/刷新失败，无论它最终是否演变成真实冲突。运维仍然应该对 `ClusterRouteConflictsTotal` 非零告警，因为自动摘除本地路由解决的是一致性问题，并不会解释为什么两个节点一度都认为自己拥有同一个 key；`ClusterRouteSyncFailuresTotal` 在 Redis 抖动期间波动是预期行为，只有持续非零才值得关注。
+这确实打开了一个较窄的裂脑窗口：当本节点认为自己拥有某条路由时（它正待在 `clusterRoutes` 里，尚未同步成功），*另一个*节点可能已经真的抢到了同一个 key。下一次 `refreshClusterRoutes` 重试会在这一刻立即发现——`RegisterRoute` 对一条本节点自认为已经拥有的条目返回 `ErrSubdomainConflict`，说明集群的共享状态已经和本节点的认知不一致了。这会以 `Error` 级别记录（而不是常规同步失败用的 `Warn`），并计入 `ClusterRouteConflictsTotal`；从机制上看是另一个节点的注册获胜，本节点会立即从本地内存 `Router` 和 `client.clusterRoutes` 中摘除这条陈旧路由，停止继续为一个集群其余部分已经路由到别处的 key 提供流量服务。`ClusterRouteSyncFailuresTotal` 单独统计更常见、能自行恢复的那类情况——任何非冲突的注册/刷新失败，无论它最终是否演变成真实冲突。运维仍然应该对 `ClusterRouteConflictsTotal` 非零告警，因为自动摘除本地路由解决的是一致性问题，并不会解释为什么两个节点一度都认为自己拥有同一个 key；`ClusterRouteSyncFailuresTotal` 在 Redis 抖动期间波动是预期行为，只有持续非零才值得关注。摘除本地路由的同时也会同步修正该客户端自己的 `TunnelInfo` 记录（`client.Tunnels`）——清掉发生冲突的那一个路由维度，若该隧道已没有任何路由维度存活则整条记录一并移除——否则 `client.Tunnels` 会继续声称一条本节点已不再服务、也永远不会再重试的路由，形成一个"看起来活着、实际零流量"的半死隧道。
 
 ### 多租户：team 级路由隔离
 

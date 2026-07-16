@@ -88,6 +88,21 @@ type Mux struct {
 
 	// Shutdown
 	shutdownOnce sync.Once
+
+	// ctrlFrameDrops counts WINDOW_UPDATE/PONG frames silently dropped
+	// because ctrlCh was still full after controlFrameEnqueueTimeout (see
+	// sendWindowUpdate/sendPong). It should stay at zero in healthy
+	// operation; a nonzero and climbing value means the peer's sendLoop
+	// is chronically behind, which callers can surface via CtrlFrameDrops
+	// for alerting rather than this going unnoticed (R80-04).
+	ctrlFrameDrops uint64
+}
+
+// CtrlFrameDrops returns the number of control frames (WINDOW_UPDATE/PONG)
+// dropped so far because the control-frame queue stayed full past
+// controlFrameEnqueueTimeout. See the ctrlFrameDrops field doc comment.
+func (m *Mux) CtrlFrameDrops() uint64 {
+	return atomic.LoadUint64(&m.ctrlFrameDrops)
 }
 
 // Server creates a new server-side multiplexer.
@@ -620,6 +635,7 @@ func (m *Mux) sendWindowUpdate(streamID uint32, increment uint32) error {
 	case <-m.closeCh:
 		return m.getCloseErr()
 	case <-time.After(controlFrameEnqueueTimeout):
+		atomic.AddUint64(&m.ctrlFrameDrops, 1)
 		return nil
 	}
 }
@@ -705,6 +721,7 @@ func (m *Mux) sendPong(pingID uint32) error {
 	case <-m.closeCh:
 		return nil
 	case <-time.After(controlFrameEnqueueTimeout):
+		atomic.AddUint64(&m.ctrlFrameDrops, 1)
 		return nil
 	}
 }

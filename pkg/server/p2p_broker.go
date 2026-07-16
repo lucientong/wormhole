@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"time"
 
 	"github.com/lucientong/wormhole/pkg/auth"
@@ -229,7 +230,11 @@ func predictCandidatesForSymmetric(addr string, natType string, count int) []str
 
 	candidates := make([]string, 0, len(ports))
 	for _, p := range ports {
-		candidates = append(candidates, fmt.Sprintf("%s:%d", host, p))
+		// net.JoinHostPort (not fmt.Sprintf("%s:%d")) so an IPv6 host is
+		// correctly bracketed — "%s:%d" would emit "::1:1234" instead of
+		// "[::1]:1234", which net.SplitHostPort on the receiving end
+		// can't parse back, silently dropping the candidate (R80-02).
+		candidates = append(candidates, net.JoinHostPort(host, strconv.Itoa(p)))
 	}
 	return candidates
 }

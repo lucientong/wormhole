@@ -415,14 +415,22 @@ func (p *p2pSession) installSession(peerAddr string, conn net.PacketConn, peer *
 	return p.sessionGen
 }
 
-func (p *p2pSession) hasActiveSessionFor(peerAddr string, peerEndpoint p2p.Endpoint) bool {
+// hasActiveSessionFor reports whether the currently active P2P session (if
+// any) is already talking to peerEndpoint. Comparison is always done on the
+// parsed IP/port (p.peer), never on the raw peerAddr string that produced
+// peerEndpoint: p.peerAddr and peerAddr can carry the same address in
+// different textual forms (IPv6 zero-compression, leading zeros, case),
+// and a naive string comparison would misclassify the same peer as
+// "different" — tearing down and re-punching a perfectly healthy session
+// on every such late/duplicate notification (R80-03).
+func (p *p2pSession) hasActiveSessionFor(_ string, peerEndpoint p2p.Endpoint) bool {
 	if atomic.LoadUint32(&p.mode) != 1 {
 		return false
 	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.sessionCloseCh == nil || p.conn == nil {
+	if p.sessionCloseCh == nil || p.conn == nil || p.peer == nil {
 		return false
 	}
 	select {
@@ -430,10 +438,7 @@ func (p *p2pSession) hasActiveSessionFor(peerAddr string, peerEndpoint p2p.Endpo
 		return false
 	default:
 	}
-	if p.peerAddr != "" {
-		return p.peerAddr == peerAddr
-	}
-	if p.peer == nil || p.peer.Port != peerEndpoint.Port {
+	if p.peer.Port != peerEndpoint.Port {
 		return false
 	}
 	peerIP := net.ParseIP(peerEndpoint.IP)

@@ -947,9 +947,11 @@ func (r *relayClient) handleStream(ctx context.Context, stream *tunnel.Stream) {
 			return
 
 		case msg.P2PCandidates != nil:
-			// Not yet consumed by the hole-punching algorithm; retained
-			// here purely so the exchange doesn't stall or get
-			// misclassified while waiting for the offer response.
+			// Candidates typically arrive on this stream before the
+			// P2POfferResponse below; buffer them here and hand the
+			// accumulated list to onNotification once the offer response
+			// arrives, so attemptP2P can probe them alongside the primary
+			// peer endpoint during hole punching.
 			p2pCandidates = append(p2pCandidates, msg.P2PCandidates.Candidates...)
 			continue
 

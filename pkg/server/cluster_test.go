@@ -453,6 +453,45 @@ func TestTunnelRegistry_RefreshClusterRoutes_DropsSplitBrainLocalRoute(t *testin
 	client.mu.Unlock()
 }
 
+// TestTunnelRegistry_DropLocalClusterRoute_ClearsTunnelInfo is the
+// regression test for R80-05: dropping a split-brained per-tunnel route
+// must also correct the corresponding TunnelInfo record in
+// client.Tunnels, so the client-visible tunnel list doesn't keep
+// advertising a route this node no longer serves ("half-dead" tunnel).
+// A tunnel that loses its only route dimension is removed outright; one
+// that still has another live route dimension just has the conflicting
+// field cleared.
+func TestTunnelRegistry_DropLocalClusterRoute_ClearsTunnelInfo(t *testing.T) {
+	s := newClusterTestServer("node-a", "node-a:7000", NewMemoryStateStore())
+
+	client := &ClientSession{
+		ID: "client-1", CreatedAt: time.Now(), LastSeen: time.Now(),
+		Tunnels: []*TunnelInfo{
+			{ID: "tunnel-host-only", Hostname: "app.example.com"},
+			{ID: "tunnel-multi", Subdomain: "myapp", PathPrefix: "/api"},
+		},
+	}
+
+	// tunnel-host-only's *only* route dimension conflicts: the whole
+	// TunnelInfo must be dropped, nothing left to advertise.
+	s.registry.dropLocalClusterRoute(client, RouteEntry{
+		RouteID: "tunnel-host-only:host", ClientID: client.ID, Hostname: "app.example.com",
+	})
+	// tunnel-multi's PathPrefix dimension conflicts, but its Subdomain
+	// dimension is untouched: the record survives with PathPrefix cleared.
+	s.registry.dropLocalClusterRoute(client, RouteEntry{
+		RouteID: "tunnel-multi:path", ClientID: client.ID, PathPrefix: "/api",
+	})
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	require.Len(t, client.Tunnels, 1, "tunnel-host-only must be removed once its only route is gone")
+	remaining := client.Tunnels[0]
+	assert.Equal(t, "tunnel-multi", remaining.ID)
+	assert.Equal(t, "myapp", remaining.Subdomain, "the non-conflicting route dimension must survive")
+	assert.Empty(t, remaining.PathPrefix, "the conflicting route dimension must be cleared")
+}
+
 // TestServer_RegisterClientRoute_CrossTeamCannotReclaimStaleSession is
 // the core team-isolation regression test: a subdomain left behind by a
 // dead-but-not-yet-cleaned-up session must not be reclaimable by a

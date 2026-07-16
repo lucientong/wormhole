@@ -4,6 +4,12 @@ All notable changes to Wormhole are documented here. See [README.md](README.md) 
 
 **[中文版](CHANGELOG_zh.md)**
 
+## v0.8.1
+
+Security fix: custom hostname routes are now rejected outright when they fall inside the server's own base domain (equal to it, or `"<label>.<domain>"`). `Router.Route` matches the custom-hostname table before the subdomain table, so previously any connected client could register a hostname like `victim.<yourdomain>` or `admin.<yourdomain>` and hijack another tenant's subdomain traffic — or a reserved name — completely bypassing subdomain ownership checks and `--reserved-subdomains` protection. This was found in an independent follow-up review of v0.8.0 (`docs/personal/review-v0.9.md`) and is the only HIGH-severity issue from that review.
+
+The same review turned up several smaller robustness issues, all fixed here: a P2P peer's active-session check now always compares parsed IP/port instead of the raw address string, so two textually different (but equivalent) forms of the same peer address no longer trigger an unnecessary re-punch and teardown of a healthy session; dropped mux control frames (`sendPong`/`sendWindowUpdate` timing out on a full control queue) are now counted via `Mux.CtrlFrameDrops()` instead of vanishing silently; a cluster split-brain route drop now also clears the matching field on the client's own tunnel record (or removes it entirely) instead of leaving a "half-dead" tunnel that looks alive but receives no traffic; P2P candidate-endpoint address formatting now uses `net.JoinHostPort` instead of manual string concatenation (fixing IPv6 formatting); and auto-assigned subdomains now retry a few times on an (astronomically unlikely) collision instead of rejecting the connection outright.
+
 ## v0.8.0
 
 P5 hardening closure: this release folds the planned v0.7.1-v0.7.5 hardening batches into one v0.8.0 release. Wormhole now validates custom hostnames and path-prefix routes before they reach the router or cluster state, rejecting invalid DNS labels, ports/wildcards/control characters, path traversal, query/fragment delimiters, and malformed path values. Redis-backed cluster startup now requires `--cluster-secret`, making unauthenticated inter-node proxying a fail-fast configuration error instead of a warning; the architecture docs also now describe Redis route reservation as the current atomic Lua script implementation rather than the old `SETNX` wording.

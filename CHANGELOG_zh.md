@@ -4,6 +4,12 @@
 
 **[English](CHANGELOG.md)**
 
+## v0.8.1
+
+安全修复：自定义 hostname 路由现在会直接拒绝落在服务器自身基础域名内的值（等于该域名，或形如 `"<label>.<域名>"`）。`Router.Route` 的匹配顺序是自定义 hostname 表优先于 subdomain 表，此前任何已连接的客户端都可以注册一个类似 `victim.<你的域名>` 或 `admin.<你的域名>` 的 hostname，从而劫持别的租户的子域名流量——甚至是保留字子域名——完全绕过子域名归属校验和 `--reserved-subdomains` 保护。这是对 v0.8.0 的一次独立后续复核（`docs/personal/review-v0.9.md`）中发现的问题，也是该轮复核中唯一的 HIGH 级问题。
+
+同一轮复核还发现了若干较小的健壮性问题，均已在本版本修复：P2P 活跃会话检查现在始终比较解析后的 IP/端口，而不是原始地址字符串，避免同一个 peer 因地址的两种不同文本形式被误判为"不同 peer"，进而触发不必要的重新打洞和健康会话重装；mux 控制帧因控制队列打满而超时丢弃时（`sendPong`/`sendWindowUpdate`），现在可以通过 `Mux.CtrlFrameDrops()` 观测到丢弃计数，不再悄无声息地消失；集群裂脑摘除本地路由时，现在会同步清理客户端自己的隧道记录中对应的字段（或整条移除），不再留下一个"看起来活着、实际零流量"的半死隧道；P2P candidate 端点的地址拼接改用 `net.JoinHostPort`，修正了 IPv6 格式问题；自动分配的 subdomain 遇到（概率极低的）碰撞时现在会重试若干次，而不是直接拒绝连接。
+
 ## v0.8.0
 
 P5 深度加固收官：本版本将原计划 v0.7.1-v0.7.5 的加固批次合并为一次 v0.8.0 发布。Wormhole 现在会在 hostname/path-prefix 进入路由表或集群状态前做格式校验，拒绝非法 DNS label、端口/通配符/控制字符、路径穿越、query/fragment 分隔符和畸形 path 值。Redis 集群启动时现在必须配置 `--cluster-secret`，未认证的节点间代理从"显著告警"提升为 fail-fast 配置错误；架构文档中的 Redis 路由申请描述也已更新为当前的原子 Lua 脚本实现，不再保留旧的 `SETNX` 表述。

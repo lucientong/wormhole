@@ -434,6 +434,46 @@ func TestGenerateSubdomain(t *testing.T) {
 	}
 }
 
+// TestServer_GenerateUniqueSubdomain_RetriesOnCollision is the regression
+// test for R80-06: an auto-generated subdomain that happens to collide
+// with one already claimed in the local router must be retried rather
+// than handed out as-is, up to maxSubdomainGenerationAttempts times.
+func TestServer_GenerateUniqueSubdomain_RetriesOnCollision(t *testing.T) {
+	s := NewServer(DefaultConfig())
+	taken := &ClientSession{ID: "taken-client"}
+	require.NoError(t, s.registry.router.RegisterSubdomain("taken", taken))
+
+	calls := 0
+	gen := func() string {
+		calls++
+		if calls == 1 {
+			return "taken"
+		}
+		return "free"
+	}
+
+	assert.Equal(t, "free", s.generateUniqueSubdomainWith(gen))
+	assert.Equal(t, 2, calls, "must retry exactly once after the first candidate collides")
+}
+
+// TestServer_GenerateUniqueSubdomain_GivesUpAfterMaxAttempts verifies the
+// retry loop is bounded: if every candidate keeps colliding, it still
+// returns after maxSubdomainGenerationAttempts instead of retrying forever.
+func TestServer_GenerateUniqueSubdomain_GivesUpAfterMaxAttempts(t *testing.T) {
+	s := NewServer(DefaultConfig())
+	taken := &ClientSession{ID: "taken-client"}
+	require.NoError(t, s.registry.router.RegisterSubdomain("always-taken", taken))
+
+	calls := 0
+	gen := func() string {
+		calls++
+		return "always-taken"
+	}
+
+	assert.Equal(t, "always-taken", s.generateUniqueSubdomainWith(gen))
+	assert.Equal(t, maxSubdomainGenerationAttempts, calls)
+}
+
 func TestExtractIP_IPv6FullAddr(t *testing.T) {
 	// IPv6 full format test (supplements cases in admin_test.go).
 	result := extractIP("[2001:db8::1]:443")
@@ -4073,30 +4113,42 @@ func TestIsValidSubdomainLabel(t *testing.T) {
 
 func TestIsValidHostname(t *testing.T) {
 	tests := []struct {
-		name  string
-		input string
-		want  bool
+		name       string
+		input      string
+		baseDomain string
+		want       bool
 	}{
-		{"single label", "localhost", true},
-		{"domain", "app.example.com", true},
-		{"uppercase accepted", "App.Example.COM", true},
-		{"hyphen label", "my-app.example.com", true},
-		{"max label length", strings.Repeat("a", 63) + ".example.com", true},
-		{"empty", "", false},
-		{"too long", strings.Repeat("a", 244) + ".example.com", false},
-		{"trailing dot", "app.example.com.", false},
-		{"empty label", "app..example.com", false},
-		{"leading hyphen", "-app.example.com", false},
-		{"trailing hyphen", "app-.example.com", false},
-		{"port", "app.example.com:8080", false},
-		{"wildcard", "*.example.com", false},
-		{"underscore", "app_test.example.com", false},
-		{"slash", "app/example.com", false},
-		{"newline injection", "app.example.com\nX-Evil: 1", false},
+		{"single label", "localhost", "", true},
+		{"domain", "app.example.com", "", true},
+		{"uppercase accepted", "App.Example.COM", "", true},
+		{"hyphen label", "my-app.example.com", "", true},
+		{"max label length", strings.Repeat("a", 63) + ".example.com", "", true},
+		{"empty", "", "", false},
+		{"too long", strings.Repeat("a", 244) + ".example.com", "", false},
+		{"trailing dot", "app.example.com.", "", false},
+		{"empty label", "app..example.com", "", false},
+		{"leading hyphen", "-app.example.com", "", false},
+		{"trailing hyphen", "app-.example.com", "", false},
+		{"port", "app.example.com:8080", "", false},
+		{"wildcard", "*.example.com", "", false},
+		{"underscore", "app_test.example.com", "", false},
+		{"slash", "app/example.com", "", false},
+		{"newline injection", "app.example.com\nX-Evil: 1", "", false},
+		// R80-01: a custom hostname inside the server's own base domain
+		// must be rejected — it would bypass RegisterSubdomain's
+		// ownership check and isReservedSubdomain's protection entirely,
+		// since Router.Route matches the hostname table before the
+		// subdomain table.
+		{"exact base domain", "tunnel.internal", "tunnel.internal", false},
+		{"exact base domain case-insensitive", "Tunnel.Internal", "tunnel.internal", false},
+		{"hijacks another tenant's subdomain", "victim.tunnel.internal", "tunnel.internal", false},
+		{"hijacks a reserved subdomain", "admin.tunnel.internal", "tunnel.internal", false},
+		{"unrelated domain still allowed", "app.example.com", "tunnel.internal", true},
+		{"suffix collision without dot boundary allowed", "eviltunnel.internal", "tunnel.internal", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, isValidHostname(tt.input))
+			assert.Equal(t, tt.want, isValidHostname(tt.input, tt.baseDomain))
 		})
 	}
 }
@@ -4257,6 +4309,27 @@ func TestServer_HandleRegister_RejectsInvalidHostname(t *testing.T) {
 	assert.Empty(t, client.Tunnels)
 	client.mu.Unlock()
 	assert.Nil(t, s.registry.router.Route("app.example.com", "/"))
+}
+
+// TestServer_HandleRegister_RejectsBaseDomainHostname is the registration-
+// level regression test for R80-01: a client must not be able to register
+// a custom Hostname that lands inside the server's own base domain, since
+// Router.Route matches the hostname table before the subdomain table and
+// would let this bypass both another tenant's subdomain ownership and the
+// reserved-subdomain protection.
+func TestServer_HandleRegister_RejectsBaseDomainHostname(t *testing.T) {
+	s, client, clientMux, serverMux := newRegisterTestHarness(t)
+
+	resp := registerThroughHarness(t, s, client, clientMux, serverMux,
+		proto.NewRegisterRequest(8080, proto.ProtocolHTTP, "", "victim.test.local", ""))
+
+	require.NotNil(t, resp)
+	assert.False(t, resp.Success)
+	assert.Equal(t, "invalid hostname", resp.Error)
+	client.mu.Lock()
+	assert.Empty(t, client.Tunnels)
+	client.mu.Unlock()
+	assert.Nil(t, s.registry.router.Route("victim.test.local", "/"))
 }
 
 func TestServer_HandleRegister_RejectsInvalidPathPrefix(t *testing.T) {

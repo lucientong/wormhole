@@ -151,6 +151,28 @@ func TestP2PSession_HasActiveSessionFor_AllowsDifferentPeer(t *testing.T) {
 	assert.False(t, c.p2p.hasActiveSessionFor("10.0.0.2:5000", endpoint), "a real peer address change must be allowed to trigger a fresh attempt")
 }
 
+// TestP2PSession_HasActiveSessionFor_SameIPDifferentStringForm is the
+// regression test for R80-03: the same peer, textually written in two
+// different (but semantically equivalent) forms — here differing only in
+// IPv4-mapped-IPv6 notation — must still be recognized as the same active
+// peer. A naive string comparison of peerAddr would wrongly say "different
+// peer" and cause the caller to tear down and re-punch a healthy session.
+func TestP2PSession_HasActiveSessionFor_SameIPDifferentStringForm(t *testing.T) {
+	cfg := DefaultConfig()
+	c := NewClient(cfg)
+
+	pipe, _ := net.Pipe()
+	closeCh := make(chan struct{})
+	c.p2p.installSession("10.0.0.1:5000", newFakePacketConn(pipe), &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 5000}, nil, closeCh)
+
+	// Same host:port, but written through the IPv4-in-IPv6 form; textually
+	// different from the "10.0.0.1:5000" used to install the session.
+	endpoint, err := parseP2PEndpoint("[::ffff:10.0.0.1]:5000")
+	require.NoError(t, err)
+	assert.True(t, c.p2p.hasActiveSessionFor("[::ffff:10.0.0.1]:5000", endpoint),
+		"same IP/port in a different textual form must still match the active session")
+}
+
 func TestParseP2PEndpointCandidates_SkipsInvalidCandidates(t *testing.T) {
 	endpoints := parseP2PEndpointCandidates([]string{
 		"10.0.0.1:5001",

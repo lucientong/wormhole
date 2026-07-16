@@ -630,7 +630,7 @@ func (s *Server) handleClient(conn net.Conn) {
 
 	// Generate subdomain (if not set by auth).
 	if subdomain == "" {
-		subdomain = generateSubdomain()
+		subdomain = s.generateUniqueSubdomain()
 	}
 
 	// Create client session.
@@ -837,7 +837,7 @@ func (s *Server) authenticateClient(mux *tunnel.Mux, sessionID string) (*auth.Cl
 	subdomain := authReq.Subdomain
 	switch {
 	case subdomain == "":
-		subdomain = generateSubdomain()
+		subdomain = s.generateUniqueSubdomain()
 	case !isValidSubdomainLabel(subdomain):
 		s.sendAuthFailure(stream, "invalid subdomain")
 		return nil, "", fmt.Errorf("invalid subdomain requested: %q", subdomain)
@@ -1084,7 +1084,7 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 		}
 		return
 	}
-	if req.Hostname != "" && !isValidHostname(req.Hostname) {
+	if req.Hostname != "" && !isValidHostname(req.Hostname, s.config.Domain) {
 		log.Warn().Str("client", client.ID).Str("hostname", req.Hostname).Msg("Tunnel registration rejected: invalid hostname")
 		resp := proto.NewRegisterResponse(false, "invalid hostname", "", "", 0)
 		if data, encErr := resp.Encode(); encErr == nil {
@@ -1501,6 +1501,35 @@ func generateSubdomain() string {
 	return hex.EncodeToString(b)
 }
 
+// maxSubdomainGenerationAttempts bounds the retry loop in
+// generateUniqueSubdomain. generateSubdomain's 64-bit random space makes a
+// collision vanishingly unlikely; this only guards against a legitimate
+// client being rejected outright on the rare occasion one does happen.
+const maxSubdomainGenerationAttempts = 5
+
+// generateUniqueSubdomain generates a random subdomain that isn't already
+// claimed in this node's local router, retrying up to
+// maxSubdomainGenerationAttempts times on collision (R80-06). This is a
+// best-effort local pre-check, not a substitute for registerClientRoute's
+// authoritative (and cluster-aware) conflict check: it only avoids the
+// self-inflicted case where an auto-assigned subdomain collides with
+// another connection on the same node, which registerClientRoute would
+// otherwise reject the new client for outright.
+func (s *Server) generateUniqueSubdomain() string {
+	return s.generateUniqueSubdomainWith(generateSubdomain)
+}
+
+// generateUniqueSubdomainWith is generateUniqueSubdomain with the random
+// generator injected, so tests can force a deterministic collision
+// sequence without depending on crypto/rand output.
+func (s *Server) generateUniqueSubdomainWith(gen func() string) string {
+	candidate := gen()
+	for i := 1; i < maxSubdomainGenerationAttempts && s.registry.router.LookupSubdomain(candidate) != nil; i++ {
+		candidate = gen()
+	}
+	return candidate
+}
+
 // maxSubdomainLabelLen is the RFC 1035 DNS label length limit.
 const maxSubdomainLabelLen = 63
 
@@ -1539,14 +1568,31 @@ func isValidSubdomainLabel(s string) bool {
 const maxHostnameLen = 253
 
 // isValidHostname reports whether s is safe to use as a custom hostname
-// route. It rejects ports, wildcards, empty labels, trailing dots and
-// control characters before the value reaches router/state-store keys.
-func isValidHostname(s string) bool {
+// route for the server's baseDomain. It rejects ports, wildcards, empty
+// labels, trailing dots and control characters before the value reaches
+// router/state-store keys.
+//
+// It also rejects any hostname equal to, or a subdomain of, baseDomain.
+// Router.Route matches the custom-hostname table before the subdomain
+// table, so a hostname route inside the base domain would completely
+// bypass RegisterSubdomain's ownership check and isReservedSubdomain's
+// reserved-word protection — letting any client hijack another tenant's
+// "<label>.<baseDomain>" traffic (or a reserved name like
+// "admin.<baseDomain>") just by registering it as a custom hostname
+// instead of a subdomain.
+func isValidHostname(s, baseDomain string) bool {
 	if len(s) == 0 || len(s) > maxHostnameLen || strings.HasSuffix(s, ".") {
 		return false
 	}
 	for _, label := range strings.Split(s, ".") {
 		if !isValidSubdomainLabel(label) {
+			return false
+		}
+	}
+	if baseDomain != "" {
+		lower := strings.ToLower(s)
+		domain := strings.ToLower(baseDomain)
+		if lower == domain || strings.HasSuffix(lower, "."+domain) {
 			return false
 		}
 	}

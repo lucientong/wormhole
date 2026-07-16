@@ -1098,6 +1098,7 @@ func TestMux_SendPong_TimesOutOnFullCtrlCh(t *testing.T) {
 	err := mux.sendPong(42)
 	assert.NoError(t, err)
 	assert.Less(t, time.Since(start), 500*time.Millisecond, "sendPong must not block indefinitely when ctrlCh is full")
+	assert.Equal(t, uint64(1), mux.CtrlFrameDrops(), "the silent drop must be observable via CtrlFrameDrops (R80-04)")
 }
 
 func TestMux_SendWindowUpdate_TimesOutOnFullCtrlCh(t *testing.T) {
@@ -1111,6 +1112,7 @@ func TestMux_SendWindowUpdate_TimesOutOnFullCtrlCh(t *testing.T) {
 	err := mux.sendWindowUpdate(1, 4096)
 	assert.NoError(t, err)
 	assert.Less(t, time.Since(start), 500*time.Millisecond, "sendWindowUpdate must not block indefinitely when ctrlCh is full")
+	assert.Equal(t, uint64(1), mux.CtrlFrameDrops(), "the silent drop must be observable via CtrlFrameDrops (R80-04)")
 }
 
 func TestMux_SendPing_NotBlockedByFullSendCh(t *testing.T) {

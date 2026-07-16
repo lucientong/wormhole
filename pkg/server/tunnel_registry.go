@@ -644,6 +644,14 @@ func (tr *tunnelRegistry) refreshClusterRoutes() {
 // from client.clusterRoutes, without touching the shared state store. At the
 // point this is called the store already reports a real conflict, so deleting
 // the store entry would risk removing the winning node's route.
+//
+// It also clears the matching field on the client's TunnelInfo record (and
+// drops the record entirely once none of its route dimensions are left), so
+// client.Tunnels stops advertising a route this node no longer serves and
+// will never retry (R80-05: previously the client-visible tunnel state and
+// the actual routing state could disagree indefinitely after a split-brain
+// drop — a "half-dead" tunnel that looked alive locally but received no
+// traffic and had no path back to a healthy state).
 func (tr *tunnelRegistry) dropLocalClusterRoute(client *ClientSession, entry RouteEntry) bool {
 	removedLocalRoute := tr.router.UnregisterRouteIfOwned(entry, client)
 
@@ -654,9 +662,43 @@ func (tr *tunnelRegistry) dropLocalClusterRoute(client *ClientSession, entry Rou
 			break
 		}
 	}
+	if tunnelID, ok := tunnelIDFromRouteID(entry.RouteID); ok {
+		for i, info := range client.Tunnels {
+			if info.ID != tunnelID {
+				continue
+			}
+			switch {
+			case entry.Subdomain != "":
+				info.Subdomain = ""
+			case entry.Hostname != "":
+				info.Hostname = ""
+			case entry.PathPrefix != "":
+				info.PathPrefix = ""
+			}
+			if info.Subdomain == "" && info.Hostname == "" && info.PathPrefix == "" {
+				client.Tunnels = append(client.Tunnels[:i], client.Tunnels[i+1:]...)
+			}
+			break
+		}
+	}
 	client.mu.Unlock()
 
 	return removedLocalRoute
+}
+
+// tunnelIDFromRouteID extracts the owning tunnel ID from a per-tunnel
+// RouteEntry.RouteID (format "<tunnelID>:sub" / "<tunnelID>:host" /
+// "<tunnelID>:path" — see RegisterTunnel). It returns ok=false for route
+// IDs that don't follow this convention, e.g. the connection-level
+// subdomain reserved at auth time, whose RouteID defaults to the bare
+// ClientID and has no corresponding client.Tunnels entry to correct.
+func tunnelIDFromRouteID(routeID string) (string, bool) {
+	for _, suffix := range [...]string{":sub", ":host", ":path"} {
+		if id, ok := strings.CutSuffix(routeID, suffix); ok {
+			return id, true
+		}
+	}
+	return "", false
 }
 
 func (tr *tunnelRegistry) StateStoreHealth() (configured, healthy bool) {
