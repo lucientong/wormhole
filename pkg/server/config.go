@@ -183,6 +183,12 @@ type Config struct {
 	// OIDCRoleClaim is an optional JWT claim for the Wormhole role.
 	OIDCRoleClaim string
 
+	// OIDCAllowAdminRole allows OIDC role claims to map directly to auth.RoleAdmin.
+	// Defaults to false; when false, an OIDC claim of "admin" is downgraded
+	// to the configured default role to avoid accidental privilege escalation
+	// from IdP claim misconfiguration.
+	OIDCAllowAdminRole bool
+
 	// AuditEnabled enables structured audit logging.
 	// When false, no audit events are recorded.
 	AuditEnabled bool

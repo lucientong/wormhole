@@ -317,13 +317,14 @@ wormhole server -c server.yml
 | `--oidc-client-id` | 用于 OIDC audience 校验的 OAuth2 client ID | 无 |
 | `--oidc-team-claim` | 用作团队名的 JWT claim | `email` |
 | `--oidc-role-claim` | 用作 Wormhole 角色的 JWT claim | 无 |
+| `--oidc-allow-admin-role` | 允许 OIDC 角色 claim 授予 Wormhole `admin`；关闭时 `admin` claim 会降级为默认 member 角色 | false |
 | `--cluster-backend` | 集群状态后端：memory 或 redis | （禁用） |
 | `--cluster-node-id` | 本节点在集群中的唯一 ID | `os.Hostname()` |
 | `--cluster-node-addr` | 其他节点访问本节点的地址 | 无 |
 | `--cluster-redis-addr` | 集群状态使用的 Redis 地址 | 无 |
 | `--cluster-redis-password` | Redis AUTH 密码 | 无 |
 | `--cluster-redis-db` | Redis 数据库编号 | 0 |
-| `--cluster-secret` | 节点间代理请求校验用的共享密钥（`X-Wormhole-Cluster-Secret`） | 无 |
+| `--cluster-secret` | 节点间代理请求校验用的共享密钥（`X-Wormhole-Cluster-Secret`）；使用 `--cluster-backend redis` 时必填 | 无 |
 | `--auth-redis-addr` | 鉴权/团队/吊销状态使用的 Redis 地址（`--persistence redis`）；未设置时回退到 `--cluster-redis-addr` | 无 |
 | `--auth-redis-password` | 鉴权存储的 Redis AUTH 密码；未设置时回退到 `--cluster-redis-password` | 无 |
 | `--auth-redis-db` | 鉴权存储的 Redis 数据库编号；未设置时回退到 `--cluster-redis-db` | 0 |
@@ -395,6 +396,14 @@ wormhole server --require-auth --auth-secret "my-secret-at-least-16-chars"
 wormhole server --require-auth \
   --oidc-issuer https://accounts.google.com \
   --oidc-client-id <your-client-id>
+
+# OIDC 角色 claim 默认只映射 member/viewer。若确实要允许 IdP claim
+# 授予 Wormhole admin（与 --admin-token 保护的 Admin API 权限体系无关），需显式开启：
+wormhole server --require-auth \
+  --oidc-issuer https://accounts.google.com \
+  --oidc-client-id <your-client-id> \
+  --oidc-role-claim wormhole_role \
+  --oidc-allow-admin-role
 
 # 使用独立 Token 保护管理 API
 wormhole server --admin-token my-admin-secret
@@ -514,7 +523,7 @@ wormhole server \
 每个节点会：
 - `--cluster-node-id` 未设置时默认取本机主机名，避免多个节点意外共用空字符串 ID
 - 每 30 秒向 Redis 发送一次心跳，并在同一周期内重新注册（刷新 TTL）它当前持有的每一条路由——子域名、hostname、path 前缀均一视同仁——确保长连接的隧道不会从共享状态存储中静默过期
-- 在 Redis 中查找未知的子域名/hostname/path，并通过 `httputil.ReverseProxy` 将 HTTP 请求代理给真正持有该路由的节点，转发时附带 `--cluster-secret` 头，拒绝伪造的节点间代理流量
+- 在 Redis 中查找未知的子域名/hostname/path，并通过 `httputil.ReverseProxy` 将 HTTP 请求代理给真正持有该路由的节点，转发时附带 `--cluster-secret` 头，拒绝伪造的节点间代理流量；Redis 集群缺少该共享密钥会直接启动失败
 - 配置了 `--persistence redis` 后，在某一节点吊销 Token 或更新团队信息会立即对所有其他节点可见（没有传播延迟）；若未单独设置 `--auth-redis-*`，会回退使用 `--cluster-redis-addr`/`--cluster-redis-password`/`--cluster-redis-db`
 - 在 `GET /health` 中暴露 Redis 连接状态（`cluster.state_store_healthy`）；状态存储不可达时整体状态会降级为 `"degraded"`
 - 重连时，如果原持有者的会话已经失效（mux 已关闭），会立即回收对应的子域名/hostname/path，而不是返回一次虚假的冲突错误
@@ -655,6 +664,8 @@ P2P 直连使用**端到端加密**，基于 X25519 ECDH 密钥交换和 AES-256
 **两种 P2P 场景，两条不同的流量路径。** 公网访客（浏览器、curl 等普通 HTTP 客户端）访问你的隧道 hostname 时永远无法打洞——服务器物理上不可能替一个任意的 HTTP 客户端做 NAT 穿透——所以这条流量始终走加密中继。P2P 真正加速的是 **`wormhole connect`**：当对端也是一个 `wormhole client` 时，双方打洞成功后所有数据全程走端到端加密的 UDP 直连通道，服务器只用于信令（不会看到任何一个字节的隧道流量）。如果打洞失败或 P2P 通道之后中断，`wormhole connect` 会直接关闭本地监听，而不是悄悄降级到中继——connect 模式没有中继兜底路径（服务器从未为这类会话注册过隧道），所以 P2P 路径丢失就意味着连接真的断了，需要重试。
 
 `wormhole connect` 与 P2P 加速数据面底层共用的可靠 UDP 传输（`UDPMux` + `UDPStream`）采用 RFC 6298 风格的自适应重传（SRTT/RTTVAR/RTO 估算 + 按段指数退避），替代固定超时时间，在真实网络抖动和丢包下吞吐能平滑退化，不会因固定超时过短而过度重传、也不会因固定超时过长而恢复迟缓。
+
+对于 Symmetric+Symmetric NAT 组合，信令服务器会预测一小组可能的对端端口，双方 client 会把这些 candidate endpoints 和主 public endpoint 放进同一个 UDP 打洞循环里轮流探测。这样能提高直连命中率，但不会改变兜底语义：超时前没有任何探测响应时，`wormhole connect` 仍会报告直连失败。
 
 ```bash
 # 禁用 P2P，强制所有流量走加密的中继通道

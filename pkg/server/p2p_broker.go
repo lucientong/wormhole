@@ -166,8 +166,9 @@ func (b *p2pBroker) HandleOffer(client *ClientSession, stream *tunnel.Stream, re
 	// Client.sendP2POffer, which now loop-reads framed messages instead of
 	// doing a single raw stream.Read().
 	bothSymmetric := req.NATType == natTypeSymmetric && peerNATType == natTypeSymmetric
+	var initiatorCandidates []string
 	if bothSymmetric {
-		initiatorCandidates := predictCandidatesForSymmetric(req.PublicAddr, req.NATType, 8)
+		initiatorCandidates = predictCandidatesForSymmetric(req.PublicAddr, req.NATType, 8)
 		peerCandidates := predictCandidatesForSymmetric(peerAddr, peerNATType, 8)
 
 		// Send peer's predicted candidates to the initiating client.
@@ -177,9 +178,6 @@ func (b *p2pBroker) HandleOffer(client *ClientSession, stream *tunnel.Stream, re
 				log.Error().Err(err).Msg("Failed to write P2P candidates")
 			}
 		}
-		// Initiator's predicted candidates will be forwarded to peer in notifyPeer.
-		_ = initiatorCandidates
-
 		log.Info().
 			Str("client", client.ID).
 			Str("peer", peer.ID).
@@ -196,7 +194,7 @@ func (b *p2pBroker) HandleOffer(client *ClientSession, stream *tunnel.Stream, re
 	}
 
 	// Notify the peer about the incoming P2P request (via a new stream).
-	go b.notifyPeer(peer, client)
+	go b.notifyPeer(peer, client, initiatorCandidates)
 }
 
 // isP2PCompatible checks if two NAT types can establish a P2P connection.
@@ -245,7 +243,7 @@ func splitHostPort(addr string) (host, port string, err error) {
 // notifyPeer sends a P2P offer notification to the peer client.
 // For Symmetric+Symmetric NAT pairs it also sends predicted port candidates
 // for the initiator side so the peer can attempt hole punching.
-func (b *p2pBroker) notifyPeer(peer *ClientSession, initiator *ClientSession) {
+func (b *p2pBroker) notifyPeer(peer *ClientSession, initiator *ClientSession, initiatorCandidates []string) {
 	initiator.mu.Lock()
 	initiatorAddr := initiator.P2PPublicAddr
 	initiatorNATType := initiator.P2PNATType
@@ -275,15 +273,14 @@ func (b *p2pBroker) notifyPeer(peer *ClientSession, initiator *ClientSession) {
 	// client's Client.handleStream, which loop-reads framed control
 	// messages off this notification stream.
 	if initiatorNATType == natTypeSymmetric && peerNATType == natTypeSymmetric {
-		candidates := predictCandidatesForSymmetric(initiatorAddr, initiatorNATType, 8)
-		if len(candidates) > 0 {
-			candidatesMsg := proto.NewP2PCandidates(initiatorTunnelID, candidates)
+		if len(initiatorCandidates) > 0 {
+			candidatesMsg := proto.NewP2PCandidates(initiatorTunnelID, initiatorCandidates)
 			if err := proto.WriteControlMessage(stream, candidatesMsg); err != nil {
 				log.Error().Err(err).Str("peer", peer.ID).Msg("Failed to write P2P candidates to peer")
 			} else {
 				log.Debug().
 					Str("peer", peer.ID).
-					Int("candidates", len(candidates)).
+					Int("candidates", len(initiatorCandidates)).
 					Msg("Sent initiator port prediction candidates to peer")
 			}
 		}

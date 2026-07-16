@@ -54,9 +54,30 @@ var punchMagic = []byte{0x57, 0x48, 0x50, 0x50} // "WHPP" = WormHole Punch Proto
 // It sends probe packets to the peer's public endpoint while simultaneously
 // listening for incoming probes. Returns the established connection if successful.
 func (h *HolePuncher) Punch(ctx context.Context, localConn net.PacketConn, peerEndpoint Endpoint) (*net.UDPAddr, error) {
+	return h.PunchMulti(ctx, localConn, peerEndpoint, nil)
+}
+
+// PunchMulti is like Punch, but also sends probes to predicted candidate
+// endpoints. All probes share the same local socket and cadence; each tick
+// sends one probe to the primary endpoint and then one to each candidate.
+func (h *HolePuncher) PunchMulti(ctx context.Context, localConn net.PacketConn, peerEndpoint Endpoint, candidates []Endpoint) (*net.UDPAddr, error) {
 	peerAddr, err := net.ResolveUDPAddr("udp", peerEndpoint.String())
 	if err != nil {
 		return nil, fmt.Errorf("resolve peer address: %w", err)
+	}
+	peerAddrs := []*net.UDPAddr{peerAddr}
+	seen := map[string]struct{}{peerAddr.String(): {}}
+	for _, candidate := range candidates {
+		addr, resolveErr := net.ResolveUDPAddr("udp", candidate.String())
+		if resolveErr != nil {
+			log.Debug().Err(resolveErr).Str("candidate", candidate.String()).Msg("Skipping unresolved P2P candidate endpoint")
+			continue
+		}
+		if _, ok := seen[addr.String()]; ok {
+			continue
+		}
+		seen[addr.String()] = struct{}{}
+		peerAddrs = append(peerAddrs, addr)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, h.config.Timeout)
@@ -71,7 +92,7 @@ func (h *HolePuncher) Punch(ctx context.Context, localConn net.PacketConn, peerE
 	// Sender goroutine: send probe packets to peer.
 	go func() {
 		defer wg.Done()
-		h.sendProbes(ctx, localConn, peerAddr)
+		h.sendProbes(ctx, localConn, peerAddrs)
 	}()
 
 	// Receiver goroutine: listen for probe packets from peer.
@@ -100,8 +121,8 @@ func (h *HolePuncher) Punch(ctx context.Context, localConn net.PacketConn, peerE
 	}
 }
 
-// sendProbes sends periodic UDP probe packets to the peer.
-func (h *HolePuncher) sendProbes(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) {
+// sendProbes sends periodic UDP probe packets to the peer endpoints.
+func (h *HolePuncher) sendProbes(ctx context.Context, conn net.PacketConn, peers []*net.UDPAddr) {
 	// Build probe packet: magic + "probe" [+ HMAC tag].
 	probePayload := []byte("probe")
 	baseProbe := make([]byte, 0, len(punchMagic)+len(probePayload))
@@ -117,10 +138,7 @@ func (h *HolePuncher) sendProbes(ctx context.Context, conn net.PacketConn, peer 
 		probe = append(probe, tag...)
 	}
 
-	// Send the first probe immediately (avoid ticker startup delay).
-	if _, err := conn.WriteTo(probe, peer); err != nil {
-		log.Debug().Err(err).Str("peer", peer.String()).Msg("Probe send failed")
-	}
+	h.sendProbeBatch(conn, probe, peers)
 
 	ticker := time.NewTicker(h.config.Interval)
 	defer ticker.Stop()
@@ -130,9 +148,15 @@ func (h *HolePuncher) sendProbes(ctx context.Context, conn net.PacketConn, peer 
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if _, err := conn.WriteTo(probe, peer); err != nil {
-				log.Debug().Err(err).Str("peer", peer.String()).Msg("Probe send failed")
-			}
+			h.sendProbeBatch(conn, probe, peers)
+		}
+	}
+}
+
+func (h *HolePuncher) sendProbeBatch(conn net.PacketConn, probe []byte, peers []*net.UDPAddr) {
+	for _, peer := range peers {
+		if _, err := conn.WriteTo(probe, peer); err != nil {
+			log.Debug().Err(err).Str("peer", peer.String()).Msg("Probe send failed")
 		}
 	}
 }

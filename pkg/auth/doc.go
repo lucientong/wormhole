@@ -17,7 +17,10 @@
 //     standard JWTs validated against an OIDC provider's JWKS. [Auth.ValidateToken]
 //     detects a JWT-shaped token automatically and routes it to the OIDC
 //     validator instead of the HMAC path, so both modes can coexist on one
-//     server (e.g. pre-shared tokens for CI, OIDC for humans).
+//     server (e.g. pre-shared tokens for CI, OIDC for humans). Role claims
+//     can map to member/viewer by default; mapping to [RoleAdmin] requires
+//     [OIDCClaimMapping.AllowAdminRole] to be enabled explicitly, so a
+//     provider-side claim mistake cannot silently grant tunnel-layer admin.
 //
 // # SSO Login (Device Code Flow)
 //
@@ -80,7 +83,10 @@
 //	}
 //
 //	// OIDC mode layered on top of the same Auth instance
-//	v, err := auth.NewOIDCValidator(auth.OIDCConfig{Issuer: "https://accounts.google.com"})
+//	v, err := auth.NewOIDCValidator(auth.OIDCConfig{
+//	    Issuer:   "https://accounts.google.com",
+//	    ClientID: "your-oauth-client-id",
+//	})
 //	a.SetOIDCValidator(v)
 //
 //	// Simple mode, no teams

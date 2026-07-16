@@ -289,9 +289,10 @@ func NewServer(config Config) *Server {
 				Issuer:   config.OIDCIssuer,
 				ClientID: config.OIDCClientID,
 				ClaimMapping: auth.OIDCClaimMapping{
-					TeamClaim:   config.OIDCTeamClaim,
-					RoleClaim:   config.OIDCRoleClaim,
-					DefaultRole: auth.RoleMember,
+					TeamClaim:      config.OIDCTeamClaim,
+					RoleClaim:      config.OIDCRoleClaim,
+					DefaultRole:    auth.RoleMember,
+					AllowAdminRole: config.OIDCAllowAdminRole,
 				},
 			}
 			if v, err := auth.NewOIDCValidator(oidcCfg); err != nil {
@@ -1083,6 +1084,22 @@ func (s *Server) handleRegister(client *ClientSession, stream *tunnel.Stream, re
 		}
 		return
 	}
+	if req.Hostname != "" && !isValidHostname(req.Hostname) {
+		log.Warn().Str("client", client.ID).Str("hostname", req.Hostname).Msg("Tunnel registration rejected: invalid hostname")
+		resp := proto.NewRegisterResponse(false, "invalid hostname", "", "", 0)
+		if data, encErr := resp.Encode(); encErr == nil {
+			_, _ = stream.Write(data)
+		}
+		return
+	}
+	if req.PathPrefix != "" && !isValidPathPrefix(req.PathPrefix) {
+		log.Warn().Str("client", client.ID).Str("path_prefix", req.PathPrefix).Msg("Tunnel registration rejected: invalid path prefix")
+		resp := proto.NewRegisterResponse(false, "invalid path prefix", "", "", 0)
+		if data, encErr := resp.Encode(); encErr == nil {
+			_, _ = stream.Write(data)
+		}
+		return
+	}
 
 	// Determine public URL: prefer a custom hostname when the tunnel
 	// requested one, otherwise fall back to the subdomain-based URL.
@@ -1516,6 +1533,53 @@ func isValidSubdomainLabel(s string) bool {
 	return true
 }
 
+// maxHostnameLen is the RFC 1035 fully-qualified domain name length limit,
+// excluding an optional trailing dot (which Wormhole does not accept in
+// client-supplied route hostnames).
+const maxHostnameLen = 253
+
+// isValidHostname reports whether s is safe to use as a custom hostname
+// route. It rejects ports, wildcards, empty labels, trailing dots and
+// control characters before the value reaches router/state-store keys.
+func isValidHostname(s string) bool {
+	if len(s) == 0 || len(s) > maxHostnameLen || strings.HasSuffix(s, ".") {
+		return false
+	}
+	for _, label := range strings.Split(s, ".") {
+		if !isValidSubdomainLabel(label) {
+			return false
+		}
+	}
+	return true
+}
+
+const maxPathPrefixLen = 1024
+
+// isValidPathPrefix reports whether s is a safe path-prefix route. It
+// accepts ordinary URL path prefixes and rejects traversal, URL components
+// that belong outside the path, and control characters.
+func isValidPathPrefix(s string) bool {
+	if len(s) == 0 || len(s) > maxPathPrefixLen || s[0] != '/' {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c == 0x7f {
+			return false
+		}
+		switch c {
+		case '\\', '?', '#':
+			return false
+		}
+	}
+	for _, part := range strings.Split(s, "/") {
+		if part == ".." {
+			return false
+		}
+	}
+	return true
+}
+
 // isReservedSubdomain reports whether subdomain is blocked for role by
 // Config.ReservedSubdomains — e.g. "admin"/"api"/"www" staying available
 // for the operator's own use regardless of which team's client registers
@@ -1562,9 +1626,9 @@ func initStateStore(config Config) StateStore {
 		// Node-to-node proxied requests are only authenticated when a
 		// shared ClusterSecret is configured. Running a multi-node cluster
 		// without one means any caller that can reach a node's
-		// ClusterNodeAddr can impersonate a peer hop — warn loudly.
+		// ClusterNodeAddr can impersonate a peer hop, so fail closed.
 		if config.ClusterSecret == "" {
-			log.Warn().Msg("Cluster: ClusterSecret is not set — inter-node proxied requests are UNAUTHENTICATED; set a shared secret in production")
+			log.Fatal().Msg("Cluster: ClusterSecret must be set when using redis state backend")
 		}
 		store, err := NewRedisStateStore(RedisStateStoreConfig{
 			Addr:     config.ClusterRedisAddr,

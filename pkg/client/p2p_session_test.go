@@ -39,7 +39,7 @@ func TestP2PSession_InstallSession_TearsDownPreviousSession(t *testing.T) {
 	newCloseCh := make(chan struct{})
 	newPeer := &net.UDPAddr{IP: net.ParseIP("10.0.0.2"), Port: 4242}
 
-	gen := c.p2p.installSession(newConn, newPeer, nil, newCloseCh)
+	gen := c.p2p.installSession("10.0.0.2:4242", newConn, newPeer, nil, newCloseCh)
 
 	// The old session's signal channel must be closed so any goroutine
 	// still selecting on it (e.g. a lingering acceptP2PStreams) unblocks
@@ -54,6 +54,7 @@ func TestP2PSession_InstallSession_TearsDownPreviousSession(t *testing.T) {
 	c.p2p.mu.Lock()
 	assert.Same(t, newConn, c.p2p.conn, "new connection should be installed")
 	assert.Equal(t, newPeer, c.p2p.peer)
+	assert.Equal(t, "10.0.0.2:4242", c.p2p.peerAddr)
 	assert.True(t, newCloseCh == c.p2p.sessionCloseCh, "new session's close channel should be installed")
 	c.p2p.mu.Unlock()
 
@@ -73,7 +74,7 @@ func TestP2PSession_InstallSession_NoPreviousSession(t *testing.T) {
 	newConn := newFakePacketConn(newPipe)
 	newCloseCh := make(chan struct{})
 
-	gen := c.p2p.installSession(newConn, &net.UDPAddr{}, nil, newCloseCh)
+	gen := c.p2p.installSession("", newConn, &net.UDPAddr{}, nil, newCloseCh)
 
 	assert.True(t, c.IsP2PMode())
 	assert.Equal(t, uint64(1), gen)
@@ -92,7 +93,7 @@ func TestP2PSession_AttemptP2P_SkipsWhenAlreadyAttempting(t *testing.T) {
 	// Simulate an attempt already in flight.
 	c.p2p.attempting.Store(true)
 
-	c.p2p.attemptP2P(context.Background(), c.relay, "10.0.0.1:5000", "", true)
+	c.p2p.attemptP2P(context.Background(), c.relay, "10.0.0.1:5000", "", nil, true)
 
 	// The guard must be left exactly as the in-flight attempt (not this
 	// call) would eventually clear it — this call's early return must not
@@ -112,9 +113,55 @@ func TestP2PSession_AttemptP2P_ReleasesGuardOnCompletion(t *testing.T) {
 
 	// No NAT info discovered, so manager.AttemptP2P fails fast — this
 	// exercises the "attempt ran and failed" path, not the skip path.
-	c.p2p.attemptP2P(context.Background(), c.relay, "10.0.0.1:5000", "", true)
+	c.p2p.attemptP2P(context.Background(), c.relay, "10.0.0.1:5000", "", nil, true)
 
 	assert.False(t, c.p2p.attempting.Load(), "guard must be released after a completed attempt")
+}
+
+func TestP2PSession_AttemptP2P_SkipsDuplicateActivePeer(t *testing.T) {
+	cfg := DefaultConfig()
+	c := NewClient(cfg)
+
+	pipe, _ := net.Pipe()
+	closeCh := make(chan struct{})
+	gen := c.p2p.installSession("10.0.0.1:5000", newFakePacketConn(pipe), &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 5000}, nil, closeCh)
+
+	c.p2p.attemptP2P(context.Background(), c.relay, "10.0.0.1:5000", "", nil, true)
+
+	assert.True(t, c.IsP2PMode())
+	assert.Equal(t, gen, c.p2p.sessionGen, "duplicate active-peer notification must not reinstall the session")
+	assert.False(t, c.p2p.attempting.Load(), "duplicate skip must not take the in-flight guard")
+	select {
+	case <-closeCh:
+		t.Fatal("duplicate active-peer notification must not close the current session")
+	default:
+	}
+}
+
+func TestP2PSession_HasActiveSessionFor_AllowsDifferentPeer(t *testing.T) {
+	cfg := DefaultConfig()
+	c := NewClient(cfg)
+
+	pipe, _ := net.Pipe()
+	closeCh := make(chan struct{})
+	c.p2p.installSession("10.0.0.1:5000", newFakePacketConn(pipe), &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 5000}, nil, closeCh)
+
+	endpoint, err := parseP2PEndpoint("10.0.0.2:5000")
+	require.NoError(t, err)
+	assert.False(t, c.p2p.hasActiveSessionFor("10.0.0.2:5000", endpoint), "a real peer address change must be allowed to trigger a fresh attempt")
+}
+
+func TestParseP2PEndpointCandidates_SkipsInvalidCandidates(t *testing.T) {
+	endpoints := parseP2PEndpointCandidates([]string{
+		"10.0.0.1:5001",
+		"not-an-endpoint",
+		"10.0.0.1:5002",
+	})
+
+	require.Len(t, endpoints, 2)
+	assert.Equal(t, "10.0.0.1", endpoints[0].IP)
+	assert.Equal(t, 5001, endpoints[0].Port)
+	assert.Equal(t, 5002, endpoints[1].Port)
 }
 
 // TestP2PSession_FallbackFromStaleSession_IgnoresStaleGeneration verifies
@@ -129,12 +176,12 @@ func TestP2PSession_FallbackFromStaleSession_IgnoresStaleGeneration(t *testing.T
 	// one, simulating a fresh attempt superseding the first before its
 	// accept loop noticed anything was wrong.
 	pipe1, _ := net.Pipe()
-	staleGen := c.p2p.installSession(newFakePacketConn(pipe1), &net.UDPAddr{}, nil, make(chan struct{}))
+	staleGen := c.p2p.installSession("", newFakePacketConn(pipe1), &net.UDPAddr{}, nil, make(chan struct{}))
 
 	pipe2, _ := net.Pipe()
 	currentCloseCh := make(chan struct{})
 	currentConn := newFakePacketConn(pipe2)
-	currentGen := c.p2p.installSession(currentConn, &net.UDPAddr{}, nil, currentCloseCh)
+	currentGen := c.p2p.installSession("", currentConn, &net.UDPAddr{}, nil, currentCloseCh)
 	require.Greater(t, currentGen, staleGen)
 
 	// The stale accept loop's error must be ignored: the current session
@@ -172,7 +219,7 @@ func TestP2PSession_Close_ResetsMode(t *testing.T) {
 	c := NewClient(cfg)
 
 	pipe, _ := net.Pipe()
-	_ = c.p2p.installSession(newFakePacketConn(pipe), &net.UDPAddr{}, nil, make(chan struct{}))
+	_ = c.p2p.installSession("", newFakePacketConn(pipe), &net.UDPAddr{}, nil, make(chan struct{}))
 	require.True(t, c.IsP2PMode())
 
 	c.p2p.Close()

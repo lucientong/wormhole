@@ -336,13 +336,14 @@ Only fields present in the file override the defaults — anything omitted keeps
 | `--oidc-client-id` | OAuth2 client ID for OIDC audience validation | None |
 | `--oidc-team-claim` | JWT claim to use as team name | `email` |
 | `--oidc-role-claim` | JWT claim to use as Wormhole role | None |
+| `--oidc-allow-admin-role` | Allow OIDC role claims to grant Wormhole `admin`; when false, `admin` claims downgrade to the default member role | false |
 | `--cluster-backend` | Cluster state backend: memory or redis | (disabled) |
 | `--cluster-node-id` | Unique ID for this node in the cluster | `os.Hostname()` |
 | `--cluster-node-addr` | Address other nodes use to reach this node | None |
 | `--cluster-redis-addr` | Redis address for cluster state | None |
 | `--cluster-redis-password` | Redis AUTH password | None |
 | `--cluster-redis-db` | Redis database number | 0 |
-| `--cluster-secret` | Shared secret validated on inter-node proxy requests (`X-Wormhole-Cluster-Secret`) | None |
+| `--cluster-secret` | Shared secret validated on inter-node proxy requests (`X-Wormhole-Cluster-Secret`); required with `--cluster-backend redis` | None |
 | `--auth-redis-addr` | Redis address for auth/team/revocation state (`--persistence redis`); falls back to `--cluster-redis-addr` | None |
 | `--auth-redis-password` | Redis AUTH password for the auth store; falls back to `--cluster-redis-password` | None |
 | `--auth-redis-db` | Redis database number for the auth store; falls back to `--cluster-redis-db` | 0 |
@@ -414,6 +415,14 @@ wormhole server --require-auth --auth-secret "my-secret-at-least-16-chars"
 wormhole server --require-auth \
   --oidc-issuer https://accounts.google.com \
   --oidc-client-id <your-client-id>
+
+# OIDC role claims map to member/viewer by default. To allow an IdP claim
+# to grant Wormhole admin (separate from --admin-token), opt in explicitly:
+wormhole server --require-auth \
+  --oidc-issuer https://accounts.google.com \
+  --oidc-client-id <your-client-id> \
+  --oidc-role-claim wormhole_role \
+  --oidc-allow-admin-role
 
 # Protect admin API with a separate token
 wormhole server --admin-token my-admin-secret
@@ -533,7 +542,7 @@ wormhole server \
 Each node:
 - Defaults `--cluster-node-id` to its hostname when unset, so nodes don't accidentally collide on the empty string
 - Sends a heartbeat to Redis every 30 seconds, and in the same cycle re-registers (TTL-refreshes) every route it currently owns — subdomain, hostname, and path-prefix routes alike — so long-lived tunnels never silently expire out of the shared state store
-- Looks up unknown subdomains/hostnames/paths in Redis and proxies HTTP requests to the owning node via `httputil.ReverseProxy`, attaching `--cluster-secret` as a header so peer nodes reject forged proxy traffic
+- Looks up unknown subdomains/hostnames/paths in Redis and proxies HTTP requests to the owning node via `httputil.ReverseProxy`, attaching `--cluster-secret` as a header so peer nodes reject forged proxy traffic; Redis-backed clusters fail startup if this shared secret is missing
 - With `--persistence redis`, revoking a token or updating a team on one node is instantly visible to every other node (no propagation delay); falls back to `--cluster-redis-addr`/`--cluster-redis-password`/`--cluster-redis-db` if `--auth-redis-*` isn't set separately
 - Reports Redis connectivity in `GET /health` (`cluster.state_store_healthy`); status flips to `"degraded"` if the state store becomes unreachable
 - On reconnect, reclaims a subdomain/hostname/path immediately if the previous owner's session has gone stale (mux closed), instead of returning a spurious conflict
@@ -688,6 +697,8 @@ P2P direct connections feature **end-to-end encryption** using X25519 ECDH key e
 **Two P2P scenarios, two different traffic paths.** Public visitors hitting your tunnel's hostname (a plain browser, curl, etc.) can never be hole-punched — the server physically cannot NAT-traverse with an arbitrary HTTP client — so that traffic always goes through the encrypted relay. What P2P actually accelerates is **`wormhole connect`**: when the peer on the other end is *also* a `wormhole client`, both sides hole-punch and all data flows directly over the encrypted UDP channel end-to-end, with the server used purely for signaling (it never sees a single byte of tunneled traffic). If the hole punch fails or the P2P channel later dies, `wormhole connect` closes its local listener rather than silently degrading to relay — there is no relay path for a connect-mode session (the server never registered a tunnel for it), so a lost P2P path really does mean the connection is gone until you retry.
 
 The reliable UDP transport (`UDPMux` + `UDPStream`) underneath both `wormhole connect` and the P2P-accelerated data plane uses RFC 6298-style adaptive retransmission (SRTT/RTTVAR/RTO estimation with per-segment exponential backoff) instead of a fixed timeout, so throughput degrades gracefully under real-world jitter and packet loss instead of retransmitting either too eagerly or too slowly.
+
+For Symmetric+Symmetric NAT pairs, the signaling server predicts a small set of likely peer ports and both clients include those candidate endpoints in the same UDP hole-punch loop as the primary public endpoint. This improves the odds of a direct path without changing the fallback behavior: if no probe response arrives before the timeout, `wormhole connect` still reports the failed direct connection.
 
 ```bash
 # Disable P2P to force all traffic through the encrypted relay

@@ -127,6 +127,39 @@ func (r *Router) UnregisterPath(pathPrefix string) {
 	delete(r.paths, normalizePath(pathPrefix))
 }
 
+// UnregisterRouteIfOwned removes the specific route entry only when the
+// local router still maps that key to client. It is used for cluster
+// conflict remediation, where blindly deleting by key could remove a newer
+// local route that replaced the stale one after the heartbeat snapshot.
+func (r *Router) UnregisterRouteIfOwned(entry RouteEntry, client *ClientSession) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	switch {
+	case entry.Subdomain != "":
+		key := strings.ToLower(entry.Subdomain)
+		if r.subdomains[key] != client {
+			return false
+		}
+		delete(r.subdomains, key)
+	case entry.Hostname != "":
+		key := strings.ToLower(entry.Hostname)
+		if r.hostnames[key] != client {
+			return false
+		}
+		delete(r.hostnames, key)
+	case entry.PathPrefix != "":
+		key := normalizePath(entry.PathPrefix)
+		if r.paths[key] != client {
+			return false
+		}
+		delete(r.paths, key)
+	default:
+		return false
+	}
+	return true
+}
+
 // Unregister removes all routes for the given client session.
 func (r *Router) Unregister(client *ClientSession) {
 	r.mu.Lock()

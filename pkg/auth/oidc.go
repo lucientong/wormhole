@@ -19,13 +19,16 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/rs/zerolog/log"
 )
 
 // JWT signing algorithm identifiers (JWS "alg" header values, RFC 7518).
 const (
-	jwtAlgRS256 = "RS256"
-	jwtAlgES256 = "ES256"
-	jwtAlgES384 = "ES384"
+	jwtAlgRS256   = "RS256"
+	jwtAlgES256   = "ES256"
+	jwtAlgES384   = "ES384"
+	jwkKeyTypeRSA = "RSA"
 )
 
 // OIDCConfig holds the OIDC provider configuration.
@@ -59,6 +62,11 @@ type OIDCClaimMapping struct {
 	// DefaultRole is the role assigned when RoleClaim is absent.
 	// Defaults to RoleMember.
 	DefaultRole Role
+
+	// AllowAdminRole allows RoleClaim to map directly to RoleAdmin.
+	// Defaults to false so an IdP claim misconfiguration cannot silently
+	// grant Wormhole admin privileges.
+	AllowAdminRole bool
 }
 
 // OIDCValidator validates JWT tokens issued by an OIDC provider.
@@ -69,9 +77,10 @@ type OIDCValidator struct {
 	client  *http.Client
 	jwksURL string
 
-	mu       sync.RWMutex
-	keyCache map[string]crypto.PublicKey // kid → public key
-	cacheExp time.Time
+	mu        sync.RWMutex
+	keyCache  map[string]crypto.PublicKey // kid → public key
+	cacheExp  time.Time
+	refreshMu sync.Mutex
 }
 
 const jwksCacheTTL = 15 * time.Minute
@@ -195,7 +204,18 @@ func (v *OIDCValidator) getKey(kid string) (crypto.PublicKey, error) {
 		return key, nil
 	}
 
-	// Refresh JWKS.
+	v.refreshMu.Lock()
+	defer v.refreshMu.Unlock()
+
+	// Another goroutine may have refreshed while we were waiting.
+	v.mu.RLock()
+	key, ok = v.keyCache[kid]
+	expired = time.Now().After(v.cacheExp)
+	v.mu.RUnlock()
+	if ok && !expired {
+		return key, nil
+	}
+
 	if err := v.refreshKeys(); err != nil {
 		return nil, err
 	}
@@ -335,7 +355,13 @@ func mapRole(rawClaims map[string]json.RawMessage, mapping OIDCClaimMapping) Rol
 	}
 	if roleName := extractStringClaim(rawClaims, mapping.RoleClaim); roleName != "" {
 		switch Role(roleName) {
-		case RoleAdmin, RoleMember, RoleViewer:
+		case RoleAdmin:
+			if mapping.AllowAdminRole {
+				role = RoleAdmin
+			} else {
+				log.Warn().Str("role_claim", mapping.RoleClaim).Msg("OIDC role claim mapped to admin but AllowAdminRole is disabled; using default role")
+			}
+		case RoleMember, RoleViewer:
 			role = Role(roleName)
 		}
 	}
@@ -430,7 +456,7 @@ func parseJWK(raw json.RawMessage) (crypto.PublicKey, string, error) {
 	}
 
 	switch k.Kty {
-	case "RSA":
+	case jwkKeyTypeRSA:
 		key, err := parseRSAJWK(k)
 		return key, k.Kid, err
 	case "EC":

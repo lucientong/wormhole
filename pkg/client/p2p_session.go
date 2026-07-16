@@ -90,6 +90,7 @@ type p2pSession struct {
 	mu             sync.Mutex
 	conn           net.PacketConn     // UDP connection for P2P
 	peer           *net.UDPAddr       // Peer's confirmed UDP address
+	peerAddr       string             // Peer's advertised signaling address for duplicate-notification suppression
 	udpMux         *p2p.UDPMux        // Multiplexed P2P transport
 	sessionCloseCh chan struct{}      // Signal to stop the P2P accept loop for the current session
 	keyPair        *p2p.KeyPair       // ECDH key pair for this session
@@ -276,7 +277,7 @@ func (p *p2pSession) handleOfferResponse(ctx context.Context, relay RelayChannel
 		Msg("P2P peer found, attempting connection")
 
 	// Offer sender is the initiator for stream-ID allocation.
-	go p.attemptP2P(ctx, relay, resp.PeerAddr, resp.PeerTunnelID, true)
+	go p.attemptP2P(ctx, relay, resp.PeerAddr, resp.PeerTunnelID, candidates, true)
 }
 
 func (p *p2pSession) currentCipher() *p2p.SessionCipher {
@@ -318,7 +319,7 @@ func (p *p2pSession) deriveP2PCipher(peerPubKeyB64 string) error {
 // The initiator allocates odd stream IDs; the acceptor uses even IDs.
 // peerTunnelID is the peer's tunnel ID to address outgoing stream requests
 // to in "connect" mode (see startConnectListener); it's ignored otherwise.
-func (p *p2pSession) attemptP2P(ctx context.Context, relay RelayChannel, peerAddr, peerTunnelID string, isInitiator bool) {
+func (p *p2pSession) attemptP2P(ctx context.Context, relay RelayChannel, peerAddr, peerTunnelID string, candidates []string, isInitiator bool) {
 	// Singleflight: an outgoing offer response and an inbound notification
 	// can both trigger a hole-punch attempt concurrently. Only let one run
 	// at a time — a second concurrent attempt is skipped outright rather
@@ -336,15 +337,21 @@ func (p *p2pSession) attemptP2P(ctx context.Context, relay RelayChannel, peerAdd
 		p.sendP2PResult(ctx, relay, false, "", err.Error())
 		return
 	}
+	if p.hasActiveSessionFor(peerAddr, peerEndpoint) {
+		log.Debug().Str("peer_addr", peerAddr).Msg("P2P session already active for peer, skipping duplicate notification")
+		return
+	}
+	candidateEndpoints := parseP2PEndpointCandidates(candidates)
 
 	log.Info().
 		Str("peer", peerAddr).
 		Bool("initiator", isInitiator).
+		Int("candidates", len(candidateEndpoints)).
 		Msg("Attempting P2P hole punching")
 
 	cipher := p.currentCipher()
 
-	conn, confirmedPeer, p2pErr := p.manager.AttemptP2P(ctx, peerEndpoint, cipher)
+	conn, confirmedPeer, p2pErr := p.manager.AttemptP2PWithCandidates(ctx, peerEndpoint, candidateEndpoints, cipher)
 	if p2pErr != nil {
 		log.Warn().Err(p2pErr).Msg("P2P hole punching failed")
 		p.sendP2PResult(ctx, relay, false, "", p2pErr.Error())
@@ -354,7 +361,7 @@ func (p *p2pSession) attemptP2P(ctx context.Context, relay RelayChannel, peerAdd
 	mux := p2p.NewUDPMux(conn, confirmedPeer, p2p.DefaultTransportConfig(), cipher, isInitiator)
 	closeSig := make(chan struct{})
 
-	gen := p.installSession(conn, confirmedPeer, mux, closeSig)
+	gen := p.installSession(peerAddr, conn, confirmedPeer, mux, closeSig)
 
 	peerAddrStr := confirmedPeer.String()
 	encrypted := cipher != nil
@@ -392,7 +399,7 @@ func (p *p2pSession) attemptP2P(ctx context.Context, relay RelayChannel, peerAdd
 // which is what guarantees its UDPMux/socket/accept-loop goroutine is never
 // orphaned by the replacement. Split out from attemptP2P so the
 // teardown-then-install behavior is unit-testable without a real hole punch.
-func (p *p2pSession) installSession(conn net.PacketConn, peer *net.UDPAddr, mux *p2p.UDPMux, closeSig chan struct{}) uint64 {
+func (p *p2pSession) installSession(peerAddr string, conn net.PacketConn, peer *net.UDPAddr, mux *p2p.UDPMux, closeSig chan struct{}) uint64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	// teardownLocked already bumps sessionGen, which is all the "new
@@ -401,10 +408,39 @@ func (p *p2pSession) installSession(conn net.PacketConn, peer *net.UDPAddr, mux 
 	p.teardownLocked()
 	p.conn = conn
 	p.peer = peer
+	p.peerAddr = peerAddr
 	p.udpMux = mux
 	p.sessionCloseCh = closeSig
 	atomic.StoreUint32(&p.mode, 1)
 	return p.sessionGen
+}
+
+func (p *p2pSession) hasActiveSessionFor(peerAddr string, peerEndpoint p2p.Endpoint) bool {
+	if atomic.LoadUint32(&p.mode) != 1 {
+		return false
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.sessionCloseCh == nil || p.conn == nil {
+		return false
+	}
+	select {
+	case <-p.sessionCloseCh:
+		return false
+	default:
+	}
+	if p.peerAddr != "" {
+		return p.peerAddr == peerAddr
+	}
+	if p.peer == nil || p.peer.Port != peerEndpoint.Port {
+		return false
+	}
+	peerIP := net.ParseIP(peerEndpoint.IP)
+	if peerIP == nil {
+		return p.peer.IP.String() == peerEndpoint.IP
+	}
+	return p.peer.IP.Equal(peerIP)
 }
 
 // acceptP2PStreams accepts incoming multiplexed P2P streams and proxies each
@@ -600,6 +636,19 @@ func parseP2PEndpoint(addr string) (p2p.Endpoint, error) {
 	return p2p.Endpoint{IP: host, Port: port}, nil
 }
 
+func parseP2PEndpointCandidates(candidates []string) []p2p.Endpoint {
+	endpoints := make([]p2p.Endpoint, 0, len(candidates))
+	for _, candidate := range candidates {
+		endpoint, err := parseP2PEndpoint(candidate)
+		if err != nil {
+			log.Debug().Err(err).Str("candidate", candidate).Msg("Skipping invalid P2P candidate endpoint")
+			continue
+		}
+		endpoints = append(endpoints, endpoint)
+	}
+	return endpoints
+}
+
 // sendP2PResult sends the P2P connection result to the server.
 func (p *p2pSession) sendP2PResult(ctx context.Context, relay RelayChannel, success bool, peerAddr, errMsg string) {
 	mux := relay.Mux()
@@ -645,8 +694,7 @@ func (p *p2pSession) sendP2PResult(ctx context.Context, relay RelayChannel, succ
 // This is called when another client wants to establish a P2P connection
 // with us. candidates carries any predicted peer ports received alongside
 // the offer response (Symmetric+Symmetric NAT port prediction); they are
-// logged for diagnostics but not yet consumed by the hole-punch attempt
-// itself.
+// consumed by the hole-punch attempt.
 func (p *p2pSession) HandleNotification(ctx context.Context, relay RelayChannel, resp *proto.P2POfferResponse, candidates []string) {
 	if !resp.Success || resp.PeerAddr == "" {
 		return
@@ -682,7 +730,7 @@ func (p *p2pSession) HandleNotification(ctx context.Context, relay RelayChannel,
 
 	// Notified side is the acceptor for stream-ID allocation; it never
 	// initiates outgoing connect-mode streams, so peerTunnelID is unused.
-	go p.attemptP2P(ctx, relay, resp.PeerAddr, "", false)
+	go p.attemptP2P(ctx, relay, resp.PeerAddr, "", candidates, false)
 }
 
 // teardownLocked closes every resource belonging to the currently active
@@ -706,6 +754,7 @@ func (p *p2pSession) teardownLocked() {
 		p.conn = nil
 	}
 	p.peer = nil
+	p.peerAddr = ""
 	atomic.StoreUint32(&p.mode, 0)
 	p.sessionGen++
 }

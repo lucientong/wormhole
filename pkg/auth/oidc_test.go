@@ -13,6 +13,8 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -81,7 +83,7 @@ func testFakeOIDCServer(t *testing.T, key *rsa.PrivateKey) *httptest.Server {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"keys": []map[string]string{
-				{"kty": "RSA", "kid": "key-1", "alg": jwtAlgRS256, "use": "sig", "n": nB64, "e": eB64},
+				{"kty": jwkKeyTypeRSA, "kid": "key-1", "alg": jwtAlgRS256, "use": "sig", "n": nB64, "e": eB64},
 			},
 		})
 	})
@@ -111,6 +113,65 @@ func TestOIDCValidator_ValidToken(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "user@example.com", claims.TeamName)
 	assert.Equal(t, RoleMember, claims.Role)
+}
+
+func TestOIDCValidator_GetKey_RefreshSingleflight(t *testing.T) {
+	key := testGenRSAKey(t)
+	var jwksRequests atomic.Int32
+
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"issuer":   srv.URL,
+			"jwks_uri": srv.URL + "/.well-known/jwks.json",
+		})
+	})
+	mux.HandleFunc("/.well-known/jwks.json", func(w http.ResponseWriter, _ *http.Request) {
+		jwksRequests.Add(1)
+		time.Sleep(50 * time.Millisecond)
+		pub := &key.PublicKey
+		nB64 := base64.RawURLEncoding.EncodeToString(pub.N.Bytes())
+		eB64 := base64.RawURLEncoding.EncodeToString(big.NewInt(int64(pub.E)).Bytes())
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"keys": []map[string]string{
+				{"kty": jwkKeyTypeRSA, "kid": "key-1", "alg": jwtAlgRS256, "use": "sig", "n": nB64, "e": eB64},
+			},
+		})
+	})
+	srv = httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	v, err := NewOIDCValidator(OIDCConfig{Issuer: srv.URL, ClientID: "my-client"})
+	require.NoError(t, err)
+
+	jwt := testBuildJWT(t, key, srv.URL, "my-client", "user@example.com", map[string]interface{}{
+		claimEmail: "user@example.com",
+	}, time.Now().Add(time.Hour).Unix())
+
+	const workers = 12
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, validateErr := v.ValidateToken(jwt)
+			errCh <- validateErr
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+
+	for validateErr := range errCh {
+		require.NoError(t, validateErr)
+	}
+	assert.Equal(t, int32(1), jwksRequests.Load(), "concurrent cache miss should trigger one JWKS request")
 }
 
 func TestOIDCValidator_ExpiredToken(t *testing.T) {
@@ -157,7 +218,7 @@ func TestOIDCValidator_WrongAudience(t *testing.T) {
 	assert.Contains(t, err.Error(), "audience mismatch")
 }
 
-func TestOIDCValidator_CustomRoleClaim(t *testing.T) {
+func TestOIDCValidator_CustomRoleClaim_DowngradesAdminByDefault(t *testing.T) {
 	key := testGenRSAKey(t)
 	srv := testFakeOIDCServer(t, key)
 
@@ -178,8 +239,33 @@ func TestOIDCValidator_CustomRoleClaim(t *testing.T) {
 
 	claims, err := v.ValidateToken(jwt)
 	require.NoError(t, err)
-	assert.Equal(t, RoleAdmin, claims.Role)
+	assert.Equal(t, RoleMember, claims.Role)
 	assert.Equal(t, "admin@example.com", claims.TeamName)
+}
+
+func TestOIDCValidator_CustomRoleClaim_AllowsAdminWhenEnabled(t *testing.T) {
+	key := testGenRSAKey(t)
+	srv := testFakeOIDCServer(t, key)
+
+	v, err := NewOIDCValidator(OIDCConfig{
+		Issuer:   srv.URL,
+		ClientID: "my-client",
+		ClaimMapping: OIDCClaimMapping{
+			TeamClaim:      claimEmail,
+			RoleClaim:      "wormhole_role",
+			AllowAdminRole: true,
+		},
+	})
+	require.NoError(t, err)
+
+	jwt := testBuildJWT(t, key, srv.URL, "my-client", "admin@example.com", map[string]interface{}{
+		claimEmail:      "admin@example.com",
+		"wormhole_role": "admin",
+	}, time.Now().Add(1*time.Hour).Unix())
+
+	claims, err := v.ValidateToken(jwt)
+	require.NoError(t, err)
+	assert.Equal(t, RoleAdmin, claims.Role)
 }
 
 // TestOIDCValidator_RejectsAlgNone verifies the classic JWT `alg:none`

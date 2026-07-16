@@ -132,6 +132,12 @@ func (m *Manager) IsEnabled() bool {
 // It returns the established UDP connection or an error (caller should fallback to relay).
 // If a SessionCipher is provided, hole-punch probes will be HMAC-authenticated.
 func (m *Manager) AttemptP2P(ctx context.Context, peerEndpoint Endpoint, cipher *SessionCipher) (net.PacketConn, *net.UDPAddr, error) {
+	return m.AttemptP2PWithCandidates(ctx, peerEndpoint, nil, cipher)
+}
+
+// AttemptP2PWithCandidates tries to establish a P2P connection with a peer,
+// including any predicted candidate endpoints in the hole-punch probe set.
+func (m *Manager) AttemptP2PWithCandidates(ctx context.Context, peerEndpoint Endpoint, candidateEndpoints []Endpoint, cipher *SessionCipher) (net.PacketConn, *net.UDPAddr, error) {
 	if !m.IsEnabled() {
 		if m.natInfo == nil {
 			return nil, nil, fmt.Errorf("P2P not available (NAT discovery not completed)")
@@ -142,6 +148,7 @@ func (m *Manager) AttemptP2P(ctx context.Context, peerEndpoint Endpoint, cipher 
 	log.Info().
 		Str("peer", peerEndpoint.String()).
 		Str("nat_type", m.natInfo.Type.String()).
+		Int("candidates", len(candidateEndpoints)).
 		Msg("Attempting P2P connection")
 
 	ctx, cancel := context.WithTimeout(ctx, m.config.FallbackTimeout)
@@ -158,7 +165,7 @@ func (m *Manager) AttemptP2P(ctx context.Context, peerEndpoint Endpoint, cipher 
 	m.holePuncher.SetCipher(cipher)
 
 	// Attempt hole punch.
-	peerAddr, punchErr := m.holePuncher.Punch(ctx, conn, peerEndpoint)
+	peerAddr, punchErr := m.holePuncher.PunchMulti(ctx, conn, peerEndpoint, candidateEndpoints)
 	if punchErr != nil {
 		_ = conn.Close()
 		log.Warn().Err(punchErr).Msg("Hole punch failed, falling back to relay")

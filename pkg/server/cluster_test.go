@@ -415,18 +415,20 @@ func TestTunnelRegistry_RegisterClusterRoute_RetriesAfterTransientFailure(t *tes
 	assert.Equal(t, "client-1", entry.ClientID)
 }
 
-// TestTunnelRegistry_RefreshClusterRoutes_NH01DetectsSplitBrainConflict
+// TestTunnelRegistry_RefreshClusterRoutes_DropsSplitBrainLocalRoute
 // verifies that once a node's belief that it owns a route ("clusterRoutes"
 // contains that entry) turns out to be false — the cluster-wide state now
 // disagrees, e.g. another node grabbed the same key while this node was
 // registering it during an outage — refreshClusterRoutes surfaces it as a
-// counted conflict instead of a routine, silently-retried warning.
-func TestTunnelRegistry_RefreshClusterRoutes_NH01DetectsSplitBrainConflict(t *testing.T) {
+// counted conflict and drops the stale local route so this node stops
+// serving traffic for a key the cluster now routes elsewhere.
+func TestTunnelRegistry_RefreshClusterRoutes_DropsSplitBrainLocalRoute(t *testing.T) {
 	store := NewMemoryStateStore()
 	s := newClusterTestServer("node-a", "node-a:7000", store)
 
 	client := &ClientSession{ID: "client-1", Subdomain: "myapp", CreatedAt: time.Now(), LastSeen: time.Now()}
 	client.clusterRoutes = []RouteEntry{{ClientID: client.ID, Subdomain: "myapp"}}
+	require.NoError(t, s.registry.router.RegisterSubdomain("myapp", client))
 	s.registry.clientLock.Lock()
 	s.registry.clients[client.ID] = client
 	s.registry.clientLock.Unlock()
@@ -445,6 +447,10 @@ func TestTunnelRegistry_RefreshClusterRoutes_NH01DetectsSplitBrainConflict(t *te
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	assert.Equal(t, "client-2", entry.ClientID, "the other node's route must win; this node's stale belief must not overwrite it")
+	assert.Nil(t, s.registry.router.LookupSubdomain("myapp"), "split-brain local route must be dropped so this node stops serving it")
+	client.mu.Lock()
+	assert.Empty(t, client.clusterRoutes, "dropped split-brain route must not keep retrying on later heartbeats")
+	client.mu.Unlock()
 }
 
 // TestServer_RegisterClientRoute_CrossTeamCannotReclaimStaleSession is

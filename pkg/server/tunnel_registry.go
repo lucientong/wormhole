@@ -619,12 +619,13 @@ func (tr *tunnelRegistry) refreshClusterRoutes() {
 				// route was registered locally during a Redis outage
 				// and another node has since claimed the same key for
 				// real. This node's copy is split-brained:
-				// it will keep serving local traffic for it, but the
-				// rest of the cluster now routes elsewhere. Logged at
-				// Error (not Warn) and counted so it's impossible to
-				// miss, since there's no automatic remediation.
+				// drop the local route immediately so consistency wins
+				// over continuing to serve a route the rest of the
+				// cluster already maps elsewhere.
+				removed := tr.dropLocalClusterRoute(c, entry)
 				log.Error().Err(err).Str("client", c.ID).Str("route", entry.Key()).
-					Msg("Cluster: route conflict detected on refresh — this node's route is no longer cluster-visible (split-brain)")
+					Bool("removed_local_route", removed).
+					Msg("Cluster: route conflict detected on refresh — dropped this node's local split-brain route")
 				if tr.metrics != nil {
 					tr.metrics.ClusterRouteConflictsTotal.Inc()
 				}
@@ -637,6 +638,25 @@ func (tr *tunnelRegistry) refreshClusterRoutes() {
 			}
 		}
 	}
+}
+
+// dropLocalClusterRoute removes entry from this node's in-memory router and
+// from client.clusterRoutes, without touching the shared state store. At the
+// point this is called the store already reports a real conflict, so deleting
+// the store entry would risk removing the winning node's route.
+func (tr *tunnelRegistry) dropLocalClusterRoute(client *ClientSession, entry RouteEntry) bool {
+	removedLocalRoute := tr.router.UnregisterRouteIfOwned(entry, client)
+
+	client.mu.Lock()
+	for i, e := range client.clusterRoutes {
+		if e.Key() == entry.Key() {
+			client.clusterRoutes = append(client.clusterRoutes[:i], client.clusterRoutes[i+1:]...)
+			break
+		}
+	}
+	client.mu.Unlock()
+
+	return removedLocalRoute
 }
 
 func (tr *tunnelRegistry) StateStoreHealth() (configured, healthy bool) {

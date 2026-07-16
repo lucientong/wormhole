@@ -90,10 +90,11 @@ type FileConfig struct {
 	EnableMetrics *bool `yaml:"enable_metrics"`
 
 	OIDC struct {
-		Issuer    string `yaml:"issuer"`
-		ClientID  string `yaml:"client_id"`
-		TeamClaim string `yaml:"team_claim"`
-		RoleClaim string `yaml:"role_claim"`
+		Issuer         string `yaml:"issuer"`
+		ClientID       string `yaml:"client_id"`
+		TeamClaim      string `yaml:"team_claim"`
+		RoleClaim      string `yaml:"role_claim"`
+		AllowAdminRole bool   `yaml:"allow_admin_role"`
 	} `yaml:"oidc"`
 
 	Audit struct {
@@ -282,6 +283,9 @@ func (fc *FileConfig) applyOIDCAndAudit(cfg *Config) {
 	overrideString(&cfg.OIDCClientID, fc.OIDC.ClientID)
 	overrideString(&cfg.OIDCTeamClaim, fc.OIDC.TeamClaim)
 	overrideString(&cfg.OIDCRoleClaim, fc.OIDC.RoleClaim)
+	if fc.OIDC.AllowAdminRole {
+		cfg.OIDCAllowAdminRole = true
+	}
 
 	if fc.Audit.Enabled {
 		cfg.AuditEnabled = true

@@ -225,6 +225,14 @@ func (c *Client) dialAndProxy(ctx context.Context, inReader io.Reader, outWriter
 	}
 	defer localConn.Close()
 
+	stopCancelClose := context.AfterFunc(ctx, func() {
+		_ = localConn.Close()
+		if rc, ok := inReader.(io.Closer); ok {
+			_ = rc.Close()
+		}
+	})
+	defer stopCancelClose()
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 

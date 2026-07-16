@@ -4,6 +4,14 @@
 
 **[English](CHANGELOG.md)**
 
+## v0.8.0
+
+P5 深度加固收官：本版本将原计划 v0.7.1-v0.7.5 的加固批次合并为一次 v0.8.0 发布。Wormhole 现在会在 hostname/path-prefix 进入路由表或集群状态前做格式校验，拒绝非法 DNS label、端口/通配符/控制字符、路径穿越、query/fragment 分隔符和畸形 path 值。Redis 集群启动时现在必须配置 `--cluster-secret`，未认证的节点间代理从"显著告警"提升为 fail-fast 配置错误；架构文档中的 Redis 路由申请描述也已更新为当前的原子 Lua 脚本实现，不再保留旧的 `SETNX` 表述。
+
+HA 与数据面韧性也同步加固。当某节点心跳刷新自己认为拥有的路由时，如果 Redis 确认该路由已经被另一个存活 owner 赢得，失败节点会只摘除自己的本地陈旧 route，并从心跳重试列表移除该条目，不会删除 Redis 中获胜节点的 route。`sendPong` 与 `sendWindowUpdate` 遇到满控制队列时不再无限阻塞；客户端 raw proxy 在 context 取消时会主动关闭本地连接；P2P 会话遇到同一 peer 的重复迟到通知时会跳过重装，如果 peer 地址确实变化，仍允许新的打洞尝试。
+
+P2P 与 OIDC 也完成了针对性加固。对于 Symmetric+Symmetric NAT 组合，服务端预测的 candidate endpoints 现在会和主 endpoint 一起进入真实 UDP 打洞循环，并新增测试覆盖"只有预测候选响应时仍能成功"的场景。OIDC JWKS 缓存刷新现在具备 singleflight 语义；OIDC 角色映射默认不再因为 claim 写了 `admin` 就授予 Wormhole `admin`，需要显式配置 `--oidc-allow-admin-role`（或 `server.yml` 的 `oidc.allow_admin_role`）才允许该映射生效。README、architecture 与包级文档均已同步。
+
 ## v0.7.0
 
 文档与学习性：README 的 Quick Start 现在提供一份可直接照抄的三终端本地闭环流程（server → 本地服务 → client → `curl` 验证），全程在 `localhost` 上完成，无需域名也无需部署；同时补上了 `wormhole nat-check` 的专门用法说明。`docs/architecture.md` 新增"调试与运维手册"章节——日志级别调节、Admin API 导览、值得配置告警的 Prometheus 指标，以及常见故障特征及排查方向的对照表；其"测试策略"章节也同步更新，反映了 v0.6.13 新增的全链路端到端 / P2P 信令端到端 / fuzz 测试层次。`pkg/auth`、`pkg/client`、`pkg/server` 三个包都新增（`pkg/auth` 是大幅扩充）了包级 `doc.go`，覆盖各自的组合结构、请求生命周期与关键扩展点，现在对这三个包跑 `go doc` 能看到真正有用的总览，而不是一行占位说明。新增 `CONTRIBUTING.md`，为外部贡献者说明开发流程、代码风格与测试约定。此外：过去几个版本代码注释里散落的内部评审编号简写（如 `NS-04`、`NDP-06`）已全部扫描清理，改写为不依赖编号的自然语言描述——纯注释改动，无行为变化。

@@ -87,3 +87,43 @@ func TestHolePuncher_Timeout(t *testing.T) {
 	assert.Error(t, punchErr)
 	assert.Contains(t, punchErr.Error(), "timed out")
 }
+
+func TestHolePuncher_PunchMulti_UsesReachableCandidate(t *testing.T) {
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer conn.Close()
+
+	candidateConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer candidateConn.Close()
+	candidateAddr := candidateConn.LocalAddr().(*net.UDPAddr)
+
+	responderDone := make(chan struct{})
+	go func() {
+		defer close(responderDone)
+		buf := make([]byte, 256)
+		_ = candidateConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, addr, readErr := candidateConn.ReadFrom(buf)
+		if readErr != nil {
+			return
+		}
+		if n >= len(punchMagic) && string(buf[:len(punchMagic)]) == string(punchMagic) {
+			_, _ = candidateConn.WriteTo(append(append([]byte{}, punchMagic...), []byte("probe")...), addr)
+		}
+	}()
+
+	hp := NewHolePuncher(HolePunchConfig{
+		MaxAttempts: 3,
+		Interval:    25 * time.Millisecond,
+		Timeout:     2 * time.Second,
+	})
+
+	primary := Endpoint{IP: "127.0.0.1", Port: 1}
+	candidates := []Endpoint{{IP: candidateAddr.IP.String(), Port: candidateAddr.Port}}
+	confirmed, punchErr := hp.PunchMulti(context.Background(), conn, primary, candidates)
+	require.NoError(t, punchErr)
+	require.NotNil(t, confirmed)
+	assert.Equal(t, candidateAddr.Port, confirmed.Port)
+
+	<-responderDone
+}

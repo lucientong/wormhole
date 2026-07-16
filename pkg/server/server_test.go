@@ -4071,6 +4071,65 @@ func TestIsValidSubdomainLabel(t *testing.T) {
 	}
 }
 
+func TestIsValidHostname(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		{"single label", "localhost", true},
+		{"domain", "app.example.com", true},
+		{"uppercase accepted", "App.Example.COM", true},
+		{"hyphen label", "my-app.example.com", true},
+		{"max label length", strings.Repeat("a", 63) + ".example.com", true},
+		{"empty", "", false},
+		{"too long", strings.Repeat("a", 244) + ".example.com", false},
+		{"trailing dot", "app.example.com.", false},
+		{"empty label", "app..example.com", false},
+		{"leading hyphen", "-app.example.com", false},
+		{"trailing hyphen", "app-.example.com", false},
+		{"port", "app.example.com:8080", false},
+		{"wildcard", "*.example.com", false},
+		{"underscore", "app_test.example.com", false},
+		{"slash", "app/example.com", false},
+		{"newline injection", "app.example.com\nX-Evil: 1", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isValidHostname(tt.input))
+		})
+	}
+}
+
+func TestIsValidPathPrefix(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		{"root", "/", true},
+		{"simple", "/api", true},
+		{"nested", "/api/v1/users", true},
+		{"trailing slash", "/api/", true},
+		{"hyphen underscore", "/api-v1/user_list", true},
+		{"encoded path", "/files/%E4%B8%AD%E6%96%87", true},
+		{"empty", "", false},
+		{"missing leading slash", "api", false},
+		{"path traversal segment", "/api/../admin", false},
+		{"path traversal only", "/..", false},
+		{"backslash", "/api\\admin", false},
+		{"query", "/api?debug=1", false},
+		{"fragment", "/api#section", false},
+		{"newline injection", "/api\nX-Evil: 1", false},
+		{"too long", "/" + strings.Repeat("a", maxPathPrefixLen), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isValidPathPrefix(tt.input))
+		})
+	}
+}
+
 // TestServer_IsReservedSubdomain covers the reserved-word mechanism:
 // regular roles are blocked from claiming a reserved subdomain,
 // auth.RoleAdmin always bypasses it, and the whole check is a no-op when
@@ -4183,4 +4242,108 @@ func TestServer_HandleRegister_RejectsReservedSubdomain(t *testing.T) {
 	client.mu.Lock()
 	assert.Empty(t, client.Tunnels)
 	client.mu.Unlock()
+}
+
+func TestServer_HandleRegister_RejectsInvalidHostname(t *testing.T) {
+	s, client, clientMux, serverMux := newRegisterTestHarness(t)
+
+	resp := registerThroughHarness(t, s, client, clientMux, serverMux,
+		proto.NewRegisterRequest(8080, proto.ProtocolHTTP, "", "app.example.com\nX-Evil: 1", ""))
+
+	require.NotNil(t, resp)
+	assert.False(t, resp.Success)
+	assert.Equal(t, "invalid hostname", resp.Error)
+	client.mu.Lock()
+	assert.Empty(t, client.Tunnels)
+	client.mu.Unlock()
+	assert.Nil(t, s.registry.router.Route("app.example.com", "/"))
+}
+
+func TestServer_HandleRegister_RejectsInvalidPathPrefix(t *testing.T) {
+	s, client, clientMux, serverMux := newRegisterTestHarness(t)
+
+	resp := registerThroughHarness(t, s, client, clientMux, serverMux,
+		proto.NewRegisterRequest(8080, proto.ProtocolHTTP, "", "", "/api/../admin"))
+
+	require.NotNil(t, resp)
+	assert.False(t, resp.Success)
+	assert.Equal(t, "invalid path prefix", resp.Error)
+	client.mu.Lock()
+	assert.Empty(t, client.Tunnels)
+	client.mu.Unlock()
+	assert.Nil(t, s.registry.router.Route("member-sub.test.local", "/api/../admin"))
+}
+
+func newRegisterTestHarness(t *testing.T) (*Server, *ClientSession, *tunnel.Mux, *tunnel.Mux) {
+	t.Helper()
+
+	cfg := DefaultConfig()
+	cfg.Domain = "test.local"
+	cfg.MuxConfig.KeepAliveInterval = 0
+	s := NewServer(cfg)
+
+	clientMux, serverMux := newMuxPair(t)
+	client := &ClientSession{
+		ID: "member-client", Subdomain: "member-sub", Mux: serverMux,
+		CreatedAt: time.Now(), LastSeen: time.Now(),
+	}
+	s.registry.clientLock.Lock()
+	s.registry.clients[client.ID] = client
+	s.registry.clientLock.Unlock()
+
+	return s, client, clientMux, serverMux
+}
+
+func registerThroughHarness(t *testing.T, s *Server, client *ClientSession, clientMux, serverMux *tunnel.Mux, req *proto.ControlMessage) *proto.RegisterResponse {
+	t.Helper()
+
+	errCh := make(chan error, 1)
+	respCh := make(chan *proto.RegisterResponse, 1)
+	go func() {
+		stream, openErr := clientMux.OpenStream()
+		if openErr != nil {
+			errCh <- openErr
+			return
+		}
+		defer stream.Close()
+
+		data, encErr := req.Encode()
+		if encErr != nil {
+			errCh <- encErr
+			return
+		}
+		if _, writeErr := stream.Write(data); writeErr != nil {
+			errCh <- writeErr
+			return
+		}
+
+		buf := make([]byte, 4096)
+		n, readErr := stream.Read(buf)
+		if readErr != nil {
+			errCh <- readErr
+			return
+		}
+		msg, decErr := proto.DecodeControlMessage(buf[:n])
+		if decErr != nil {
+			errCh <- decErr
+			return
+		}
+		respCh <- msg.RegisterResponse
+		errCh <- nil
+	}()
+
+	stream, err := serverMux.AcceptStream()
+	require.NoError(t, err)
+	defer stream.Close()
+
+	buf := make([]byte, 4096)
+	n, err := stream.Read(buf)
+	require.NoError(t, err)
+	msg, err := proto.DecodeControlMessage(buf[:n])
+	require.NoError(t, err)
+	require.NotNil(t, msg.RegisterRequest)
+
+	s.handleRegister(client, stream, msg.RegisterRequest)
+	require.NoError(t, <-errCh)
+	return <-respCh
 }

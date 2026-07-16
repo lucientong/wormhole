@@ -1087,6 +1087,32 @@ func TestMux_SendWindowUpdate_NotBlockedByFullSendCh(t *testing.T) {
 	}
 }
 
+func TestMux_SendPong_TimesOutOnFullCtrlCh(t *testing.T) {
+	mux := newBareTestMux()
+	for range cap(mux.ctrlCh) {
+		mux.ctrlCh <- NewPingFrame(1)
+	}
+	require.Len(t, mux.ctrlCh, cap(mux.ctrlCh))
+
+	start := time.Now()
+	err := mux.sendPong(42)
+	assert.NoError(t, err)
+	assert.Less(t, time.Since(start), 500*time.Millisecond, "sendPong must not block indefinitely when ctrlCh is full")
+}
+
+func TestMux_SendWindowUpdate_TimesOutOnFullCtrlCh(t *testing.T) {
+	mux := newBareTestMux()
+	for range cap(mux.ctrlCh) {
+		mux.ctrlCh <- NewPingFrame(1)
+	}
+	require.Len(t, mux.ctrlCh, cap(mux.ctrlCh))
+
+	start := time.Now()
+	err := mux.sendWindowUpdate(1, 4096)
+	assert.NoError(t, err)
+	assert.Less(t, time.Since(start), 500*time.Millisecond, "sendWindowUpdate must not block indefinitely when ctrlCh is full")
+}
+
 func TestMux_SendPing_NotBlockedByFullSendCh(t *testing.T) {
 	mux := newBareTestMux()
 	for range cap(mux.sendCh) {

@@ -41,6 +41,8 @@ func DefaultMuxConfig() MuxConfig {
 	}
 }
 
+const controlFrameEnqueueTimeout = 100 * time.Millisecond
+
 // Mux is a multiplexer that manages multiple streams over a single connection.
 type Mux struct {
 	conn   net.Conn
@@ -617,6 +619,8 @@ func (m *Mux) sendWindowUpdate(streamID uint32, increment uint32) error {
 		return nil
 	case <-m.closeCh:
 		return m.getCloseErr()
+	case <-time.After(controlFrameEnqueueTimeout):
+		return nil
 	}
 }
 
@@ -646,7 +650,7 @@ func (m *Mux) sendClose(streamID uint32) error { //nolint:unparam // error retur
 			return nil
 		case <-m.closeCh:
 			return nil
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(controlFrameEnqueueTimeout):
 			return nil
 		}
 	}
@@ -699,6 +703,8 @@ func (m *Mux) sendPong(pingID uint32) error {
 	case m.ctrlCh <- frame:
 		return nil
 	case <-m.closeCh:
+		return nil
+	case <-time.After(controlFrameEnqueueTimeout):
 		return nil
 	}
 }

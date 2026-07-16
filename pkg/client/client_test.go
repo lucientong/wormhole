@@ -1873,6 +1873,53 @@ func TestClient_DialAndProxy_Success(t *testing.T) {
 	assert.Greater(t, stats.BytesOut, uint64(0), "BytesOut should be incremented")
 }
 
+func TestClient_DialAndProxy_ReturnsOnContextCancel(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr == nil {
+			accepted <- conn
+		}
+	}()
+
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	port := 0
+	fmt.Sscanf(portStr, "%d", &port)
+
+	cfg := DefaultConfig()
+	cfg.LocalHost = "127.0.0.1"
+	cfg.LocalPort = port
+	c := NewClient(cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	reader, writer := io.Pipe()
+	defer writer.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.dialAndProxy(ctx, reader, io.Discard, &proto.StreamRequest{Protocol: proto.ProtocolTCP})
+	}()
+
+	select {
+	case conn := <-accepted:
+		defer conn.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("local service did not receive dialAndProxy connection")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dialAndProxy did not return after context cancellation")
+	}
+}
+
 // TestClient_ForwardRawTCPWithReader verifies the custom reader path.
 func TestClient_ForwardRawTCPWithReader(t *testing.T) {
 	// Start a local TCP server that reads data and responds.

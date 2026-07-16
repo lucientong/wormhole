@@ -52,6 +52,7 @@ var (
 	serverOIDCClientID         string
 	serverOIDCTeamClaim        string
 	serverOIDCRoleClaim        string
+	serverOIDCAllowAdminRole   bool
 
 	// Cluster / HA flags.
 	serverClusterNodeID        string
@@ -144,6 +145,7 @@ func init() {
 	serverCmd.Flags().StringVar(&serverOIDCClientID, "oidc-client-id", "", "OAuth2 client ID for OIDC audience validation")
 	serverCmd.Flags().StringVar(&serverOIDCTeamClaim, "oidc-team-claim", "email", "JWT claim to use as team name (default: email)")
 	serverCmd.Flags().StringVar(&serverOIDCRoleClaim, "oidc-role-claim", "", "JWT claim to use as Wormhole role (optional)")
+	serverCmd.Flags().BoolVar(&serverOIDCAllowAdminRole, "oidc-allow-admin-role", false, "Allow OIDC role claims to grant Wormhole admin role (default: false; admin claims downgrade to member)")
 
 	// Cluster / HA flags.
 	serverCmd.Flags().StringVar(&serverClusterNodeID, "cluster-node-id", "", "Unique ID for this node in the cluster (default: hostname)")
@@ -152,7 +154,7 @@ func init() {
 	serverCmd.Flags().StringVar(&serverClusterRedisAddr, "cluster-redis-addr", "", "Redis address for cluster state (e.g. localhost:6379)")
 	serverCmd.Flags().StringVar(&serverClusterRedisPassword, "cluster-redis-password", "", "Redis AUTH password")
 	serverCmd.Flags().IntVar(&serverClusterRedisDB, "cluster-redis-db", 0, "Redis database number")
-	serverCmd.Flags().StringVar(&serverClusterSecret, "cluster-secret", "", "Shared secret validated on requests forwarded between cluster nodes")
+	serverCmd.Flags().StringVar(&serverClusterSecret, "cluster-secret", "", "Shared secret validated on requests forwarded between cluster nodes (required with --cluster-backend redis)")
 	serverCmd.Flags().StringVar(&serverAuthRedisAddr, "auth-redis-addr", "", "Redis address for shared auth/revocation state when --persistence=redis (default: --cluster-redis-addr)")
 	serverCmd.Flags().StringVar(&serverAuthRedisPassword, "auth-redis-password", "", "Redis AUTH password for --auth-redis-addr (default: --cluster-redis-password)")
 	serverCmd.Flags().IntVar(&serverAuthRedisDB, "auth-redis-db", 0, "Redis database number for --auth-redis-addr (default: --cluster-redis-db)")
@@ -276,6 +278,7 @@ func buildServerConfig(cmd *cobra.Command) server.Config {
 	config.OIDCClientID = serverOIDCClientID
 	config.OIDCTeamClaim = serverOIDCTeamClaim
 	config.OIDCRoleClaim = serverOIDCRoleClaim
+	config.OIDCAllowAdminRole = serverOIDCAllowAdminRole
 
 	config.ClusterNodeID = serverClusterNodeID
 	config.ClusterNodeAddr = serverClusterNodeAddr

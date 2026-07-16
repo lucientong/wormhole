@@ -57,6 +57,13 @@ persistence:
   type: sqlite
   path: /var/lib/wormhole/wormhole.db
 
+oidc:
+  issuer: https://issuer.example.com
+  client_id: wormhole
+  team_claim: email
+  role_claim: wormhole_role
+  allow_admin_role: true
+
 audit:
   enabled: true
   retention_days: 30
@@ -152,6 +159,11 @@ func TestFileConfig_ToServerConfig_OverridesExplicitFields(t *testing.T) {
 	assert.Equal(t, 10*time.Minute, cfg.RateLimitWindow)
 	assert.Equal(t, PersistenceSQLite, cfg.Persistence)
 	assert.Equal(t, "/var/lib/wormhole/wormhole.db", cfg.PersistencePath)
+	assert.Equal(t, "https://issuer.example.com", cfg.OIDCIssuer)
+	assert.Equal(t, "wormhole", cfg.OIDCClientID)
+	assert.Equal(t, "email", cfg.OIDCTeamClaim)
+	assert.Equal(t, "wormhole_role", cfg.OIDCRoleClaim)
+	assert.True(t, cfg.OIDCAllowAdminRole)
 	assert.True(t, cfg.AuditEnabled)
 	assert.Equal(t, 30, cfg.AuditRetentionDays)
 	assert.Equal(t, "node-1", cfg.ClusterNodeID)
